@@ -13,7 +13,7 @@ An actual Iran-derived extract and provenance sidecar have been supplied for loc
 | Source snapshot timestamp (sidecar) | 2026-09-27T20:23:36Z; extraction used `osmium` 1.19.0 with `smart` strategy |
 | Selection box | `51.175,35.705,51.285,35.785` (W,S,E,N) |
 | Objects | 125,907 nodes; 18,619 ways; 267 relations |
-| Relevant raw tags | 7,530 ways with `highway`; 76 objects with `natural=water`; 1,020 with `landuse` (including 638 `grass`); 129 with `leisure=park`; 976 with `amenity` |
+| Relevant raw tags | 7,530 ways with `highway` (plus 768 nodes); 76 ways/relations with `natural=water`; 1,020 ways/relations with `landuse` (including 638 `grass`; plus 12 nodes); 129 ways/relations with `leisure=park` (plus 1 node); 976 objects of any type with `amenity` (535 nodes, 439 ways, 2 relations) |
 | Names | 6,051 objects with `name`; 241 with an explicit `name:fa`; 5,844 `name` values containing at least one Persian/Arabic-script character |
 | Search reference | way `1259635603`, `name=دریاچه چیتگر`, `name:fa=دریاچه چیتگر`, `name:en=Chitgar Lake`, `tourism=attraction` |
 
