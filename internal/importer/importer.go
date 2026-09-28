@@ -18,6 +18,9 @@ package importer
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -95,6 +99,8 @@ type Report struct {
 	StyleRevision    string               `json:"style_revision"`
 	Osm2pgsqlVersion string               `json:"osm2pgsql_version"`
 	ImporterVersion  string               `json:"importer_version"`
+	Identity         string               `json:"identity"`
+	Toolchain        map[string]string    `json:"toolchain"`
 	Counts           map[string]int64     `json:"counts"`
 	Features         map[string]int64     `json:"features_by_category"`
 	Names            NameReport           `json:"names"`
@@ -235,15 +241,18 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 	}
 	lap("verify_input", t)
 
-	// 2. Identify and lock ------------------------------------------------
+	// 2. Lock and build a candidate ------------------------------------
+	// The release id depends on the versions of the database tools that
+	// produce tiles and search results, which are only known inside a
+	// database with PostGIS installed. The import therefore runs in a
+	// randomly named candidate database; only a fully validated candidate is
+	// renamed to karta_<release_id>.
 	schemaRev, styleRev := schema.Revision(), style.Revision()
-	id := releaseid.Derive(releaseid.Inputs{
-		SourceSHA256: info.SHA256, RegionID: cfg.ID, RegionBBox: cfg.BBox,
-		SchemaRevision: schemaRev, StyleRevision: styleRev,
-	})
-	dbName := releaseid.DatabaseName(id)
-	log.Info("release identified", "release_id", id, "database", dbName, "schema", schemaRev, "style", styleRev)
-
+	provDigest := ""
+	if prov != nil {
+		sum := sha256.Sum256(prov.Raw)
+		provDigest = hex.EncodeToString(sum[:])
+	}
 	reg, err := opts.DB.Connect(ctx, opts.RegistryDB)
 	if err != nil {
 		return nil, fmt.Errorf("connect registry: %w", err)
@@ -255,41 +264,103 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 	if err := registry.LockImports(ctx, reg, opts.LockTimeout); err != nil {
 		return nil, err
 	}
-	active, err := registry.Active(ctx, reg)
+	if err := dropLeftoverCandidates(ctx, reg, log); err != nil {
+		return nil, err
+	}
+	t = time.Now()
+	candidate, err := candidateName()
 	if err != nil {
 		return nil, err
 	}
+	if _, err := reg.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %s TEMPLATE %s`, candidate, opts.TemplateDB)); err != nil {
+		return nil, fmt.Errorf("create candidate database from template %s: %w", opts.TemplateDB, err)
+	}
+	discard := func() {
+		cctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := dropDatabase(cctx, reg, candidate); err != nil {
+			log.Error("could not drop candidate", "database", candidate, "err", err)
+		}
+	}
+	if _, err := reg.Exec(ctx, fmt.Sprintf(`REVOKE ALL ON DATABASE %s FROM PUBLIC; GRANT CONNECT ON DATABASE %s TO %s`, candidate, candidate, registry.ReaderRole)); err != nil {
+		discard()
+		return nil, err
+	}
+	rel, err := opts.DB.Connect(ctx, candidate)
+	if err != nil {
+		discard()
+		return nil, fmt.Errorf("connect candidate database: %w", err)
+	}
+	defer rel.Close(context.Background())
+	toolchain, err := readToolchain(ctx, rel)
+	if err != nil {
+		_ = rel.Close(ctx)
+		discard()
+		return nil, err
+	}
+	toolchain["osm2pgsql"] = o2pVersion
+
+	// 3. Identify ------------------------------------------------------------
+	inputs := releaseid.Inputs{
+		SourceSHA256: info.SHA256, ProvenanceSHA256: provDigest,
+		DataTimestamp: src.DataTimestamp, DataTimestampSource: src.DataTimestampSource,
+		Region: releaseid.Region{
+			ID: cfg.ID, Name: cfg.Name, BBox: cfg.BBox, Center: cfg.View.Center, Zoom: cfg.View.Zoom,
+		},
+		SchemaRevision: schemaRev, StyleRevision: styleRev,
+		Attribution: Attribution, License: License, LicenseURL: LicenseURL,
+		Toolchain: toolchain,
+	}
+	id := releaseid.Derive(inputs)
+	identity := releaseid.Canonical(inputs)
+	dbName := releaseid.DatabaseName(id)
+	log.Info("release identified", "release_id", id, "database", dbName, "candidate", candidate,
+		"schema", schemaRev, "style", styleRev, "toolchain", toolchain)
+	active, err := registry.Active(ctx, reg)
+	if err != nil {
+		_ = rel.Close(ctx)
+		discard()
+		return nil, err
+	}
 	if active != nil && active.ID == id {
+		_ = rel.Close(ctx)
+		discard()
 		log.Info("release is already active; nothing to do", "release_id", id)
 		return &Result{ReleaseID: id, AlreadyActive: true}, nil
 	}
 	if active != nil {
+		_ = rel.Close(ctx)
+		discard()
 		return nil, fmt.Errorf("%w: %s is serving; Stage 1 keeps one release, so run `make reset` before importing %s (switching releases while serving is Stage 2)",
 			ErrActiveExists, active.ID, id)
 	}
-
-	// 3. Build the candidate ---------------------------------------------
-	if err := dropDatabase(ctx, reg, dbName); err != nil { // leftover from an interrupted run
+	if err := dropDatabase(ctx, reg, dbName); err != nil { // leftover of an interrupted rename
+		_ = rel.Close(ctx)
+		discard()
 		return nil, err
 	}
 	if err := registry.Begin(ctx, reg, registry.Release{ID: id, Database: dbName, RegionID: cfg.ID, SourceSHA256: info.SHA256}, schemaRev, styleRev); err != nil {
+		_ = rel.Close(ctx)
+		discard()
 		return nil, err
 	}
 	report := &Report{
 		ReleaseID: id, Region: cfg.ID, Source: src, SchemaRevision: schemaRev, StyleRevision: styleRev,
 		Osm2pgsqlVersion: o2pVersion, ImporterVersion: opts.Version, Timings: timings,
+		Identity: identity, Toolchain: toolchain,
 	}
 	fail := func(cause error) (*Result, error) {
 		cctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
+		_ = rel.Close(cctx)
 		reason := cause.Error()
 		if len(reason) > 2000 {
 			reason = reason[:2000]
 		}
-		if !opts.KeepFailed {
-			if err := dropDatabase(cctx, reg, dbName); err != nil {
-				log.Error("could not drop failed candidate", "database", dbName, "err", err)
-			}
+		if opts.KeepFailed {
+			log.Warn("keeping failed candidate for inspection until the next import", "database", candidate)
+		} else {
+			discard()
 		}
 		if err := registry.Fail(cctx, reg, id, reason); err != nil {
 			log.Error("could not record failure", "release_id", id, "err", err)
@@ -297,18 +368,7 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 		return &Result{ReleaseID: id, Report: report}, cause
 	}
 
-	t = time.Now()
-	if _, err := reg.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %s TEMPLATE %s`, dbName, opts.TemplateDB)); err != nil {
-		return fail(fmt.Errorf("create release database from template %s: %w", opts.TemplateDB, err))
-	}
-	if _, err := reg.Exec(ctx, fmt.Sprintf(`REVOKE ALL ON DATABASE %s FROM PUBLIC; GRANT CONNECT ON DATABASE %s TO %s`, dbName, dbName, registry.ReaderRole)); err != nil {
-		return fail(err)
-	}
-	rel, err := opts.DB.Connect(ctx, dbName)
-	if err != nil {
-		return fail(fmt.Errorf("connect release database: %w", err))
-	}
-	defer rel.Close(context.Background())
+	// 4. Import ------------------------------------------------------------
 	if _, err := rel.Exec(ctx, schema.SetupSQL().SQL); err != nil {
 		return fail(fmt.Errorf("setup SQL: %w", err))
 	}
@@ -319,7 +379,7 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 	lap("create_database", t)
 
 	t = time.Now()
-	rss, err := runOsm2pgsql(ctx, opts, dbName, log)
+	rss, err := runOsm2pgsql(ctx, opts, candidate, log)
 	report.Resources.Osm2pgsqlMaxRSSKiB = rss
 	if err != nil {
 		return fail(err)
@@ -338,7 +398,7 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 	}
 	lap("post_import_sql", t)
 
-	// 4. Validate ----------------------------------------------------------
+	// 5. Validate ----------------------------------------------------------
 	t = time.Now()
 	if err := collect(ctx, rel, report); err != nil {
 		return fail(err)
@@ -356,7 +416,7 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 		return fail(fmt.Errorf("%w: %s", ErrValidation, strings.Join(failed, "; ")))
 	}
 
-	// 5. Record, freeze, activate -------------------------------------------
+	// 6. Record, freeze, rename, activate --------------------------------
 	t = time.Now()
 	report.Resources.ImporterMaxRSSKiB = selfMaxRSS()
 	var provRaw any
@@ -364,6 +424,7 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 		provRaw = json.RawMessage(prov.Raw)
 	}
 	layersJSON, _ := json.Marshal(catalog)
+	toolchainJSON, _ := json.Marshal(toolchain)
 	if _, err := rel.Exec(ctx, `VACUUM (ANALYZE)`); err != nil {
 		return fail(err)
 	}
@@ -379,18 +440,26 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 	if _, err := rel.Exec(ctx, `
 INSERT INTO karta.release_info (release_id, schema_major, schema_revision, style_revision, region_id, region_name,
     bbox, center, default_zoom, minzoom, maxzoom, source_sha256, source_size, data_timestamp, data_timestamp_source,
-    provenance, imported_at, importer_version, osm2pgsql_version, attribution, license, license_url, layers, style, report)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now(), $17, $18, $19, $20, $21, $22, $23, $24)`,
+    provenance, imported_at, importer_version, osm2pgsql_version, attribution, license, license_url, layers, style, report,
+    identity, toolchain)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now(), $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`,
 		id, schema.Major, schemaRev, styleRev, cfg.ID, cfg.Name,
 		cfg.BBox[:], cfg.View.Center[:], cfg.View.Zoom, catalog.MinZoom, catalog.MaxZoom,
 		info.SHA256, info.Size, src.DataTimestamp, src.DataTimestampSource,
 		provRaw, opts.Version, o2pVersion, Attribution, License, LicenseURL,
-		layersJSON, []byte(styleJSON), reportJSON); err != nil {
+		layersJSON, []byte(styleJSON), reportJSON, identity, toolchainJSON); err != nil {
 		return fail(fmt.Errorf("record release metadata: %w", err))
 	}
-	if _, err := rel.Exec(ctx, fmt.Sprintf(`ALTER DATABASE %s SET default_transaction_read_only = on`, dbName)); err != nil {
+	if _, err := rel.Exec(ctx, fmt.Sprintf(`ALTER DATABASE %s SET default_transaction_read_only = on`, candidate)); err != nil {
 		return fail(err)
 	}
+	if err := rel.Close(ctx); err != nil {
+		return fail(err)
+	}
+	if _, err := reg.Exec(ctx, fmt.Sprintf(`ALTER DATABASE %s RENAME TO %s`, candidate, dbName)); err != nil {
+		return fail(fmt.Errorf("rename candidate to %s: %w", dbName, err))
+	}
+	candidate = dbName // a failure from here on drops the renamed database
 	if err := registry.SetState(ctx, reg, id, registry.StateReady, nil); err != nil {
 		return fail(err)
 	}
@@ -399,6 +468,58 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, n
 	}
 	log.Info("release active", "release_id", id, "seconds", timings["total"])
 	return &Result{ReleaseID: id, Report: report}, nil
+}
+
+// candidateName returns a fresh name for an import's working database.
+func candidateName() (string, error) {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "karta_c" + hex.EncodeToString(b), nil
+}
+
+var candidatePattern = regexp.MustCompile(`^karta_c[0-9a-f]{24}$`)
+
+// dropLeftoverCandidates removes working databases of interrupted or kept
+// failed imports. It runs under the import lock, so no import is using them.
+func dropLeftoverCandidates(ctx context.Context, conn *pgx.Conn, log *slog.Logger) error {
+	rows, err := conn.Query(ctx, `SELECT datname FROM pg_database WHERE datname LIKE 'karta\_c%'`)
+	if err != nil {
+		return err
+	}
+	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		if !candidatePattern.MatchString(n) {
+			continue
+		}
+		log.Info("dropping leftover candidate database", "database", n)
+		if err := dropDatabase(ctx, conn, n); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readToolchain records the versions of the database components whose
+// behaviour shapes tiles and search results.
+func readToolchain(ctx context.Context, conn *pgx.Conn) (map[string]string, error) {
+	var pg, postgis, geos, proj, trgm, icu string
+	err := conn.QueryRow(ctx, `
+SELECT split_part(current_setting('server_version'), ' ', 1),
+       public.postgis_lib_version(),
+       public.postgis_geos_version(),
+       split_part(public.postgis_proj_version(), ' ', 1),
+       (SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm'),
+       COALESCE((SELECT collversion FROM pg_collation WHERE collname = 'und-x-icu'), '')`).Scan(
+		&pg, &postgis, &geos, &proj, &trgm, &icu)
+	if err != nil {
+		return nil, fmt.Errorf("read database toolchain versions: %w", err)
+	}
+	return map[string]string{"postgresql": pg, "postgis": postgis, "geos": geos, "proj": proj, "pg_trgm": trgm, "icu": icu}, nil
 }
 
 func dropDatabase(ctx context.Context, conn *pgx.Conn, name string) error {

@@ -9,7 +9,9 @@
 package glyphs
 
 import (
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -55,21 +57,38 @@ type Set struct {
 
 type entry struct {
 	once sync.Once
-	data []byte
+	rng  Range
 	err  error
+}
+
+// Range is one generated glyph range and its HTTP validator.
+type Range struct {
+	Data []byte
+	// ETag is a strong validator derived from Data, so any change to a
+	// font or to the generator changes it.
+	ETag string
 }
 
 // New parses the bundled fonts.
 func New() (*Set, error) {
-	s := &Set{fonts: map[string]*sfnt.Font{}, cache: map[string]*entry{}}
+	fonts := map[string][]byte{}
 	for name, file := range fontstackFiles {
 		b, err := fontFiles.ReadFile(file)
 		if err != nil {
 			return nil, err
 		}
+		fonts[name] = b
+	}
+	return newSet(fonts)
+}
+
+// newSet builds a set from fontstack name -> TrueType bytes.
+func newSet(fonts map[string][]byte) (*Set, error) {
+	s := &Set{fonts: map[string]*sfnt.Font{}, cache: map[string]*entry{}}
+	for name, b := range fonts {
 		f, err := sfnt.Parse(b)
 		if err != nil {
-			return nil, fmt.Errorf("parse %s: %w", file, err)
+			return nil, fmt.Errorf("parse font for %q: %w", name, err)
 		}
 		s.fonts[name] = f
 	}
@@ -89,13 +108,13 @@ func (s *Set) Fontstacks() []string {
 // Range returns the protobuf glyph range starting at start (a multiple of
 // 256) for a fontstack. Ranges without any glyph in the font are valid,
 // empty ranges, so clients never see an error for uncovered blocks.
-func (s *Set) Range(fontstack string, start, end int) ([]byte, error) {
+func (s *Set) Range(fontstack string, start, end int) (Range, error) {
 	f, ok := s.fonts[fontstack]
 	if !ok {
-		return nil, ErrUnknownFontstack
+		return Range{}, ErrUnknownFontstack
 	}
 	if start < 0 || start%256 != 0 || end != start+255 || end > 65535 {
-		return nil, ErrInvalidRange
+		return Range{}, ErrInvalidRange
 	}
 	key := fmt.Sprintf("%s/%d", fontstack, start)
 	s.mu.Lock()
@@ -105,8 +124,13 @@ func (s *Set) Range(fontstack string, start, end int) ([]byte, error) {
 		s.cache[key] = e
 	}
 	s.mu.Unlock()
-	e.once.Do(func() { e.data, e.err = buildRange(f, fontstack, start) })
-	return e.data, e.err
+	e.once.Do(func() {
+		var data []byte
+		data, e.err = buildRange(f, fontstack, start)
+		sum := sha256.Sum256(data)
+		e.rng = Range{Data: data, ETag: `"` + hex.EncodeToString(sum[:16]) + `"`}
+	})
+	return e.rng, e.err
 }
 
 // Glyph is one rendered glyph and its metrics in pixels at 24 px/em.

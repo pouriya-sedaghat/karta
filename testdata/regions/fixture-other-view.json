@@ -1,0 +1,8 @@
+{
+  "id": "fixture",
+  "name": "Karta synthetic test fixture",
+  "bbox": [0.0, 0.0, 0.02, 0.015],
+  "source": { "require_provenance": false },
+  "view": { "center": [0.005, 0.005], "zoom": 14 },
+  "validation": { "min_counts": { "features": 15 }, "search": [], "tiles": [] }
+}

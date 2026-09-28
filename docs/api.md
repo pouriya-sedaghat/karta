@@ -20,7 +20,7 @@ curl -G http://localhost:8080/v1/search --data-urlencode 'q=Chitgar Lake' --data
 ```
 
 ```json
-{"release_id":"r37a15d199da7e2c601a3e68c","query":"Chitgar Lake","normalized_query":"chitgar lake","limit":2,"lang":null,"bbox":null,
+{"release_id":"rc7684f3108af1233d275559b","query":"Chitgar Lake","normalized_query":"chitgar lake","limit":2,"lang":null,"bbox":null,
  "results":[{"id":"way/1259635603","osm_type":"way","osm_id":1259635603,"display_name":"دریاچه چیتگر",
    "names":{"name":"دریاچه چیتگر","name:en":"Chitgar Lake","name:fa":"دریاچه چیتگر"},
    "category":"tourism","subcategory":"attraction","lon":51.2149387,"lat":35.745582,"bbox":[…],
@@ -57,14 +57,19 @@ Every error is JSON with `Cache-Control: no-store`:
 | Resource | Cache-Control | Validator |
 | --- | --- | --- |
 | tiles (200 and empty 204) | `public, max-age=31536000, immutable` | `ETag "<release_id>-<z>-<x>-<y>"` |
-| style.json, glyphs, openapi.yaml | `public, max-age=86400` | content `ETag` |
+| style.json, glyphs, openapi.yaml | `public, max-age=86400` | `ETag` derived from the response bytes |
+| demo page / vendored MapLibre | `no-cache` / `public, max-age=86400` | `ETag` from file content; no `Last-Modified` (npm files carry a fixed mtime) |
 | manifest | `no-cache` (always revalidate) | content `ETag` |
 | search | `no-cache`; `public, max-age=300` when `release_id` is given | — |
 | errors | `no-store` | — |
 
 Release-pinned URLs are the cache keys: a new release has a new id and thus
 new style and tile URLs, so no cache needs purging when the active release
-changes. The style embeds `KARTA_PUBLIC_BASE_URL`; changing that value
+changes. The id covers every input that shapes served content (snapshot and
+provenance digests, data timestamp, region id/name/box/default view, schema
+and style revisions, attribution, osm2pgsql/PostgreSQL/PostGIS/GEOS/PROJ/ICU
+versions; see `karta.release_info.identity`), so an immutable URL never
+names different bytes. The style embeds `KARTA_PUBLIC_BASE_URL`; changing that value
 requires purging cached styles.
 
 ## CORS

@@ -10,8 +10,11 @@ info:
     addresses, house numbers, reverse geocoding and routing are not provided.
 
     **Releases.** A release is an immutable, validated import identified by
-    `release_id`, derived from the source snapshot SHA-256, the region and the
-    import-schema and style revisions. `GET /v1/manifest` names the active
+    `release_id`, a hash of everything that shapes what it serves: the source
+    snapshot and provenance digests, the data timestamp, the region (id, name,
+    box, default view), the import-schema and style revisions, the attribution
+    and the toolchain versions (osm2pgsql, PostgreSQL, PostGIS, GEOS, PROJ,
+    ICU). Changing any of them yields a new id and therefore new URLs. `GET /v1/manifest` names the active
     release; clients that need a consistent map and search session pin that
     `release_id` in tile/style URLs (always) and in search (optional). Stage 1
     serves one active release; requests for any other id return
@@ -33,7 +36,7 @@ info:
 
     **Caching.** Tiles: `public, max-age=31536000, immutable` (also for `204`
     empty tiles) with ETag `"<release_id>-<z>-<x>-<y>"`. Style and glyphs:
-    `public, max-age=86400` with a content ETag. Manifest: `no-cache` with a
+    `public, max-age=86400` with an ETag derived from the response bytes. Manifest: `no-cache` with a
     content ETag (revalidate with `If-None-Match`). Search: `no-cache`, or
     `public, max-age=300` when `release_id` is given. Errors: `no-store`.
     Cache keys are the full URL; the release id in the path keys tiles and

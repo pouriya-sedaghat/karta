@@ -70,8 +70,14 @@ refused with exit code 3. Do not substitute another snapshot silently.
 | 1 | other failure (database, osm2pgsql) | unchanged |
 | 130 | interrupted | unchanged |
 
-On failure the candidate database is dropped (`--keep-failed` keeps it for
-inspection) and the registry records the release as `failed` with the reason.
+Each import builds in a working database `karta_c<random>`; the release id
+is derived there (it includes the database toolchain versions) and the
+database is renamed to `karta_<release_id>` only after every check passed. On
+failure the candidate is dropped (`--keep-failed` keeps it for inspection
+until the next import, which removes leftover candidates) and the registry
+records the release as `failed` with the reason. Changing a region's name or
+default view, the provenance sidecar or the toolchain gives a new release id;
+changing only its acceptance thresholds does not.
 
 ## Normal operation
 

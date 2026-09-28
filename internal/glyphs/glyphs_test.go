@@ -69,11 +69,11 @@ func TestLatinRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.Range("Vazirmatn Regular", 0, 255)
+	r, err := s.Range("Vazirmatn Regular", 0, 255)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := decode(t, b)
+	d := decode(t, r.Data)
 	if d.name != "Vazirmatn Regular" || d.rng != "0-255" {
 		t.Fatalf("header = %q %q", d.name, d.rng)
 	}
@@ -120,11 +120,11 @@ func TestPersianPresentationForms(t *testing.T) {
 	}
 	for _, stack := range s.Fontstacks() {
 		for start, cps := range cases {
-			b, err := s.Range(stack, start, start+255)
+			r, err := s.Range(stack, start, start+255)
 			if err != nil {
 				t.Fatal(err)
 			}
-			d := decode(t, b)
+			d := decode(t, r.Data)
 			for _, cp := range cps {
 				g, ok := d.glyphs[cp]
 				if !ok {
@@ -144,11 +144,11 @@ func TestEmptyAndInvalidRanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.Range("Vazirmatn Regular", 0x4E00, 0x4EFF) // CJK: not in the font
+	r, err := s.Range("Vazirmatn Regular", 0x4E00, 0x4EFF) // CJK: not in the font
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d := decode(t, b); len(d.glyphs) != 0 || d.rng != "19968-20223" {
+	if d := decode(t, r.Data); len(d.glyphs) != 0 || d.rng != "19968-20223" {
 		t.Fatalf("CJK range = %d glyphs, %q", len(d.glyphs), d.rng)
 	}
 	for _, r := range [][2]int{{1, 256}, {0, 254}, {65536, 65791}, {-256, -1}} {
@@ -166,8 +166,45 @@ func TestDeterministic(t *testing.T) {
 	b, _ := New()
 	ra, _ := a.Range("Vazirmatn Bold", 0xFE00, 0xFEFF)
 	rb, _ := b.Range("Vazirmatn Bold", 0xFE00, 0xFEFF)
-	if string(ra) != string(rb) {
+	if string(ra.Data) != string(rb.Data) || ra.ETag != rb.ETag {
 		t.Fatal("glyph range output is not deterministic")
+	}
+}
+
+// Replacing the font behind a fontstack name must change the validator of
+// every affected range, or a revalidating client would keep stale glyphs.
+func TestETagFollowsContent(t *testing.T) {
+	regular, err := fontFiles.ReadFile("fonts/Vazirmatn-Regular.ttf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bold, err := fontFiles.ReadFile("fonts/Vazirmatn-Bold.ttf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := newSet(map[string][]byte{"Karta Sans": regular})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := newSet(map[string][]byte{"Karta Sans": bold})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, start := range []int{0, 0x0600, 0xFB00, 0xFE00} {
+		a, _ := before.Range("Karta Sans", start, start+255)
+		b, _ := after.Range("Karta Sans", start, start+255)
+		if string(a.Data) == string(b.Data) {
+			t.Fatalf("range %d: fonts produced identical bytes", start)
+		}
+		if a.ETag == b.ETag || !strings.HasPrefix(a.ETag, `"`) {
+			t.Errorf("range %d: ETag %s did not change with the content", start, a.ETag)
+		}
+	}
+	// Different ranges of one font have different validators too.
+	x, _ := before.Range("Karta Sans", 0, 255)
+	y, _ := before.Range("Karta Sans", 0xFE00, 0xFEFF)
+	if x.ETag == y.ETag {
+		t.Error("distinct ranges share an ETag")
 	}
 }
 
@@ -199,8 +236,8 @@ func TestVisualSample(t *testing.T) {
 		t.Skip("run with -v to print sample glyphs")
 	}
 	s, _ := New()
-	b, _ := s.Range("Vazirmatn Regular", 0xFB00, 0xFBFF)
-	d := decode(t, b)
+	r, _ := s.Range("Vazirmatn Regular", 0xFB00, 0xFBFF)
+	d := decode(t, r.Data)
 	for _, cp := range []int{0xFB58, 0xFB92} { // initial peh, isolated gaf
 		g := d.glyphs[cp]
 		t.Logf("U+%04X %+v\n%s", cp, Glyph{Width: g.Width, Height: g.Height, Left: g.Left, Top: g.Top, Advance: g.Advance}, ascii(g))

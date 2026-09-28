@@ -34,14 +34,28 @@ pointer. Stage 2 imports into a new candidate database while serving, then
 flips the pointer in one transaction; the API already resolves the release
 once per request and keeps one pool per release, so no consumer changes.
 Stage 1 only bootstraps: an import activates itself when nothing is active and
-refuses (exit 4) otherwise.
+refuses (exit 4) otherwise. **Stage 2 design gate:** `release.Manager.swap`
+closes the previous release's pool immediately, which is correct only because
+Stage 1 changes the pointer solely after a reset. Switching while serving must
+first keep the previous release resolvable for a grace period covering
+in-flight and pinned requests.
 
-**Release id = hash of validated inputs.** `r` + 24 hex of SHA-256 over the
-snapshot digest, region id and box, schema revision (digest of the flex
-config, SQL and layer catalog) and style revision (digest of the style
-template). The same inputs always give the same id; any change gives a new
-one. The schema also has a *major* version: the API serves releases whose
-major version it supports.
+**Release id = hash of every output-affecting input.** `r` + 24 hex of
+SHA-256 over a versioned canonical text (`releaseid.Canonical`, stored in
+`karta.release_info.identity`): snapshot digest, provenance-sidecar digest,
+data timestamp and its source, region id, name, box and default view, schema
+revision (digest of the flex config, SQL and layer catalog), style revision
+(digest of the style template), attribution and license, and the toolchain
+that shapes tiles and search (osm2pgsql, PostgreSQL, PostGIS, GEOS, PROJ,
+pg_trgm, ICU collation version). The toolchain is read from the candidate
+database, so an import builds in a randomly named `karta_c…` database and
+renames it to `karta_<release_id>` only after validation. Identical inputs
+always give the same id and any change gives a new one, so release-pinned
+style and tile URLs can be cached as immutable. Acceptance thresholds are
+excluded: they decide acceptance, not output. The schema also has a *major*
+version: the API serves releases whose major version it supports. Resources
+that are not release-pinned (glyphs, demo assets, the served style's
+rendering) carry validators derived from their bytes.
 
 **Search normalization inside the release database.** `karta.normalize()`
 builds the index at import and normalizes queries at request time, so the two

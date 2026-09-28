@@ -214,9 +214,12 @@ func (m *Manager) Refresh(ctx context.Context) {
 	m.setStatus(Status{Ready: true, Reason: ReasonReady, ReleaseID: ref.ID})
 }
 
-// swap replaces the active release. In Stage 1 the pointer changes only
-// after a reset and fresh import; Stage 2 keeps the previous release open for
-// a grace period so pinned clients and in-flight requests are not cut off.
+// swap replaces the active release and closes the previous release's pool
+// immediately. That is only safe in Stage 1, where the pointer changes solely
+// after a reset (the previous database no longer exists). Stage 2 design
+// gate, not implemented: before switching while serving, keep the previous
+// release loaded (Get must still resolve it) for a grace period covering
+// in-flight and pinned requests, then close its pool.
 func (m *Manager) swap(rel *Release) {
 	m.mu.Lock()
 	old := m.active

@@ -28,7 +28,11 @@ CREATE TABLE karta.release_info (
     license_url text NOT NULL,
     layers jsonb NOT NULL,
     style jsonb NOT NULL,
-    report jsonb NOT NULL
+    report jsonb NOT NULL,
+    -- The canonical text the release id is the hash of (releaseid.Canonical),
+    -- and the tool versions that produced the release.
+    identity text NOT NULL,
+    toolchain jsonb NOT NULL
 );
 
 GRANT USAGE ON SCHEMA karta TO karta_reader;

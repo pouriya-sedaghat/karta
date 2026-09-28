@@ -802,6 +802,16 @@ func TestStack(t *testing.T) {
 		}
 	})
 
+	t.Run("a changed default view is a new release, never the same immutable URLs", func(t *testing.T) {
+		// While a release is active the importer refuses, and names the
+		// different id the changed region would get.
+		_, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/data/testdata/regions/fixture-other-view.json")
+		m := regexp.MustCompile(`(r[0-9a-f]{24}) is serving; .* before importing (r[0-9a-f]{24})`).FindStringSubmatch(stderr)
+		if code != 4 || m == nil || m[1] != releaseID || m[2] == releaseID {
+			t.Fatalf("exit %d, ids %v; stderr:\n%s", code, m, stderr)
+		}
+	})
+
 	t.Run("database outage and recovery", func(t *testing.T) {
 		if _, stderr, code := compose(t, "stop", "db"); code != 0 {
 			t.Fatalf("stop db: %s", stderr)
@@ -820,6 +830,75 @@ func TestStack(t *testing.T) {
 		expectStatus(t, r, http.StatusOK)
 		if len(s.Results) == 0 || s.Results[0].ID != "way/100" {
 			t.Errorf("after recovery %v", ids(s))
+		}
+	})
+
+	t.Run("reset and rebuild with a changed default view gets new release URLs", func(t *testing.T) {
+		ctx := context.Background()
+		oldStyle := "/v1/releases/" + releaseID + "/style.json"
+		oldTile := "/v1/releases/" + releaseID + "/tiles/14/8192/8191.pbf"
+		expectStatus(t, get(t, oldStyle), http.StatusOK)
+		// Equivalent of `make reset` for the release data, done as the superuser.
+		reg := superuser(t, "karta_registry")
+		for _, sql := range []string{`DELETE FROM registry.active_release`, `DELETE FROM registry.releases`} {
+			if _, err := reg.Exec(ctx, sql); err != nil {
+				t.Fatal(err)
+			}
+		}
+		reg.Close(ctx)
+		pg := superuser(t, "postgres")
+		if _, err := pg.Exec(ctx, "DROP DATABASE karta_"+releaseID+" WITH (FORCE)"); err != nil {
+			t.Fatal(err)
+		}
+		pg.Close(ctx)
+		waitReady(t, false, "no_active_release")
+
+		res, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/data/testdata/regions/fixture-other-view.json")
+		if code != 0 || res.ReleaseID == "" || res.ReleaseID == releaseID {
+			t.Fatalf("exit %d, release %q (old %s); stderr:\n%s", code, res.ReleaseID, releaseID, stderr)
+		}
+		st := waitReady(t, true, "ready")
+		if st["release_id"] != res.ReleaseID {
+			t.Fatalf("serving %v, want %s", st["release_id"], res.ReleaseID)
+		}
+		var m struct {
+			StyleURL    string `json:"style_url"`
+			DefaultView struct {
+				Center [2]float64 `json:"center"`
+				Zoom   float64    `json:"zoom"`
+			} `json:"default_view"`
+		}
+		get(t, "/v1/manifest").json(t, &m)
+		if m.DefaultView.Zoom != 14 || m.DefaultView.Center != [2]float64{0.005, 0.005} || !strings.Contains(m.StyleURL, res.ReleaseID) {
+			t.Errorf("manifest %+v", m)
+		}
+		// The old immutable URLs are gone rather than serving new content.
+		expectError(t, get(t, oldStyle), http.StatusNotFound, "unknown_release", "release_id")
+		expectError(t, get(t, oldTile), http.StatusNotFound, "unknown_release", "release_id")
+		var style struct {
+			Zoom float64 `json:"zoom"`
+		}
+		get(t, "/v1/releases/"+res.ReleaseID+"/style.json").json(t, &style)
+		if style.Zoom != 14 {
+			t.Errorf("new style zoom %v", style.Zoom)
+		}
+		// The release records the canonical identity it was derived from.
+		conn := superuser(t, "karta_"+res.ReleaseID)
+		defer conn.Close(ctx)
+		var identity string
+		if err := conn.QueryRow(ctx, `SELECT identity FROM karta.release_info`).Scan(&identity); err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{`region.view.zoom="14.0000000"`, `toolchain.osm2pgsql=`, `toolchain.geos=`, `toolchain.icu=`} {
+			if !strings.Contains(identity, want) {
+				t.Errorf("identity lacks %s:\n%s", want, identity)
+			}
+		}
+		var leftovers int
+		pg2 := superuser(t, "postgres")
+		defer pg2.Close(ctx)
+		if err := pg2.QueryRow(ctx, `SELECT count(*) FROM pg_database WHERE datname LIKE 'karta\_c%'`).Scan(&leftovers); err != nil || leftovers != 0 {
+			t.Errorf("candidate databases left behind: %d %v", leftovers, err)
 		}
 	})
 }
