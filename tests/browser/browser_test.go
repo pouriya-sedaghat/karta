@@ -24,10 +24,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -136,6 +138,7 @@ func TestDemoRendersOffline(t *testing.T) {
 	if chrome != "" {
 		opts = append(opts, chromedp.ExecPath(chrome))
 	}
+	waitForQuietHostNetwork(t, 2*time.Second, 30*time.Second)
 	actx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	defer cancel()
 	ctx, cancel := chromedp.NewContext(actx)
@@ -293,6 +296,9 @@ func TestDemoRendersOffline(t *testing.T) {
 		}
 		if len(rec.failed) > 0 {
 			t.Errorf("failed loads: %v", rec.failed)
+			if strings.Contains(strings.Join(rec.failed, " "), "ERR_NETWORK_CHANGED") {
+				t.Logf("net::ERR_NETWORK_CHANGED is raised by Chromium, not the server: a host interface address changed during the test")
+			}
 		}
 		// MapLibre shapes Persian into Arabic Presentation Forms-B (U+FE70-U+FEFF).
 		if glyphRanges["65024-65279.pbf"] != 200 {
@@ -305,6 +311,60 @@ func TestDemoRendersOffline(t *testing.T) {
 			t.Logf("console %s", c)
 		}
 	})
+}
+
+// waitForQuietHostNetwork waits until the host's interface addresses have not
+// changed for quiet and no IPv6 address is still tentative. Chromium aborts
+// in-flight requests with net::ERR_NETWORK_CHANGED whenever a host address
+// changes, and the targets that run this test have just started containers:
+// each gets a veth whose IPv6 link-local address finishes duplicate address
+// detection a second or two later. After limit it logs and goes on.
+func waitForQuietHostNetwork(t *testing.T, quiet, limit time.Duration) {
+	start := time.Now()
+	last, _ := hostAddrs()
+	changed, changes := start, 0
+	for {
+		now := time.Now()
+		cur, tentative := hostAddrs()
+		if cur != last {
+			last, changed = cur, now
+			changes++
+		}
+		if !tentative && now.Sub(changed) >= quiet {
+			t.Logf("host network quiet for %v after %d change(s), waited %v", quiet, changes, now.Sub(start).Round(time.Millisecond))
+			return
+		}
+		if now.Sub(start) >= limit {
+			t.Logf("host network still changing after %v (tentative IPv6: %v); starting the browser anyway", limit, tentative)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// hostAddrs returns a snapshot of every interface's state and addresses and
+// whether an IPv6 address is tentative (package net does not expose IPv6
+// address flags; /proc/net/if_inet6 does, on Linux).
+func hostAddrs() (string, bool) {
+	var b strings.Builder
+	ifs, _ := net.Interfaces()
+	for _, i := range ifs {
+		addrs, _ := i.Addrs()
+		fmt.Fprintf(&b, "%s %v %v\n", i.Name, i.Flags, addrs)
+	}
+	tentative := false
+	if raw, err := os.ReadFile("/proc/net/if_inet6"); err == nil {
+		b.Write(raw)
+		for _, line := range strings.Split(string(raw), "\n") {
+			// address ifindex prefixlen scope flags name; IFA_F_TENTATIVE = 0x40
+			if f := strings.Fields(line); len(f) == 6 {
+				if flags, err := strconv.ParseUint(f[4], 16, 32); err == nil && flags&0x40 != 0 {
+					tentative = true
+				}
+			}
+		}
+	}
+	return b.String(), tentative
 }
 
 // waitIdle waits until the map exists, its style and tiles are loaded and it
