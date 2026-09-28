@@ -1,0 +1,4 @@
+/data/local/
+*.osm.pbf
+*.osm.pbf.provenance.json
+__pycache__/
