@@ -51,7 +51,7 @@ pg_trgm, ICU collation version). The toolchain is read from the candidate
 database, so an import builds in a randomly named `karta_c…` database and
 renames it to `karta_<release_id>` only after validation. Identical inputs
 always give the same id and any change gives a new one, so release-pinned
-style and tile URLs can be cached as immutable. The invariant is exact: if
+tile URLs can be cached as immutable. The invariant is exact: if
 an accepted input changes release-pinned output, the id changes. Values are
 therefore hashed as they are served, never rounded: the box, center and zoom
 are stored as `double precision` and published at full float64 precision,
@@ -61,9 +61,34 @@ version 3; version 2 rounded to 7 decimals, so boxes or views less than
 1e-7 apart could share an id while serving different styles). The 1e-7
 tolerance of the snapshot header check only decides acceptance. Acceptance thresholds are
 excluded: they decide acceptance, not output. The schema also has a *major*
-version: the API serves releases whose major version it supports. Resources
-that are not release-pinned (glyphs, demo assets, the served style's
-rendering) carry validators derived from their bytes.
+version: the API serves releases whose major version it supports. Glyphs and
+demo assets are not release-pinned; they carry validators derived from their
+bytes and are cached for at most a day.
+
+**Content-addressed style URLs.** The served style is `style.Render` over the
+stored template and release metadata, so its bytes also depend on the API
+build (the renderer) and on `KARTA_PUBLIC_BASE_URL`, which it embeds in tile
+and glyph URLs. Neither is part of the release id, and an upgraded API serves
+releases imported by older versions. A style URL keyed only by the release id
+could therefore name different bytes after an upgrade or a base URL change,
+and a content ETag does not help clients during the style's freshness period.
+The style URL is instead `/v1/releases/{release_id}/styles/{style_id}.json`
+with `style_id` = the first 128 bits of SHA-256 over the served bytes: it is
+cached as immutable, any other `style_id` is `404 unknown_style`, and the
+always-revalidated manifest issues the current one.
+`/v1/releases/{release_id}/style.json`, the release-pinned path named in ADR
+0001, remains as a `no-cache` redirect to it and never returns style bytes.
+This holds for every cause of a byte change, needs no migration of existing
+(read-only) release databases, and removes the earlier "purge cached styles
+after changing `KARTA_PUBLIC_BASE_URL`" exception. Rejected alternatives:
+storing rendered output in the release (it embeds the base URL, and existing
+databases would need migrating or re-importing), and a renderer version in the
+release id with incompatible releases refused (every renderer change would
+force a re-import and downtime, and it still would not cover the base URL).
+Remaining gap: tile bytes are generated on the serving database, and the API
+does not yet refuse a release whose recorded PostgreSQL/PostGIS/GEOS/PROJ
+versions differ from the serving ones, so the database image must only be
+upgraded together with a re-import.
 
 **Search normalization inside the release database.** `karta.normalize()`
 builds the index at import and normalizes queries at request time, so the two

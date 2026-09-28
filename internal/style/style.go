@@ -29,7 +29,9 @@ func Template() json.RawMessage {
 }
 
 // Revision is a digest of the style template; it is part of every release
-// identifier, so a style change creates a new release.
+// identifier, so a template change creates a new release. It does not cover
+// Render, whose output also depends on this code and the public base URL:
+// the API content-addresses the style URL by the rendered bytes instead.
 func Revision() string {
 	sum := sha256.Sum256(template)
 	return "st1-" + hex.EncodeToString(sum[:])[:16]

@@ -15,6 +15,8 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,7 +50,10 @@ var (
 	dbPort     = env("KARTA_TEST_DB_PORT", "55433")
 	repoRoot   = "../.."
 	router     routers.Router
-	client     = &http.Client{Timeout: 30 * time.Second}
+	// The client never follows redirects, so each response is checked as sent.
+	client = &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
 	fixtureBox = [4]float64{0, 0, 0.02, 0.015}
 )
 
@@ -174,7 +179,15 @@ func expectError(t *testing.T, r response, status int, code, param string) {
 
 func compose(t *testing.T, args ...string) (string, string, int) {
 	t.Helper()
+	return composeEnv(t, nil, args...)
+}
+
+// composeEnv runs docker compose with extra environment variables, which
+// compose.test.yaml interpolates (e.g. KARTA_TEST_PUBLIC_BASE_URL).
+func composeEnv(t *testing.T, env []string, args ...string) (string, string, int) {
+	t.Helper()
 	cmd := exec.Command("sh", "-c", composeCmd+" "+strings.Join(args, " "))
+	cmd.Env = append(os.Environ(), env...)
 	cmd.Dir = repoRoot
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -288,6 +301,41 @@ func ids(s searchResp) []string {
 
 // --- the test ---------------------------------------------------------------------
 
+var styleURLPattern = regexp.MustCompile(`^(.+)(/v1/releases/(r[0-9a-f]{24})/styles/([0-9a-f]{32})\.json)$`)
+
+// styleURLParts splits a content-addressed style URL into its public base,
+// path (relative to that base) and style id.
+func styleURLParts(t *testing.T, styleURL string) (publicBase, path, styleID string) {
+	t.Helper()
+	m := styleURLPattern.FindStringSubmatch(styleURL)
+	if m == nil {
+		t.Fatalf("style URL %q is not content-addressed", styleURL)
+	}
+	return m[1], m[2], m[4]
+}
+
+// manifestStyleURL returns the style URL the manifest currently issues.
+func manifestStyleURL(t *testing.T) string {
+	t.Helper()
+	var m struct {
+		StyleURL string `json:"style_url"`
+	}
+	r := get(t, "/v1/manifest")
+	expectStatus(t, r, http.StatusOK)
+	r.json(t, &m)
+	return m.StyleURL
+}
+
+// recreateAPI replaces the API container, as an upgrade or reconfiguration
+// does, and waits until it serves the existing release again.
+func recreateAPI(t *testing.T, env ...string) {
+	t.Helper()
+	if _, stderr, code := composeEnv(t, env, "up", "-d", "--no-deps", "--force-recreate", "api"); code != 0 {
+		t.Fatalf("recreate api: %s", stderr)
+	}
+	waitReady(t, true, "ready")
+}
+
 // dropRelease is `make reset` for one release, done as the superuser: the
 // registry forgets every release and the release database is dropped.
 func dropRelease(t *testing.T, id string) {
@@ -333,7 +381,7 @@ func noCandidatesLeft(t *testing.T) {
 }
 
 func TestStack(t *testing.T) {
-	var releaseID, otherViewID string
+	var releaseID, otherViewID, styleURL string
 	// fixtureStyle is the style served at the fixture release's pinned URL.
 	var fixtureStyle []byte
 
@@ -421,10 +469,11 @@ func TestStack(t *testing.T) {
 		if m.Release.ReleaseID != releaseID || m.Release.DataTimestamp != "2026-01-01T00:00:00Z" || len(m.Release.SourceSHA256) != 64 {
 			t.Errorf("release %+v", m.Release)
 		}
-		if m.StyleURL != base+"/v1/releases/"+releaseID+"/style.json" ||
+		if pb, path, _ := styleURLParts(t, m.StyleURL); pb != base || !strings.HasPrefix(path, "/v1/releases/"+releaseID+"/styles/") ||
 			m.Tiles.URLTemplate != base+"/v1/releases/"+releaseID+"/tiles/{z}/{x}/{y}.pbf" || m.Tiles.MaxZoom != 16 {
 			t.Errorf("urls %q %q", m.StyleURL, m.Tiles.URLTemplate)
 		}
+		styleURL = m.StyleURL
 		if m.Attribution.Text != "© OpenStreetMap contributors" {
 			t.Errorf("attribution %q", m.Attribution.Text)
 		}
@@ -555,8 +604,12 @@ func TestStack(t *testing.T) {
 
 	var style map[string]any
 	t.Run("style", func(t *testing.T) {
-		r := get(t, "/v1/releases/"+releaseID+"/style.json")
+		_, stylePath, styleID := styleURLParts(t, styleURL)
+		r := get(t, stylePath)
 		expectStatus(t, r, http.StatusOK)
+		if sum := sha256.Sum256(r.body); hex.EncodeToString(sum[:16]) != styleID {
+			t.Errorf("style URL %s does not name the served bytes", styleURL)
+		}
 		r.json(t, &style)
 		src := style["sources"].(map[string]any)["karta"].(map[string]any)
 		tiles := src["tiles"].([]any)
@@ -602,10 +655,18 @@ func TestStack(t *testing.T) {
 		if !strings.Contains(src["attribution"].(string), "https://www.openstreetmap.org/copyright") {
 			t.Errorf("attribution %v", src["attribution"])
 		}
-		if r.header.Get("ETag") == "" || r.header.Get("Cache-Control") != "public, max-age=86400" {
+		if r.header.Get("ETag") != `"`+styleID+`"` || r.header.Get("Cache-Control") != "public, max-age=31536000, immutable" {
 			t.Errorf("cache headers %v", r.header)
 		}
-		expectStatus(t, do(t, http.MethodGet, "/v1/releases/"+releaseID+"/style.json", map[string]string{"If-None-Match": r.header.Get("ETag")}, nil), http.StatusNotModified)
+		expectStatus(t, do(t, http.MethodGet, stylePath, map[string]string{"If-None-Match": r.header.Get("ETag")}, nil), http.StatusNotModified)
+		// The release-pinned path only redirects, uncached, to the current URL.
+		red := get(t, "/v1/releases/"+releaseID+"/style.json")
+		if red.status != http.StatusTemporaryRedirect || red.header.Get("Location") != styleURL || red.header.Get("Cache-Control") != "no-cache" || len(red.body) != 0 {
+			t.Errorf("style.json: %d %v %q", red.status, red.header, red.body)
+		}
+		expectError(t, get(t, "/v1/releases/"+releaseID+"/styles/"+strings.Repeat("0", 32)+".json"), http.StatusNotFound, "unknown_style", "style_id")
+		expectError(t, get(t, "/v1/releases/"+releaseID+"/styles/latest.json"), http.StatusBadRequest, "invalid_parameter", "style_id")
+		expectError(t, get(t, "/v1/releases/r000000000000000000000000/styles/"+styleID+".json"), http.StatusNotFound, "unknown_release", "release_id")
 		expectError(t, get(t, "/v1/releases/r000000000000000000000000/style.json"), http.StatusNotFound, "unknown_release", "release_id")
 		expectError(t, get(t, "/v1/releases/latest/style.json"), http.StatusBadRequest, "invalid_parameter", "release_id")
 	})
@@ -742,7 +803,11 @@ func TestStack(t *testing.T) {
 			expectStatus(t, get(t, p), http.StatusOK)
 		}
 		expectError(t, get(t, "/demo/vendor/"), http.StatusNotFound, "not_found", "")
-		expectError(t, get(t, "/demo/../go.mod"), http.StatusNotFound, "not_found", "")
+		// net/http cleans the path with a redirect; the cleaned path is not a file.
+		if r := get(t, "/demo/../go.mod"); r.status != http.StatusTemporaryRedirect || r.header.Get("Location") != "/go.mod" {
+			t.Errorf("traversal: %d %v", r.status, r.header)
+		}
+		expectError(t, get(t, "/go.mod"), http.StatusNotFound, "not_found", "")
 		spec := get(t, "/v1/openapi.yaml")
 		expectStatus(t, spec, http.StatusOK)
 		if !bytes.Equal(spec.body, openapi.Spec) {
@@ -809,6 +874,62 @@ func TestStack(t *testing.T) {
 		if len(s.Results) == 0 || s.Results[0].ID != "way/302" {
 			t.Errorf("after restart %v", ids(s))
 		}
+	})
+
+	t.Run("a new public base URL issues a new style URL and stops serving the old one", func(t *testing.T) {
+		// The existing release database is served by a recreated API container
+		// with another KARTA_PUBLIC_BASE_URL, then by one with the original
+		// value again. Tile bytes do not depend on the base URL; style bytes do.
+		_, oldPath, oldID := styleURLParts(t, manifestStyleURL(t))
+		oldStyle := get(t, oldPath)
+		expectStatus(t, oldStyle, http.StatusOK)
+		tilePath := "/v1/releases/" + releaseID + "/tiles/14/8192/8191.pbf"
+		oldTile := get(t, tilePath)
+		expectStatus(t, oldTile, http.StatusOK)
+
+		moved := strings.Replace(base, "127.0.0.1", "localhost", 1)
+		if moved == base {
+			t.Skipf("base %s has no 127.0.0.1 host to swap", base)
+		}
+		recreateAPI(t, "KARTA_TEST_PUBLIC_BASE_URL="+moved)
+		var m struct {
+			Release struct {
+				ReleaseID string `json:"release_id"`
+			} `json:"release"`
+			StyleURL string `json:"style_url"`
+			Tiles    struct {
+				URLTemplate string `json:"url_template"`
+			} `json:"tiles"`
+		}
+		get(t, "/v1/manifest").json(t, &m)
+		newBase, newPath, newID := styleURLParts(t, m.StyleURL)
+		if newBase != moved || newID == oldID || m.Release.ReleaseID != releaseID ||
+			m.Tiles.URLTemplate != moved+"/v1/releases/"+releaseID+"/tiles/{z}/{x}/{y}.pbf" {
+			t.Fatalf("manifest after the base URL change: %+v (old style %s)", m, oldID)
+		}
+		expectError(t, get(t, oldPath), http.StatusNotFound, "unknown_style", "style_id")
+		newStyle := get(t, newPath)
+		expectStatus(t, newStyle, http.StatusOK)
+		if !bytes.Contains(newStyle.body, []byte(`"`+moved+`/v1/releases/`+releaseID+`/tiles/{z}/{x}/{y}.pbf"`)) || bytes.Contains(newStyle.body, []byte(base)) {
+			t.Errorf("style under %s still names %s or lacks its tiles", moved, base)
+		}
+		if red := get(t, "/v1/releases/"+releaseID+"/style.json"); red.header.Get("Location") != m.StyleURL {
+			t.Errorf("style.json redirects to %q, want %q", red.header.Get("Location"), m.StyleURL)
+		}
+		if tile := get(t, tilePath); !bytes.Equal(tile.body, oldTile.body) || tile.header.Get("ETag") != oldTile.header.Get("ETag") {
+			t.Error("tile bytes changed with the base URL")
+		}
+
+		// Back to the original configuration: the original URL and bytes, and
+		// the URL issued meanwhile is no longer served.
+		recreateAPI(t)
+		if got := manifestStyleURL(t); got != base+oldPath {
+			t.Fatalf("style URL after restoring the base URL: %s, want %s", got, base+oldPath)
+		}
+		if again := get(t, oldPath); !bytes.Equal(again.body, oldStyle.body) {
+			t.Error("the same release, renderer and base URL gave different style bytes")
+		}
+		expectError(t, get(t, newPath), http.StatusNotFound, "unknown_style", "style_id")
 	})
 
 	t.Run("a style that references a missing layer is refused", func(t *testing.T) {
@@ -892,7 +1013,7 @@ func TestStack(t *testing.T) {
 	})
 
 	t.Run("reset and rebuild with a changed default view gets new release URLs", func(t *testing.T) {
-		oldStyle := "/v1/releases/" + releaseID + "/style.json"
+		_, oldStyle, _ := styleURLParts(t, manifestStyleURL(t))
 		oldTile := "/v1/releases/" + releaseID + "/tiles/14/8192/8191.pbf"
 		r := get(t, oldStyle)
 		expectStatus(t, r, http.StatusOK)
@@ -925,7 +1046,8 @@ func TestStack(t *testing.T) {
 		var style struct {
 			Zoom float64 `json:"zoom"`
 		}
-		get(t, "/v1/releases/"+res.ReleaseID+"/style.json").json(t, &style)
+		_, newStylePath, _ := styleURLParts(t, m.StyleURL)
+		get(t, newStylePath).json(t, &style)
 		if style.Zoom != 14 {
 			t.Errorf("new style zoom %v", style.Zoom)
 		}
@@ -949,7 +1071,11 @@ func TestStack(t *testing.T) {
 			t.Fatalf("exit %d, release %q (fixture %s, other view %s); stderr:\n%s", code, res.ReleaseID, releaseID, otherViewID, stderr)
 		}
 		waitReady(t, true, "ready")
-		newStyle := get(t, "/v1/releases/"+res.ReleaseID+"/style.json")
+		_, newStylePath, _ := styleURLParts(t, manifestStyleURL(t))
+		if !strings.HasPrefix(newStylePath, "/v1/releases/"+res.ReleaseID+"/styles/") {
+			t.Fatalf("style path %s is not pinned to %s", newStylePath, res.ReleaseID)
+		}
+		newStyle := get(t, newStylePath)
 		expectStatus(t, newStyle, http.StatusOK)
 		// The rebuilt style, placed at the fixture's old URL, would differ
 		// from what that URL served; so the old URL must not be reused.
@@ -958,6 +1084,8 @@ func TestStack(t *testing.T) {
 			t.Fatal("the sub-1e-7 change is not visible in the style; the test does not exercise the invariant")
 		}
 		expectError(t, get(t, "/v1/releases/"+releaseID+"/style.json"), http.StatusNotFound, "unknown_release", "release_id")
+		_, fixtureStylePath, _ := styleURLParts(t, styleURL)
+		expectError(t, get(t, fixtureStylePath), http.StatusNotFound, "unknown_release", "release_id")
 		// The exact stored values are what is published.
 		var style struct {
 			Center  [2]float64 `json:"center"`

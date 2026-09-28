@@ -18,8 +18,10 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -79,11 +81,23 @@ type Server struct {
 	glyphs   *glyphs.Set
 	log      *slog.Logger
 	web      *os.Root
+	render   styleRenderer
+
+	styleMu sync.Mutex
+	styles  map[*release.Release]renderedStyle
 }
+
+// styleRenderer produces the style bytes served for a release; style.Render
+// in production, replaceable in tests to simulate a later API version.
+type styleRenderer func(stored json.RawMessage, p style.Params) ([]byte, error)
 
 // New builds the HTTP handler.
 func New(cfg Config, releases Releases, g *glyphs.Set, log *slog.Logger) (http.Handler, error) {
-	s := &Server{cfg: cfg, releases: releases, glyphs: g, log: log}
+	return newHandler(cfg, releases, g, log, style.Render)
+}
+
+func newHandler(cfg Config, releases Releases, g *glyphs.Set, log *slog.Logger, render styleRenderer) (http.Handler, error) {
+	s := &Server{cfg: cfg, releases: releases, glyphs: g, log: log, render: render, styles: map[*release.Release]renderedStyle{}}
 	if cfg.WebDir != "" {
 		root, err := os.OpenRoot(cfg.WebDir)
 		if err != nil {
@@ -96,7 +110,8 @@ func New(cfg Config, releases Releases, g *glyphs.Set, log *slog.Logger) (http.H
 	mux.HandleFunc("GET /health/ready", s.ready)
 	mux.HandleFunc("GET /v1/manifest", s.manifest)
 	mux.HandleFunc("GET /v1/search", s.search)
-	mux.HandleFunc("GET /v1/releases/{release_id}/style.json", s.style)
+	mux.HandleFunc("GET /v1/releases/{release_id}/style.json", s.styleRedirect)
+	mux.HandleFunc("GET /v1/releases/{release_id}/styles/{style}", s.style)
 	mux.HandleFunc("GET /v1/releases/{release_id}/tiles/{z}/{x}/{y}", s.tile)
 	mux.HandleFunc("GET /v1/fonts/{fontstack}/{range}", s.font)
 	mux.HandleFunc("GET /v1/openapi.yaml", s.openapi)
@@ -263,6 +278,12 @@ func (s *Server) manifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	i := rel.Info
+	rs, err := s.renderedStyle(rel)
+	if err != nil {
+		s.log.Error("render style", "release_id", i.ReleaseID, "err", err)
+		writeError(w, r, http.StatusInternalServerError, CodeInternal, "style rendering failed", "")
+		return
+	}
 	layers := make([]string, 0, len(rel.Catalog.Layers))
 	for _, l := range rel.Catalog.Layers {
 		layers = append(layers, l.ID)
@@ -276,7 +297,7 @@ func (s *Server) manifest(w http.ResponseWriter, r *http.Request) {
 			DataTimestamp: ts, TimestampFrom: i.DataTimestampSource, SourceSHA256: i.SourceSHA256,
 			ImportedAt: i.ImportedAt.UTC().Format(time.RFC3339), SchemaRevision: i.SchemaRevision, StyleRevision: i.StyleRevision,
 		},
-		StyleURL: base + "/v1/releases/" + i.ReleaseID + "/style.json",
+		StyleURL: s.styleURL(i.ReleaseID, rs.id),
 		Tiles: manifestTiles{
 			URLTemplate: style.TileURLTemplate(base, i.ReleaseID), Format: "mvt",
 			MinZoom: i.MinZoom, MaxZoom: i.MaxZoom, Bounds: i.BBox, Layers: layers,
@@ -480,7 +501,100 @@ func (s *Server) dbError(w http.ResponseWriter, r *http.Request, err error) {
 
 // --- style and tiles ----------------------------------------------------------
 
+// renderedStyle is the style this server serves for one release and the id
+// of those exact bytes. Style URLs are content-addressed by that id, so a
+// style URL can only ever name one byte sequence: when a later API version
+// renders an existing release differently, or KARTA_PUBLIC_BASE_URL changes,
+// the style gets a new id and URL, and the old URL is no longer served.
+type renderedStyle struct {
+	body []byte
+	id   string
+}
+
+// styleIDPattern matches style ids: 128 bits of SHA-256 over the style bytes.
+var styleIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// maxRenderedStyles bounds the memo of rendered styles; a server holds few
+// releases, and an evicted entry is simply rendered again (deterministically).
+const maxRenderedStyles = 8
+
+func (s *Server) renderedStyle(rel *release.Release) (renderedStyle, error) {
+	s.styleMu.Lock()
+	defer s.styleMu.Unlock()
+	if rs, ok := s.styles[rel]; ok {
+		return rs, nil
+	}
+	i := rel.Info
+	b, err := s.render(rel.Style, style.Params{
+		ReleaseID: i.ReleaseID, BaseURL: s.cfg.PublicBaseURL, Bounds: i.BBox, Center: i.Center,
+		Zoom: i.Zoom, MinZoom: i.MinZoom, MaxZoom: i.MaxZoom, Attribution: i.Attribution,
+	})
+	if err != nil {
+		return renderedStyle{}, err
+	}
+	sum := sha256.Sum256(b)
+	rs := renderedStyle{body: b, id: hex.EncodeToString(sum[:16])}
+	if len(s.styles) >= maxRenderedStyles {
+		clear(s.styles)
+	}
+	s.styles[rel] = rs
+	return rs, nil
+}
+
+// styleURL is the content-addressed URL of a release's style.
+func (s *Server) styleURL(releaseID, styleID string) string {
+	return s.cfg.PublicBaseURL + "/v1/releases/" + releaseID + "/styles/" + styleID + ".json"
+}
+
+// style serves a release's style at its content-addressed URL. The URL names
+// exactly these bytes, so they are immutable; any other style id (one issued
+// by an earlier API version or under another public base URL) is 404.
 func (s *Server) style(w http.ResponseWriter, r *http.Request) {
+	if !s.noParams(w, r) {
+		return
+	}
+	styleID, found := strings.CutSuffix(r.PathValue("style"), ".json")
+	if !found {
+		writeError(w, r, http.StatusNotFound, CodeNotFound, "styles are served as styles/{style_id}.json", "")
+		return
+	}
+	rel, _, ok := s.resolve(w, r, r.PathValue("release_id"), true)
+	if !ok {
+		return
+	}
+	if !styleIDPattern.MatchString(styleID) {
+		writeError(w, r, http.StatusBadRequest, CodeInvalidParameter, "style_id must match "+styleIDPattern.String(), "style_id")
+		return
+	}
+	rs, err := s.renderedStyle(rel)
+	if err != nil {
+		s.log.Error("render style", "release_id", rel.Info.ReleaseID, "err", err)
+		writeError(w, r, http.StatusInternalServerError, CodeInternal, "style rendering failed", "")
+		return
+	}
+	if styleID != rs.id {
+		writeError(w, r, http.StatusNotFound, CodeUnknownStyle,
+			"style "+styleID+" is not served for release "+rel.Info.ReleaseID+"; the manifest names the current style URL", "style_id")
+		return
+	}
+	h := w.Header()
+	etag := `"` + rs.id + `"`
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	h.Set("Cache-Control", cacheImmutable)
+	h.Set("ETag", etag)
+	if match(r, etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	h.Set("Content-Length", strconv.Itoa(len(rs.body)))
+	_, _ = w.Write(rs.body)
+}
+
+// styleRedirect resolves the release-pinned style path to the current
+// content-addressed style URL. It never returns style bytes itself and must
+// be revalidated, so a client always ends up at the URL naming the bytes it
+// receives.
+func (s *Server) styleRedirect(w http.ResponseWriter, r *http.Request) {
 	if !s.noParams(w, r) {
 		return
 	}
@@ -488,17 +602,16 @@ func (s *Server) style(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	i := rel.Info
-	b, err := style.Render(rel.Style, style.Params{
-		ReleaseID: i.ReleaseID, BaseURL: s.cfg.PublicBaseURL, Bounds: i.BBox, Center: i.Center,
-		Zoom: i.Zoom, MinZoom: i.MinZoom, MaxZoom: i.MaxZoom, Attribution: i.Attribution,
-	})
+	rs, err := s.renderedStyle(rel)
 	if err != nil {
-		s.log.Error("render style", "err", err)
+		s.log.Error("render style", "release_id", rel.Info.ReleaseID, "err", err)
 		writeError(w, r, http.StatusInternalServerError, CodeInternal, "style rendering failed", "")
 		return
 	}
-	writeBytes(w, r, http.StatusOK, "application/json; charset=utf-8", cacheDay, b, true)
+	h := w.Header()
+	h.Set("Location", s.styleURL(rel.Info.ReleaseID, rs.id))
+	h.Set("Cache-Control", cacheRevalid)
+	w.WriteHeader(http.StatusTemporaryRedirect)
 }
 
 func parseTileCoord(s string, maxDigits int) (int, bool) {

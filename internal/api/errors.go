@@ -11,6 +11,7 @@ const (
 	CodeUnknownParameter = "unknown_parameter"
 	CodeInvalidQuery     = "invalid_query"
 	CodeUnknownRelease   = "unknown_release"
+	CodeUnknownStyle     = "unknown_style"
 	CodeNoActiveRelease  = "no_active_release"
 	CodeInvalidTile      = "invalid_tile_coordinates"
 	CodeZoomOutOfRange   = "tile_zoom_out_of_range"

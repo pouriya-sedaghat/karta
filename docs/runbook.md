@@ -93,6 +93,14 @@ gives a new release id; changing only its acceptance thresholds does not.
   requests return 503; the API recovers by itself when the database returns.
 * Resource limits (override in `.env`): db 2 GiB / 2 CPUs, api 512 MiB / 1 CPU,
   importer 4 GiB. Measured use for the Chitgar sample is in the PR description.
+* Upgrading the API image or changing `KARTA_PUBLIC_BASE_URL` needs no cache
+  purge and no re-import: existing releases keep their ids and tile URLs, the
+  style gets a new content-addressed URL (the manifest issues it), and style
+  URLs issued before return `404 unknown_style` rather than different bytes.
+* Upgrading the database image (PostgreSQL/PostGIS) is different: tiles are
+  generated on the serving database, and the API does not yet compare its
+  versions with the toolchain a release was built with. Upgrade it only
+  together with `make reset` and a re-import, which gives a new release id.
 
 ## Reset and cleanup
 

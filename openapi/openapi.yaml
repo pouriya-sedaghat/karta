@@ -20,6 +20,17 @@ info:
     serves one active release; requests for any other id return
     `404 unknown_release`.
 
+    **Styles are content-addressed.** The style URL the manifest issues,
+    `/v1/releases/{release_id}/styles/{style_id}.json`, names one exact byte
+    sequence: `style_id` is the first 128 bits (32 hex digits) of SHA-256 over
+    the style bytes. The bytes depend on the release and on this server (its
+    renderer and `KARTA_PUBLIC_BASE_URL`), so after an API upgrade that renders
+    differently, or a base URL change, the same release gets a new style URL
+    and the old one returns `404 unknown_style`; a style URL never serves
+    different bytes. Clients take the style URL from the manifest (or follow
+    `/v1/releases/{release_id}/style.json`) and refetch the manifest on
+    `unknown_style`.
+
     **Compatibility.** Within `/v1`, changes are additive: new endpoints,
     optional parameters, response fields and error codes may be added; existing
     fields, parameters and codes are not removed or redefined. Clients must
@@ -35,12 +46,16 @@ info:
     response carries `X-Request-ID`.
 
     **Caching.** Tiles: `public, max-age=31536000, immutable` (also for `204`
-    empty tiles) with ETag `"<release_id>-<z>-<x>-<y>"`. Style and glyphs:
-    `public, max-age=86400` with an ETag derived from the response bytes. Manifest: `no-cache` with a
+    empty tiles) with ETag `"<release_id>-<z>-<x>-<y>"`. Style (at its
+    content-addressed URL): `public, max-age=31536000, immutable` with ETag
+    `"<style_id>"`. `/v1/releases/{release_id}/style.json`: a `307` redirect to
+    the current style URL with `no-cache`. Glyphs: `public, max-age=86400` with
+    an ETag derived from the response bytes. Manifest: `no-cache` with a
     content ETag (revalidate with `If-None-Match`). Search: `no-cache`, or
     `public, max-age=300` when `release_id` is given. Errors: `no-store`.
-    Cache keys are the full URL; the release id in the path keys tiles and
-    styles by release.
+    Cache keys are the full URL: the release id keys tiles, the style id keys
+    the style bytes, so nothing needs purging when the release, the renderer or
+    `KARTA_PUBLIC_BASE_URL` changes.
 
     OpenStreetMap data © OpenStreetMap contributors, available under the Open
     Database License (ODbL 1.0), https://www.openstreetmap.org/copyright.
@@ -160,15 +175,46 @@ paths:
         "413": { $ref: "#/components/responses/Error" }
   /v1/releases/{release_id}/style.json:
     get:
-      summary: MapLibre style for a release
+      summary: Current style URL of a release
+      operationId: styleRedirect
+      description: |
+        Redirects to the release's current content-addressed style URL (the
+        manifest's `style_url` for the active release). It never returns style
+        bytes itself and is not cached without revalidation, so the style a
+        client receives is always named by the URL it was redirected to.
+      parameters:
+        - $ref: "#/components/parameters/ReleaseIDPath"
+      responses:
+        "307":
+          description: Redirect to `/v1/releases/{release_id}/styles/{style_id}.json`.
+          headers:
+            Location:
+              description: Absolute content-addressed style URL under `KARTA_PUBLIC_BASE_URL`.
+              schema: { type: string, format: uri }
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "405": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /v1/releases/{release_id}/styles/{style_id}.json:
+    get:
+      summary: MapLibre style for a release (content-addressed)
       operationId: style
       description: |
         A MapLibre style (version 8) whose source, tile URLs, glyph URLs, bounds
         and attribution are pinned to the release and to this server's
         `KARTA_PUBLIC_BASE_URL`. It uses only tile layers and fields listed in
         the release's layer catalog and fontstacks served under `/v1/fonts`.
+        `style_id` is the first 128 bits of SHA-256 over the response body, so
+        the response is immutable; a `style_id` this server does not currently
+        produce for the release (for example one issued before an upgrade or a
+        base URL change) is `404 unknown_style`.
       parameters:
         - $ref: "#/components/parameters/ReleaseIDPath"
+        - name: style_id
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[0-9a-f]{32}$" }
       responses:
         "200":
           description: Style JSON.
@@ -297,7 +343,7 @@ components:
           properties:
             code:
               type: string
-              enum: [invalid_parameter, unknown_parameter, invalid_query, unknown_release, no_active_release,
+              enum: [invalid_parameter, unknown_parameter, invalid_query, unknown_release, unknown_style, no_active_release,
                      invalid_tile_coordinates, tile_zoom_out_of_range, unknown_fontstack, not_found,
                      method_not_allowed, request_body_not_allowed, timeout, service_unavailable, internal_error]
             message: { type: string }
@@ -342,7 +388,10 @@ components:
             imported_at: { type: string, format: date-time }
             schema_revision: { type: string }
             style_revision: { type: string }
-        style_url: { type: string, format: uri }
+        style_url:
+          type: string
+          format: uri
+          description: Content-addressed style URL, `…/v1/releases/{release_id}/styles/{style_id}.json`; it changes whenever the style bytes change.
         tiles:
           type: object
           required: [url_template, format, minzoom, maxzoom, bounds, layers]
