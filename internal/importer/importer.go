@@ -304,15 +304,16 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 	inputs := releaseid.Inputs{
 		SourceSHA256: info.SHA256, ProvenanceSHA256: provDigest,
 		DataTimestamp: src.DataTimestamp, DataTimestampSource: src.DataTimestampSource,
-		Region: releaseid.Region{
-			ID: cfg.ID, Name: cfg.Name, BBox: cfg.BBox, Center: cfg.View.Center, Zoom: cfg.View.Zoom,
-		},
-		SchemaRevision: schemaRev, StyleRevision: styleRev,
+		Region: cfg.Identity(), SchemaRevision: schemaRev, StyleRevision: styleRev,
 		Attribution: Attribution, License: License, LicenseURL: LicenseURL,
 		Toolchain: toolchain,
 	}
-	id := releaseid.Derive(inputs)
-	identity := releaseid.Canonical(inputs)
+	id, identity, err := releaseid.Derive(inputs)
+	if err != nil {
+		_ = rel.Close(ctx)
+		discard()
+		return nil, fmt.Errorf("%w: %v", ErrInput, err)
+	}
 	dbName := releaseid.DatabaseName(id)
 	log.Info("release identified", "release_id", id, "database", dbName, "candidate", candidate,
 		"schema", schemaRev, "style", styleRev, "toolchain", toolchain)

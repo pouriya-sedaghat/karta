@@ -11,6 +11,8 @@ import (
 	"math"
 	"os"
 	"regexp"
+
+	"github.com/pouriya-sedaghat/karta/internal/releaseid"
 )
 
 var (
@@ -112,11 +114,15 @@ func (c Config) Validate() error {
 	if s := c.Source.ExpectedSHA256; s != "" && !sha256Pattern.MatchString(s) {
 		errs = append(errs, errors.New("source.expected_sha256 must be 64 lowercase hex characters"))
 	}
+	// Range checks are written so that NaN fails them.
 	lon, lat := c.View.Center[0], c.View.Center[1]
-	if lon < c.BBox[0] || lon > c.BBox[2] || lat < c.BBox[1] || lat > c.BBox[3] {
+	if !finite(lon) || !finite(lat) || !finite(c.View.Zoom) {
+		errs = append(errs, errors.New("view.center and view.zoom must be finite"))
+	}
+	if !(lon >= c.BBox[0] && lon <= c.BBox[2] && lat >= c.BBox[1] && lat <= c.BBox[3]) {
 		errs = append(errs, errors.New("view.center must lie inside bbox"))
 	}
-	if c.View.Zoom < 0 || c.View.Zoom > 22 {
+	if !(c.View.Zoom >= 0 && c.View.Zoom <= 22) {
 		errs = append(errs, errors.New("view.zoom must be 0..22"))
 	}
 	for table, n := range c.Validation.MinCounts {
@@ -134,17 +140,26 @@ func (c Config) Validate() error {
 	}
 	for i, t := range c.Validation.Tiles {
 		if t.Zoom < 0 || t.Zoom > 16 || len(t.Layers) == 0 ||
-			t.Lon < c.BBox[0] || t.Lon > c.BBox[2] || t.Lat < c.BBox[1] || t.Lat > c.BBox[3] {
+			!(t.Lon >= c.BBox[0] && t.Lon <= c.BBox[2] && t.Lat >= c.BBox[1] && t.Lat <= c.BBox[3]) {
 			errs = append(errs, fmt.Errorf("validation.tiles[%d] needs a point inside bbox, z 0..16 and layers", i))
 		}
 	}
 	return errors.Join(errs...)
 }
 
+// Identity is the part of the region that release-pinned output depends on:
+// the manifest and style publish these values exactly as stored, so the
+// release id is derived from exactly these values (see package releaseid).
+func (c Config) Identity() releaseid.Region {
+	return releaseid.Region{ID: c.ID, Name: c.Name, BBox: c.BBox, Center: c.View.Center, Zoom: c.View.Zoom}
+}
+
+func finite(f float64) bool { return !math.IsNaN(f) && !math.IsInf(f, 0) }
+
 // ValidBBox checks a west,south,east,north WGS84 box within Web Mercator's range.
 func ValidBBox(b [4]float64) error {
 	for _, v := range b {
-		if math.IsNaN(v) || math.IsInf(v, 0) {
+		if !finite(v) {
 			return errors.New("bbox values must be finite")
 		}
 	}
@@ -155,7 +170,9 @@ func ValidBBox(b [4]float64) error {
 }
 
 // SameBBox compares boxes with a tolerance of 1e-7 degrees (about 1 cm),
-// the precision of OSM coordinates.
+// the precision of OSM coordinates. It only decides whether a snapshot's
+// header box matches the region; the release id and everything served use
+// the region's exact values.
 func SameBBox(a, b [4]float64) bool {
 	for i := range a {
 		if math.Abs(a[i]-b[i]) > 1e-7 {

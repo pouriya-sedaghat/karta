@@ -51,7 +51,15 @@ pg_trgm, ICU collation version). The toolchain is read from the candidate
 database, so an import builds in a randomly named `karta_c…` database and
 renames it to `karta_<release_id>` only after validation. Identical inputs
 always give the same id and any change gives a new one, so release-pinned
-style and tile URLs can be cached as immutable. Acceptance thresholds are
+style and tile URLs can be cached as immutable. The invariant is exact: if
+an accepted input changes release-pinned output, the id changes. Values are
+therefore hashed as they are served, never rounded: the box, center and zoom
+are stored as `double precision` and published at full float64 precision,
+so the canonical text writes each float as the shortest decimal that parses
+back to exactly the same float64 and rejects NaN and infinity (encoding
+version 3; version 2 rounded to 7 decimals, so boxes or views less than
+1e-7 apart could share an id while serving different styles). The 1e-7
+tolerance of the snapshot header check only decides acceptance. Acceptance thresholds are
 excluded: they decide acceptance, not output. The schema also has a *major*
 version: the API serves releases whose major version it supports. Resources
 that are not release-pinned (glyphs, demo assets, the served style's

@@ -20,7 +20,7 @@ curl -G http://localhost:8080/v1/search --data-urlencode 'q=Chitgar Lake' --data
 ```
 
 ```json
-{"release_id":"rc7684f3108af1233d275559b","query":"Chitgar Lake","normalized_query":"chitgar lake","limit":2,"lang":null,"bbox":null,
+{"release_id":"rf210a8fe8237f20095686597","query":"Chitgar Lake","normalized_query":"chitgar lake","limit":2,"lang":null,"bbox":null,
  "results":[{"id":"way/1259635603","osm_type":"way","osm_id":1259635603,"display_name":"دریاچه چیتگر",
    "names":{"name":"دریاچه چیتگر","name:en":"Chitgar Lake","name:fa":"دریاچه چیتگر"},
    "category":"tourism","subcategory":"attraction","lon":51.2149387,"lat":35.745582,"bbox":[…],
@@ -68,8 +68,9 @@ new style and tile URLs, so no cache needs purging when the active release
 changes. The id covers every input that shapes served content (snapshot and
 provenance digests, data timestamp, region id/name/box/default view, schema
 and style revisions, attribution, osm2pgsql/PostgreSQL/PostGIS/GEOS/PROJ/ICU
-versions; see `karta.release_info.identity`), so an immutable URL never
-names different bytes. The style embeds `KARTA_PUBLIC_BASE_URL`; changing that value
+versions; see `karta.release_info.identity`), hashed exactly as served
+(floats losslessly, not rounded), so an immutable URL never names different
+bytes. The style embeds `KARTA_PUBLIC_BASE_URL`; changing that value
 requires purging cached styles.
 
 ## CORS

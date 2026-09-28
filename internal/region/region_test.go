@@ -1,6 +1,7 @@
 package region
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,6 +33,8 @@ func TestRejectsInvalid(t *testing.T) {
 		"view outside":  `{"id":"x","name":"x","bbox":[0,0,1,1],"view":{"center":[5,5],"zoom":1}}`,
 		"unknown table": `{"id":"x","name":"x","bbox":[0,0,1,1],"view":{"center":[0.5,0.5],"zoom":1},"validation":{"min_counts":{"users":1}}}`,
 		"bad search":    `{"id":"x","name":"x","bbox":[0,0,1,1],"view":{"center":[0.5,0.5],"zoom":1},"validation":{"search":[{"q":"a","osm_type":"area","osm_id":1,"max_position":1}]}}`,
+		"zoom overflow": `{"id":"x","name":"x","bbox":[0,0,1,1],"view":{"center":[0.5,0.5],"zoom":1e400}}`,
+		"bbox overflow": `{"id":"x","name":"x","bbox":[0,0,1e400,1],"view":{"center":[0.5,0.5],"zoom":1}}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -53,5 +56,41 @@ func TestSameBBox(t *testing.T) {
 	}
 	if err := ValidBBox([4]float64{0, -86, 1, 1}); err == nil || !strings.Contains(err.Error(), "Mercator") {
 		t.Errorf("err %v", err)
+	}
+}
+
+// JSON cannot carry NaN or infinity, but Validate is also the check for
+// configurations built in code; every range check must reject them.
+func TestNonFiniteValuesRejected(t *testing.T) {
+	good := func() Config {
+		return Config{ID: "x", Name: "x", BBox: [4]float64{0, 0, 1, 1}, View: View{Center: [2]float64{0.5, 0.5}, Zoom: 1},
+			Validation: Validation{Tiles: []TileCheck{{Lon: 0.5, Lat: 0.5, Zoom: 10, Layers: []string{"roads"}}}}}
+	}
+	if err := good().Validate(); err != nil {
+		t.Fatal(err)
+	}
+	fields := map[string]func(*Config) *float64{
+		"bbox west": func(c *Config) *float64 { return &c.BBox[0] }, "bbox north": func(c *Config) *float64 { return &c.BBox[3] },
+		"center lon": func(c *Config) *float64 { return &c.View.Center[0] }, "center lat": func(c *Config) *float64 { return &c.View.Center[1] },
+		"zoom":     func(c *Config) *float64 { return &c.View.Zoom },
+		"tile lon": func(c *Config) *float64 { return &c.Validation.Tiles[0].Lon }, "tile lat": func(c *Config) *float64 { return &c.Validation.Tiles[0].Lat },
+	}
+	for name, field := range fields {
+		for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+			c := good()
+			*field(&c) = v
+			if err := c.Validate(); err == nil {
+				t.Errorf("%s = %v accepted", name, v)
+			}
+		}
+	}
+}
+
+// Identity carries the exact stored values the manifest and style publish.
+func TestIdentityIsExact(t *testing.T) {
+	c := Config{ID: "x", Name: "n", BBox: [4]float64{0, 0, 0.02000001, 0.015}, View: View{Center: [2]float64{0.01000001, 0.0075}, Zoom: 15.00000001}}
+	r := c.Identity()
+	if r.ID != c.ID || r.Name != c.Name || r.BBox != c.BBox || r.Center != c.View.Center || r.Zoom != c.View.Zoom {
+		t.Errorf("identity %+v does not match %+v", r, c)
 	}
 }

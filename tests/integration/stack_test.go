@@ -288,8 +288,54 @@ func ids(s searchResp) []string {
 
 // --- the test ---------------------------------------------------------------------
 
+// dropRelease is `make reset` for one release, done as the superuser: the
+// registry forgets every release and the release database is dropped.
+func dropRelease(t *testing.T, id string) {
+	t.Helper()
+	ctx := context.Background()
+	reg := superuser(t, "karta_registry")
+	for _, sql := range []string{`DELETE FROM registry.active_release`, `DELETE FROM registry.releases`} {
+		if _, err := reg.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reg.Close(ctx)
+	pg := superuser(t, "postgres")
+	if _, err := pg.Exec(ctx, "DROP DATABASE karta_"+id+" WITH (FORCE)"); err != nil {
+		t.Fatal(err)
+	}
+	pg.Close(ctx)
+	waitReady(t, false, "no_active_release")
+}
+
+// releaseIdentity reads the canonical identity a release was derived from.
+func releaseIdentity(t *testing.T, id string) string {
+	t.Helper()
+	ctx := context.Background()
+	conn := superuser(t, "karta_"+id)
+	defer conn.Close(ctx)
+	var identity string
+	if err := conn.QueryRow(ctx, `SELECT identity FROM karta.release_info`).Scan(&identity); err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}
+
+func noCandidatesLeft(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	var leftovers int
+	pg := superuser(t, "postgres")
+	defer pg.Close(ctx)
+	if err := pg.QueryRow(ctx, `SELECT count(*) FROM pg_database WHERE datname LIKE 'karta\_c%'`).Scan(&leftovers); err != nil || leftovers != 0 {
+		t.Errorf("candidate databases left behind: %d %v", leftovers, err)
+	}
+}
+
 func TestStack(t *testing.T) {
-	var releaseID string
+	var releaseID, otherViewID string
+	// fixtureStyle is the style served at the fixture release's pinned URL.
+	var fixtureStyle []byte
 
 	t.Run("readiness without data", func(t *testing.T) {
 		expectStatus(t, get(t, "/health/live"), http.StatusOK)
@@ -812,6 +858,18 @@ func TestStack(t *testing.T) {
 		}
 	})
 
+	t.Run("a change below 1e-7 to the box, center or zoom is a new release too", func(t *testing.T) {
+		// fixture-sub-1e-7.json moves the box's east edge, the center and the
+		// zoom by 1e-8 each: the snapshot header still matches (1e-7
+		// tolerance), and the manifest and style would publish the new
+		// values. Rounded identities made this "already active" (exit 0).
+		_, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/data/testdata/regions/fixture-sub-1e-7.json")
+		m := regexp.MustCompile(`(r[0-9a-f]{24}) is serving; .* before importing (r[0-9a-f]{24})`).FindStringSubmatch(stderr)
+		if code != 4 || m == nil || m[1] != releaseID || m[2] == releaseID {
+			t.Fatalf("exit %d, ids %v; stderr:\n%s", code, m, stderr)
+		}
+	})
+
 	t.Run("database outage and recovery", func(t *testing.T) {
 		if _, stderr, code := compose(t, "stop", "db"); code != 0 {
 			t.Fatalf("stop db: %s", stderr)
@@ -834,29 +892,18 @@ func TestStack(t *testing.T) {
 	})
 
 	t.Run("reset and rebuild with a changed default view gets new release URLs", func(t *testing.T) {
-		ctx := context.Background()
 		oldStyle := "/v1/releases/" + releaseID + "/style.json"
 		oldTile := "/v1/releases/" + releaseID + "/tiles/14/8192/8191.pbf"
-		expectStatus(t, get(t, oldStyle), http.StatusOK)
-		// Equivalent of `make reset` for the release data, done as the superuser.
-		reg := superuser(t, "karta_registry")
-		for _, sql := range []string{`DELETE FROM registry.active_release`, `DELETE FROM registry.releases`} {
-			if _, err := reg.Exec(ctx, sql); err != nil {
-				t.Fatal(err)
-			}
-		}
-		reg.Close(ctx)
-		pg := superuser(t, "postgres")
-		if _, err := pg.Exec(ctx, "DROP DATABASE karta_"+releaseID+" WITH (FORCE)"); err != nil {
-			t.Fatal(err)
-		}
-		pg.Close(ctx)
-		waitReady(t, false, "no_active_release")
+		r := get(t, oldStyle)
+		expectStatus(t, r, http.StatusOK)
+		fixtureStyle = r.body
+		dropRelease(t, releaseID)
 
 		res, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/data/testdata/regions/fixture-other-view.json")
 		if code != 0 || res.ReleaseID == "" || res.ReleaseID == releaseID {
 			t.Fatalf("exit %d, release %q (old %s); stderr:\n%s", code, res.ReleaseID, releaseID, stderr)
 		}
+		otherViewID = res.ReleaseID
 		st := waitReady(t, true, "ready")
 		if st["release_id"] != res.ReleaseID {
 			t.Fatalf("serving %v, want %s", st["release_id"], res.ReleaseID)
@@ -883,23 +930,69 @@ func TestStack(t *testing.T) {
 			t.Errorf("new style zoom %v", style.Zoom)
 		}
 		// The release records the canonical identity it was derived from.
-		conn := superuser(t, "karta_"+res.ReleaseID)
-		defer conn.Close(ctx)
-		var identity string
-		if err := conn.QueryRow(ctx, `SELECT identity FROM karta.release_info`).Scan(&identity); err != nil {
-			t.Fatal(err)
-		}
-		for _, want := range []string{`region.view.zoom="14.0000000"`, `toolchain.osm2pgsql=`, `toolchain.geos=`, `toolchain.icu=`} {
+		identity := releaseIdentity(t, res.ReleaseID)
+		for _, want := range []string{`region.view.zoom="14"`, `region.view.center="0.005,0.005"`, `toolchain.osm2pgsql=`, `toolchain.geos=`, `toolchain.icu=`} {
 			if !strings.Contains(identity, want) {
 				t.Errorf("identity lacks %s:\n%s", want, identity)
 			}
 		}
-		var leftovers int
-		pg2 := superuser(t, "postgres")
-		defer pg2.Close(ctx)
-		if err := pg2.QueryRow(ctx, `SELECT count(*) FROM pg_database WHERE datname LIKE 'karta\_c%'`).Scan(&leftovers); err != nil || leftovers != 0 {
-			t.Errorf("candidate databases left behind: %d %v", leftovers, err)
+		noCandidatesLeft(t)
+	})
+
+	t.Run("reset and rebuild with a change below 1e-7 gets new release URLs", func(t *testing.T) {
+		if otherViewID == "" || fixtureStyle == nil {
+			t.Skip("previous rebuild did not run")
 		}
+		dropRelease(t, otherViewID)
+		res, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/data/testdata/regions/fixture-sub-1e-7.json")
+		if code != 0 || res.ReleaseID == "" || res.ReleaseID == releaseID || res.ReleaseID == otherViewID {
+			t.Fatalf("exit %d, release %q (fixture %s, other view %s); stderr:\n%s", code, res.ReleaseID, releaseID, otherViewID, stderr)
+		}
+		waitReady(t, true, "ready")
+		newStyle := get(t, "/v1/releases/"+res.ReleaseID+"/style.json")
+		expectStatus(t, newStyle, http.StatusOK)
+		// The rebuilt style, placed at the fixture's old URL, would differ
+		// from what that URL served; so the old URL must not be reused.
+		asOld := bytes.ReplaceAll(newStyle.body, []byte(res.ReleaseID), []byte(releaseID))
+		if bytes.Equal(asOld, fixtureStyle) {
+			t.Fatal("the sub-1e-7 change is not visible in the style; the test does not exercise the invariant")
+		}
+		expectError(t, get(t, "/v1/releases/"+releaseID+"/style.json"), http.StatusNotFound, "unknown_release", "release_id")
+		// The exact stored values are what is published.
+		var style struct {
+			Center  [2]float64 `json:"center"`
+			Zoom    float64    `json:"zoom"`
+			Sources map[string]struct {
+				Bounds [4]float64 `json:"bounds"`
+			} `json:"sources"`
+		}
+		newStyle.json(t, &style)
+		wantBox := [4]float64{0, 0, 0.02000001, 0.015}
+		if style.Zoom != 15.00000001 || style.Center != [2]float64{0.01000001, 0.0075} || style.Sources["karta"].Bounds != wantBox {
+			t.Errorf("style view %v %v bounds %v", style.Center, style.Zoom, style.Sources["karta"].Bounds)
+		}
+		var m struct {
+			Release struct {
+				Region struct {
+					BBox [4]float64 `json:"bbox"`
+				} `json:"region"`
+			} `json:"release"`
+			DefaultView struct {
+				Center [2]float64 `json:"center"`
+				Zoom   float64    `json:"zoom"`
+			} `json:"default_view"`
+		}
+		get(t, "/v1/manifest").json(t, &m)
+		if m.Release.Region.BBox != wantBox || m.DefaultView.Zoom != 15.00000001 || m.DefaultView.Center != [2]float64{0.01000001, 0.0075} {
+			t.Errorf("manifest %+v", m)
+		}
+		identity := releaseIdentity(t, res.ReleaseID)
+		for _, want := range []string{`region.bbox="0,0,0.02000001,0.015"`, `region.view.center="0.01000001,0.0075"`, `region.view.zoom="15.00000001"`} {
+			if !strings.Contains(identity, want) {
+				t.Errorf("identity lacks %s:\n%s", want, identity)
+			}
+		}
+		noCandidatesLeft(t)
 	})
 }
 

@@ -75,9 +75,9 @@ is derived there (it includes the database toolchain versions) and the
 database is renamed to `karta_<release_id>` only after every check passed. On
 failure the candidate is dropped (`--keep-failed` keeps it for inspection
 until the next import, which removes leftover candidates) and the registry
-records the release as `failed` with the reason. Changing a region's name or
-default view, the provenance sidecar or the toolchain gives a new release id;
-changing only its acceptance thresholds does not.
+records the release as `failed` with the reason. Changing a region's name,
+box or default view (by any amount), the provenance sidecar or the toolchain
+gives a new release id; changing only its acceptance thresholds does not.
 
 ## Normal operation
 
