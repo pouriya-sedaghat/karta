@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Karta demo</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="vendor/maplibre-gl/maplibre-gl.css">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div id="map" aria-label="Map"></div>
+  <aside id="panel">
+    <form id="search" role="search">
+      <label for="q" class="visually-hidden">Search places</label>
+      <input id="q" name="q" type="search" dir="auto" maxlength="100" autocomplete="off"
+             placeholder="Search places · جستجوی مکان" required>
+      <button type="submit">Search</button>
+    </form>
+    <p id="status" role="status">Loading…</p>
+    <ol id="results"></ol>
+    <p class="note">Search covers named places and points of interest; addresses are not searchable.</p>
+  </aside>
+  <footer id="attribution">
+    Map data © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>,
+    available under the <a href="https://opendatacommons.org/licenses/odbl/1-0/">Open Database License (ODbL)</a>.
+    Font: Vazirmatn (SIL OFL 1.1). Renderer: MapLibre GL JS (BSD-3-Clause).
+  </footer>
+</body>
+</html>

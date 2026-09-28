@@ -1,0 +1,8 @@
+{
+  "id": "fixture-alt",
+  "name": "Same fixture under another region id: a different release (negative test while one is active)",
+  "bbox": [0.0, 0.0, 0.02, 0.015],
+  "source": { "require_provenance": false },
+  "view": { "center": [0.01, 0.0075], "zoom": 15 },
+  "validation": { "min_counts": {}, "search": [], "tiles": [] }
+}

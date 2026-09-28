@@ -1,0 +1,11 @@
+{
+  "id": "fixture",
+  "name": "Fixture region pinned to a digest the fixture does not have (negative test)",
+  "bbox": [0.0, 0.0, 0.02, 0.015],
+  "source": {
+    "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "require_provenance": false
+  },
+  "view": { "center": [0.01, 0.0075], "zoom": 15 },
+  "validation": { "min_counts": {}, "search": [], "tiles": [] }
+}

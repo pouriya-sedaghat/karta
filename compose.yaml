@@ -1,0 +1,132 @@
+# Karta Stage 1 stack: PostgreSQL/PostGIS, the API (tiles, search, style,
+# glyphs, demo) and an on-demand importer. See docs/runbook.md.
+#
+# Networks: `backend` is internal (no route outside Docker); PostgreSQL is only
+# reachable there and publishes no port. The API is additionally on `frontend`
+# to publish its HTTP port, bound to 127.0.0.1 by default.
+name: karta
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  db:
+    image: postgis/postgis:18-3.6@sha256:60f6ad1d21ea86a67d47780b9a0d1e1d200500f62b19293fa834d0dea80b8677
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_superuser_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8 --auth-host=scram-sha-256"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${KARTA_DB_SHARED_BUFFERS:-256MB}
+      - -c
+      - max_connections=80
+      - -c
+      - log_min_duration_statement=2000
+      - -c
+      - log_line_prefix=%m [%p] %q%u@%d
+    secrets: [db_superuser_password, db_importer_password, db_api_password]
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./deploy/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    networks: [backend]
+    shm_size: 256mb
+    mem_limit: ${KARTA_DB_MEM_LIMIT:-2g}
+    cpus: ${KARTA_DB_CPUS:-2}
+    pids_limit: 512
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d karta_registry -q"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+    logging: *logging
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: api
+    image: karta-api:${KARTA_IMAGE_TAG:-local}
+    environment:
+      KARTA_PUBLIC_BASE_URL: ${KARTA_PUBLIC_BASE_URL:-http://localhost:8080}
+      KARTA_DB_HOST: db
+      KARTA_DB_USER: karta_api
+      KARTA_DB_PASSWORD_FILE: /run/secrets/db_api_password
+      KARTA_CORS_ALLOWED_ORIGINS: ${KARTA_CORS_ALLOWED_ORIGINS:-}
+      KARTA_RELEASE_POLL_INTERVAL: ${KARTA_RELEASE_POLL_INTERVAL:-5s}
+      KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+    secrets: [db_api_password]
+    ports:
+      - "${KARTA_HTTP_BIND:-127.0.0.1}:${KARTA_HTTP_PORT:-8080}:8080"
+    networks: [backend, frontend]
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KARTA_API_MEM_LIMIT:-512m}
+    cpus: ${KARTA_API_CPUS:-1}
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/karta", "healthcheck"]
+      interval: 10s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    logging: *logging
+
+  importer:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: importer
+    image: karta-importer:${KARTA_IMAGE_TAG:-local}
+    profiles: [tools]
+    environment:
+      KARTA_DB_HOST: db
+      KARTA_DB_USER: karta_importer
+      KARTA_DB_PASSWORD_FILE: /run/secrets/db_importer_password
+      KARTA_OSM2PGSQL_CACHE_MB: ${KARTA_OSM2PGSQL_CACHE_MB:-800}
+      KARTA_OSM2PGSQL_PROCESSES: ${KARTA_OSM2PGSQL_PROCESSES:-2}
+      KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+    secrets: [db_importer_password]
+    volumes:
+      - ./data/local:/data/local:ro
+      - ./testdata:/data/testdata:ro
+      - ./config/regions:/config/regions:ro
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    read_only: true
+    networks: [backend]
+    depends_on:
+      db:
+        condition: service_healthy
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KARTA_IMPORTER_MEM_LIMIT:-4g}
+    pids_limit: 256
+    logging: *logging
+
+networks:
+  backend:
+    internal: true
+  frontend: {}
+
+volumes:
+  pgdata: {}
+
+secrets:
+  db_superuser_password:
+    file: ./secrets/db_superuser_password
+  db_importer_password:
+    file: ./secrets/db_importer_password
+  db_api_password:
+    file: ./secrets/db_api_password

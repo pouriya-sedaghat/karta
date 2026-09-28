@@ -2,3 +2,10 @@
 *.osm.pbf
 *.osm.pbf.provenance.json
 __pycache__/
+# Generated database passwords (scripts/gen-secrets.sh)
+/secrets/
+# Demo build output and npm install tree
+/web/node_modules/
+/web/dist/
+# Test artefacts (screenshots, reports)
+/artifacts/

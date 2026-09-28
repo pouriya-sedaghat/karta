@@ -1,0 +1,153 @@
+# Karta developer and operator commands. See docs/runbook.md.
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+COMPOSE        ?= docker compose
+TEST_PROJECT   ?= karta-test
+TEST_COMPOSE   := $(COMPOSE) -p $(TEST_PROJECT) -f compose.yaml -f compose.test.yaml
+OFFLINE_COMPOSE := $(COMPOSE) -p karta-offline -f compose.yaml -f compose.offline.yaml
+VERSION        ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
+# Optional PEM bundle for TLS-intercepting build networks (passed as a build secret).
+KARTA_BUILD_CA_FILE ?=
+comma          := ,
+BUILD_SECRET   := $(if $(KARTA_BUILD_CA_FILE),--secret id=build_ca$(comma)src=$(KARTA_BUILD_CA_FILE),)
+BASE_URL       ?= http://localhost:8080
+ARTIFACTS      ?= artifacts
+
+# Tool versions for static and security checks (run with `go run`, no global installs).
+STATICCHECK := honnef.co/go/tools/cmd/staticcheck@v0.8.1
+GOVULNCHECK := golang.org/x/vuln/cmd/govulncheck@v1.8.0
+GOSEC       := github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+
+TEHRAN_PBF := data/local/tehran-chitgar.osm.pbf
+TEHRAN_SHA := 7d0e69a2d5e1ad184ee48637626882bb8bcb7acd8e95123e05d0697ce216191e
+
+.PHONY: help
+help: ## List targets
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
+
+.PHONY: secrets
+secrets: ## Create random database passwords in ./secrets (never overwrites)
+	@./scripts/gen-secrets.sh
+
+.PHONY: build
+build: ## Build the api and importer images
+	docker build $(BUILD_SECRET) --build-arg VERSION=$(VERSION) -f deploy/Dockerfile --target api -t karta-api:local .
+	docker build $(BUILD_SECRET) --build-arg VERSION=$(VERSION) -f deploy/Dockerfile --target importer -t karta-importer:local .
+
+.PHONY: up
+up: secrets ## Start PostgreSQL and the API (the API reports not-ready until a release is imported)
+	$(COMPOSE) up -d --wait db
+	$(COMPOSE) up -d api
+
+.PHONY: wait-ready
+wait-ready: ## Wait until /health/ready returns 200
+	@for i in $$(seq 1 60); do \
+	  if curl -fsS $(BASE_URL)/health/ready >/dev/null 2>&1; then echo "ready"; exit 0; fi; sleep 2; \
+	done; curl -sS $(BASE_URL)/health/ready; echo; exit 1
+
+.PHONY: import-fixture
+import-fixture: ## Import the committed synthetic fixture (prints the JSON import report)
+	@$(COMPOSE) run --rm -T importer --snapshot /data/testdata/fixture/karta-fixture.osm --region /config/regions/fixture.json
+
+.PHONY: verify-tehran
+verify-tehran: ## Check the Chitgar extract and sidecar are present and match the documented SHA-256
+	@test -f $(TEHRAN_PBF) -a -f $(TEHRAN_PBF).provenance.json || { \
+	  echo "Missing $(TEHRAN_PBF) or its .provenance.json: copy the two supplied files into data/local/ (docs/development-data.md)." >&2; exit 3; }
+	@echo "$(TEHRAN_SHA)  $(TEHRAN_PBF)" | sha256sum --quiet -c - || { echo "SHA-256 mismatch: this is not the documented snapshot; do not substitute another." >&2; exit 3; }
+	@for f in $(TEHRAN_PBF) $(TEHRAN_PBF).provenance.json; do \
+	  [ $$(( 0$$(stat -c %a $$f) & 4 )) -ne 0 ] || { echo "Make $$f world-readable (chmod 0644): the importer runs as UID 10001." >&2; exit 3; }; \
+	done
+
+.PHONY: import-tehran
+import-tehran: verify-tehran ## Import the real Chitgar extract (Stage 1 serves one release: `make reset` first if another is active)
+	@mkdir -p $(ARTIFACTS)
+	@$(COMPOSE) run --rm -T importer --snapshot /data/local/tehran-chitgar.osm.pbf --region /config/regions/tehran-chitgar.json | tee $(ARTIFACTS)/tehran-import.json
+
+.PHONY: smoke
+smoke: ## Query the manifest, a Persian search and a tile
+	@curl -fsS $(BASE_URL)/v1/manifest | head -c 600; echo
+	@curl -fsS -G $(BASE_URL)/v1/search --data-urlencode 'q=دریاچه' --data-urlencode limit=3; echo
+
+.PHONY: logs
+logs: ## Follow service logs
+	$(COMPOSE) logs -f --tail=100
+
+.PHONY: down
+down: ## Stop the stack, keeping data
+	$(COMPOSE) down
+
+.PHONY: reset
+reset: ## Stop the stack and delete all imported data (the database volume)
+	$(COMPOSE) down -v --remove-orphans
+
+.PHONY: clean
+clean: reset ## reset, then remove images, demo build and test artefacts
+	-docker image rm karta-api:local karta-importer:local
+	rm -rf web/dist web/node_modules $(ARTIFACTS)
+
+# --- development and tests ------------------------------------------------------
+
+.PHONY: web
+web: ## Build the demo assets into web/dist for running `karta serve` outside Docker
+	cd web && npm ci --ignore-scripts --no-audit --no-fund && node build.mjs
+
+.PHONY: fmt
+fmt: ## Format Go code
+	gofmt -w cmd internal openapi tests
+
+.PHONY: lint
+lint: ## gofmt, go vet, staticcheck, govulncheck, gosec
+	@out=$$(gofmt -l cmd internal openapi tests); if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+	go vet ./...
+	go vet -tags integration ./tests/integration/
+	go vet -tags browser ./tests/browser/
+	go run $(STATICCHECK) ./...
+	go run $(STATICCHECK) -tags integration,browser ./tests/...
+	go run $(GOVULNCHECK) ./...
+	go run $(GOSEC) -quiet -exclude-generated ./...
+
+.PHONY: test
+test: ## Unit tests (no Docker needed)
+	go test -race -count=1 ./...
+
+.PHONY: test-integration
+test-integration: secrets ## Full-stack integration tests on an isolated compose project (fixture only)
+	@mkdir -p $(ARTIFACTS)
+	$(TEST_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true
+	$(TEST_COMPOSE) up -d --wait db
+	$(TEST_COMPOSE) up -d api
+	KARTA_TEST_COMPOSE="$(TEST_COMPOSE)" go test -tags integration -count=1 -v ./tests/integration/ ; \
+	  status=$$?; $(TEST_COMPOSE) logs --no-color api > $(CURDIR)/$(ARTIFACTS)/integration-api.log 2>&1 || true; \
+	  $(TEST_COMPOSE) down -v --remove-orphans; exit $$status
+
+.PHONY: test-browser
+test-browser: ## Render the demo in headless Chromium against the running stack (BASE_URL)
+	@mkdir -p $(ARTIFACTS)
+	KARTA_TEST_BASE_URL=$(BASE_URL) KARTA_TEST_ARTIFACTS=$(CURDIR)/$(ARTIFACTS)/browser go test -tags browser -count=1 -v ./tests/browser/
+
+.PHONY: test-browser-tehran
+test-browser-tehran: ## Render the real Chitgar release (after `make import-tehran`) and check lake, park/road and mall views
+	@mkdir -p $(ARTIFACTS)
+	KARTA_TEST_BASE_URL=$(BASE_URL) KARTA_TEST_ARTIFACTS=$(CURDIR)/$(ARTIFACTS)/tehran \
+	KARTA_TEST_VIEWS="$$(cat tests/browser/tehran-views.json)" \
+	KARTA_TEST_SEARCH='{"q":"دریاچه چیتگر","expect":"دریاچه چیتگر"}' \
+	go test -tags browser -count=1 -v ./tests/browser/
+
+.PHONY: test-offline
+test-offline: secrets ## Disconnected run: API and DB on an internal-only network, fixture imported, browser via container IP
+	$(OFFLINE_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true
+	$(OFFLINE_COMPOSE) up -d --wait db
+	$(OFFLINE_COMPOSE) run --rm -T importer --snapshot /data/testdata/fixture/karta-fixture.osm --region /config/regions/fixture.json > /dev/null
+	$(OFFLINE_COMPOSE) up -d api
+	@mkdir -p $(ARTIFACTS)
+	@ip=$$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $$($(OFFLINE_COMPOSE) ps -q api)); \
+	  echo "api container IP $$ip (no published port, no external route)"; \
+	  for i in $$(seq 1 30); do curl -fsS http://$$ip:8080/health/ready >/dev/null 2>&1 && break; sleep 1; done; \
+	  $(OFFLINE_COMPOSE) exec -T api /usr/local/bin/karta healthcheck; \
+	  if $(OFFLINE_COMPOSE) exec -T api /usr/local/bin/karta healthcheck --live --url http://1.1.1.1 2>/dev/null; then \
+	    echo "the api container can reach an external host; the offline network is not isolated" >&2; exit 1; \
+	  else echo "confirmed: the api container has no route to external hosts"; fi; \
+	  KARTA_TEST_BASE_URL=http://karta.internal:8080 KARTA_TEST_RESOLVE=karta.internal=$$ip \
+	  KARTA_TEST_ARTIFACTS=$(CURDIR)/$(ARTIFACTS)/offline go test -tags browser -count=1 -v ./tests/browser/ ; \
+	  status=$$?; $(OFFLINE_COMPOSE) down -v --remove-orphans; exit $$status

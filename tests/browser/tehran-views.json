@@ -1,0 +1,26 @@
+[
+  {
+    "name": "tehran-lake-z14",
+    "hash": "14/35.7456/51.2149",
+    "layers": ["water", "landcover-natural", "roads-casing", "roads-fill", "road-labels", "poi-labels", "place-labels"],
+    "labels": ["دریاچه چیتگر", "دریاچه شهدای خلیج فارس"]
+  },
+  {
+    "name": "tehran-park-roads-z14",
+    "hash": "14/35.7275/51.2060",
+    "layers": ["landcover-natural", "roads-casing", "roads-fill", "rail", "road-labels"],
+    "labels": ["بوستان جنگلی چیتگر"]
+  },
+  {
+    "name": "tehran-overview-z12",
+    "hash": "12/35.745/51.230",
+    "layers": ["water", "landcover-natural", "landcover-urban", "roads-fill", "place-labels"],
+    "labels": ["دریاچه چیتگر"]
+  },
+  {
+    "name": "tehran-iranmall-z16",
+    "hash": "16/35.7536/51.1918",
+    "layers": ["buildings", "roads-fill", "poi-markers", "poi-labels"],
+    "labels": ["بازار سنتی ایران مال"]
+  }
+]

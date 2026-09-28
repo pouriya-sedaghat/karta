@@ -1,0 +1,109 @@
+{
+  "minzoom": 0,
+  "maxzoom": 16,
+  "extent": 4096,
+  "buffer": 64,
+  "layers": [
+    {
+      "id": "landcover",
+      "geometry": "polygon",
+      "minzoom": 8,
+      "description": "Land use and land cover areas. Area-based thresholds: >=1 km2 from z8, >=0.1 km2 from z10, >=1 ha from z12, >=1000 m2 from z13, all from z14.",
+      "fields": {
+        "class": "park | grass | wood | farmland | cemetery | sport | residential | commercial | industrial | construction | education | hospital | parking | bare | wetland",
+        "kind": "source tag as key=value, e.g. leisure=park",
+        "osm_type": "node | way | relation",
+        "osm_id": "OSM element id"
+      }
+    },
+    {
+      "id": "water",
+      "geometry": "polygon",
+      "minzoom": 8,
+      "description": "Water areas (natural=water, riverbank, dock, reservoir, basin), with the same area thresholds as landcover but all remaining areas from z13.",
+      "fields": {
+        "kind": "water tag value (lake, pond, basin, reservoir, ...) or water",
+        "name": "name tag",
+        "name_fa": "name:fa tag",
+        "name_en": "name:en tag",
+        "osm_type": "node | way | relation",
+        "osm_id": "OSM element id"
+      }
+    },
+    {
+      "id": "waterways",
+      "geometry": "line",
+      "minzoom": 10,
+      "description": "Rivers and canals from z10; streams, drains and ditches from z13.",
+      "fields": {
+        "kind": "river | stream | canal | drain | ditch",
+        "name": "name tag",
+        "name_fa": "name:fa tag",
+        "name_en": "name:en tag",
+        "tunnel": "boolean",
+        "osm_id": "OSM way id"
+      }
+    },
+    {
+      "id": "buildings",
+      "geometry": "polygon",
+      "minzoom": 13,
+      "description": "Building footprints; >=5000 m2 from z13, all from z14.",
+      "fields": {
+        "kind": "building tag value",
+        "osm_type": "node | way | relation",
+        "osm_id": "OSM element id"
+      }
+    },
+    {
+      "id": "roads",
+      "geometry": "line",
+      "minzoom": 5,
+      "description": "Roads, paths and railways. motorway z5, trunk z6, primary z8, secondary z9, rail z10, tertiary z11, minor z13, service/track/path z14.",
+      "fields": {
+        "class": "motorway | trunk | primary | secondary | tertiary | minor | service | track | path | rail",
+        "subclass": "highway or railway tag value",
+        "name": "name tag",
+        "name_fa": "name:fa tag",
+        "name_en": "name:en tag",
+        "ref": "ref tag",
+        "oneway": "boolean",
+        "bridge": "boolean",
+        "tunnel": "boolean",
+        "layer": "integer -10..10",
+        "osm_id": "OSM way id"
+      }
+    },
+    {
+      "id": "places",
+      "geometry": "point",
+      "minzoom": 8,
+      "description": "Label points of named place=* features. city z8, town z10, suburb z11, quarter/village z12, neighbourhood z13, others z14.",
+      "fields": {
+        "kind": "place tag value",
+        "name": "display name (name, else name:fa, else name:en)",
+        "name_fa": "name:fa tag",
+        "name_en": "name:en tag",
+        "rank": "integer importance, lower is more important",
+        "osm_type": "node | way | relation",
+        "osm_id": "OSM element id"
+      }
+    },
+    {
+      "id": "pois",
+      "geometry": "point",
+      "minzoom": 12,
+      "description": "Label points of named points of interest. Areas >=0.2 km2 from z12, >=2 ha from z13, rank <=6 from z14, rank <=9 from z15, others from z16.",
+      "fields": {
+        "category": "tag key that classified the feature (amenity, shop, tourism, ...)",
+        "subcategory": "value of that tag",
+        "name": "display name (name, else name:fa, else name:en)",
+        "name_fa": "name:fa tag",
+        "name_en": "name:en tag",
+        "rank": "integer importance, lower is more important",
+        "osm_type": "node | way | relation",
+        "osm_id": "OSM element id"
+      }
+    }
+  ]
+}

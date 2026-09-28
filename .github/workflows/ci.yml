@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-and-unit:
+    name: lint, security checks, unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt, go vet, staticcheck, govulncheck, gosec
+        run: make lint
+      - name: unit tests (race detector)
+        run: make test
+
+  stack:
+    name: stack, browser and disconnected tests (fixture)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build images
+        run: make build
+      - name: integration tests
+        run: make test-integration
+      - name: browser test against the fixture
+        run: |
+          make up
+          mkdir -p artifacts
+          make -s import-fixture > artifacts/fixture-import.json
+          make wait-ready
+          make test-browser
+          make reset
+      - name: disconnected-network test
+        run: make test-offline
+      - name: upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: karta-test-artifacts
+          path: artifacts/
+          retention-days: 14
