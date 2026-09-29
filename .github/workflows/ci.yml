@@ -26,6 +26,8 @@ jobs:
           go-version-file: go.mod
       - name: gofmt, go vet, staticcheck, govulncheck, gosec
         run: make lint
+      - name: Tehran extraction publication permissions
+        run: python3 -m unittest discover -s tests -p 'test_extract_tehran.py' -v
       - name: unit tests (race detector)
         run: make test
 
