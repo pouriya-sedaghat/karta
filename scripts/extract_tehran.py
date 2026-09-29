@@ -99,6 +99,7 @@ def main():
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o644)  # Public OSM data; a containerized importer may run under another UID.
+        os.chmod(sidecar_temporary, 0o644)  # The same importer must read the provenance sidecar.
         # Link creation fails if another process has created the destination.
         os.link(temporary, target)
         try:
