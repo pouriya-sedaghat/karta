@@ -115,6 +115,30 @@ gives a new release id; changing only its acceptance thresholds does not.
   versions with the toolchain a release was built with. Upgrade it only
   together with `make reset` and a re-import, which gives a new release id.
 
+## Behind a reverse proxy with a path prefix
+
+Karta can be published under a path, e.g. `https://example.com/maps/`. Set
+`KARTA_PUBLIC_BASE_URL` to the public URL including the prefix, and have the
+proxy strip the prefix before forwarding:
+
+```nginx
+location /maps/ {
+    proxy_pass http://127.0.0.1:8080/;   # trailing slash: /maps/v1/… is sent as /v1/…
+}
+```
+
+```bash
+KARTA_PUBLIC_BASE_URL=https://example.com/maps make up
+```
+
+The manifest, style, tile and glyph URLs are absolute under the base URL, so
+they carry the prefix. The demo calls the API relative to its own URL, and `/`
+and `/demo` redirect with a relative `Location: demo/`. So
+`https://example.com/maps/` opens the demo at `https://example.com/maps/demo/`.
+Expose the prefix with its trailing slash; nginx redirects a bare `/maps` to
+`/maps/` for such a location. `make test-browser-prefix` runs all browser
+tests through such a proxy (see Development).
+
 ## Reset and cleanup
 
 ```bash
@@ -133,11 +157,20 @@ make test-offline
 
 Starts a separate project (`karta-offline`) whose API and database are only on
 the internal Docker network: no published port and no route to any external
-host (the target checks that the API container cannot reach 1.1.1.1). The
-fixture is imported, then headless Chromium, whose only network is the API
-container (every other host goes to a dead proxy), loads the demo, renders two
-views, runs a search, and asserts that every request went to the API origin
-and that the Persian presentation-form glyph ranges were served.
+host. `scripts/check-isolated.sh` verifies this from the running API
+container's configuration:
+
+* it is attached only to `karta-offline_backend`, and that network is `internal`;
+* it publishes no port and has no port binding;
+* its network namespace has no IPv4 or IPv6 default route.
+
+As a negative control, the target first attaches the API to an extra plain
+bridge network, like `frontend` in `compose.yaml`, and requires the check to
+fail. It then detaches the API and requires the check to pass. The fixture is
+imported. Headless Chromium, whose only network is the API container (every
+other host goes to a dead proxy), loads the demo, renders two views and runs a
+search. It asserts that every request went to the API origin and that the
+Persian presentation-form glyph ranges were served.
 
 ## Development without Docker for the API
 
@@ -147,6 +180,8 @@ KARTA_PUBLIC_BASE_URL=http://localhost:8080 KARTA_DB_HOST=… KARTA_DB_PASSWORD_
 KARTA_WEB_DIR=web/dist go run ./cmd/karta serve
 make lint test                 # gofmt, vet, staticcheck, govulncheck, gosec; unit tests
 make test-integration          # isolated compose project on ports 18080/55433
+make test-browser              # browser tests against the running stack (BASE_URL)
+make test-browser-prefix       # the same through a proxy serving Karta under /maps, API restarted with that base URL
 ```
 
 ## Troubleshooting
@@ -157,4 +192,4 @@ make test-integration          # isolated compose project on ports 18080/55433
 | readiness `release_incompatible` | the release's schema major, style layers or fonts do not match this API build; `detail` names the problem; re-import with the matching importer |
 | import exit 3 "refusing to import a different snapshot" | the file is not the pinned snapshot; restore the documented file |
 | import exit 3 "permission denied" | `chmod 0644` the snapshot and sidecar (importer runs as UID 10001) |
-| demo shows nothing, console CSP errors | open the demo at exactly `KARTA_PUBLIC_BASE_URL` (the page only talks to that origin) |
+| demo shows nothing, console CSP errors | open the demo at `KARTA_PUBLIC_BASE_URL` + `/demo/` (the page only talks to that origin) |

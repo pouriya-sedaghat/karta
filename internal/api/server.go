@@ -117,9 +117,13 @@ func newHandler(cfg Config, releases Releases, g *glyphs.Set, log *slog.Logger, 
 	mux.HandleFunc("GET /v1/openapi.yaml", s.openapi)
 	if s.web != nil {
 		mux.HandleFunc("GET /demo/", s.demo)
-		mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/demo/", http.StatusFound)
-		})
+		// "/" and "/demo" both redirect to "demo/", which the client resolves
+		// against the URL it requested: /demo/ at the root, and /maps/demo/
+		// behind a reverse proxy that serves Karta under /maps/ and strips
+		// that prefix. A root-relative "/demo/" (http.Redirect, or ServeMux's
+		// own redirect for /demo) would leave the prefix.
+		mux.HandleFunc("GET /{$}", redirectRelative("demo/"))
+		mux.HandleFunc("GET /demo", redirectRelative("demo/"))
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, CodeNotFound, "no such resource", "")
@@ -780,6 +784,15 @@ func (s *Server) demo(w http.ResponseWriter, r *http.Request) {
 	sum := sha256.Sum256(body)
 	h.Set("ETag", `"`+hex.EncodeToString(sum[:16])+`"`)
 	http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(body))
+}
+
+// redirectRelative answers 302 with a relative Location, sent unchanged
+// (http.Redirect would make it absolute from this server's view of the path).
+func redirectRelative(target string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target)
+		w.WriteHeader(http.StatusFound)
+	}
 }
 
 // maxDemoFile bounds a demo asset read into memory (MapLibre is ~1.2 MB).

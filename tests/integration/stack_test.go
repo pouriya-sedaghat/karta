@@ -411,6 +411,60 @@ func TestStack(t *testing.T) {
 		waitReady(t, false, "no_active_release")
 	})
 
+	t.Run("import rejects a provenance sidecar with a non-finite box before any release exists", func(t *testing.T) {
+		// The sidecar matches the fixture's digest and size; only one bbox
+		// coordinate is not a number. Without the check, NaN compares as
+		// "within tolerance" of the region box and the import goes ahead.
+		snapshot, err := os.ReadFile(filepath.Join(repoRoot, "testdata/fixture/karta-fixture.osm"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(snapshot)
+		dir := t.TempDir()
+		// The importer runs as UID 10001 and reads these files through a bind mount.
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for i, name := range []string{"west", "south", "east", "north"} {
+			box := []string{"0", "0", "0.02", "0.015"}
+			box[i] = []string{"NaN", "Infinity", "-Inf", "nan"}[i]
+			doc := fmt.Sprintf(`{"output_sha256":%q,"output_fileinfo":{"file":{"size":%d}},"bbox_wgs84":%q,`+
+				`"source_fileinfo":{"header":{"option":{"osmosis_replication_timestamp":"2026-01-01T00:00:00Z"}}},"license":"ODbL 1.0"}`,
+				hex.EncodeToString(sum[:]), len(snapshot), strings.Join(box, ","))
+			if err := os.WriteFile(filepath.Join(dir, name+".json"), []byte(doc), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, stderr, code := compose(t, "run", "--rm", "-T", "-v", dir+":/data/probe:ro", "importer",
+				"--snapshot", "/data/testdata/fixture/karta-fixture.osm", "--provenance", "/data/probe/"+name+".json",
+				"--region", "/config/regions/fixture.json")
+			if code != 3 || !strings.Contains(stderr, "bbox_wgs84 "+name) || !strings.Contains(stderr, "not a finite number") {
+				t.Fatalf("bbox_wgs84 %s=%s: exit %d, want 3 (input verification) naming %s; stderr:\n%s", name, box[i], code, name, stderr)
+			}
+		}
+		waitReady(t, false, "no_active_release")
+		ctx := context.Background()
+		reg := superuser(t, "karta_registry")
+		defer reg.Close(ctx)
+		// The importer creates the registry schema when it first connects, after
+		// input verification; a rejected input leaves no trace there at all.
+		var registered bool
+		if err := reg.QueryRow(ctx, `SELECT to_regclass('registry.releases') IS NOT NULL`).Scan(&registered); err != nil {
+			t.Fatal(err)
+		}
+		if registered {
+			var releases, active int
+			if err := reg.QueryRow(ctx, `SELECT (SELECT count(*) FROM registry.releases), (SELECT count(*) FROM registry.active_release)`).Scan(&releases, &active); err != nil {
+				t.Fatal(err)
+			}
+			if releases != 0 || active != 0 {
+				t.Errorf("registry after rejected imports: %d releases, %d active; want none", releases, active)
+			}
+		} else {
+			t.Log("the rejected imports never reached the registry")
+		}
+		noCandidatesLeft(t)
+	})
+
 	t.Run("import fixture", func(t *testing.T) {
 		res, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/config/regions/fixture.json")
 		if code != 0 || res.Report == nil {

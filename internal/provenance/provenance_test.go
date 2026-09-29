@@ -53,3 +53,22 @@ func TestChitgarSidecar(t *testing.T) {
 		t.Fatalf("timestamp %v %v", ts, err)
 	}
 }
+
+// strconv.ParseFloat accepts NaN and infinities; a sidecar box with one in any
+// coordinate must be rejected, not passed on to the box comparison.
+func TestBBoxRejectsNonFinite(t *testing.T) {
+	good := [4]string{"51.175", "35.705", "51.285", "35.785"}
+	for i, name := range bboxNames {
+		for _, bad := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "infinity", "-Infinity"} {
+			parts := good
+			parts[i] = bad
+			s := Sidecar{BBoxWGS84: strings.Join(parts[:], ",")}
+			if b, err := s.BBox(); err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "finite") {
+				t.Errorf("%s = %s: bbox %v, err %v; want an error naming %s", name, bad, b, err, name)
+			}
+		}
+	}
+	if _, err := (Sidecar{BBoxWGS84: strings.Join(good[:], ",")}).BBox(); err != nil {
+		t.Errorf("finite box rejected: %v", err)
+	}
+}

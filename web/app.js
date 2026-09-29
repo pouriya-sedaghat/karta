@@ -3,6 +3,13 @@
 // this page's origin; the page's CSP forbids any other destination.
 import * as maplibregl from './vendor/maplibre-gl/maplibre-gl.mjs';
 
+// API paths are resolved against this module (<base>/demo/app.js), never the
+// host root, so the demo also works when a reverse proxy serves Karta under a
+// path prefix: https://example.com/maps/demo/ calls
+// https://example.com/maps/v1/manifest. Style, tile and glyph URLs come from
+// the API and are absolute under KARTA_PUBLIC_BASE_URL.
+const apiURL = (path) => new URL(`../${path}`, import.meta.url);
+
 const status = document.getElementById('status');
 const results = document.getElementById('results');
 const form = document.getElementById('search');
@@ -36,7 +43,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function loadManifestAndStyle() {
   let lastError;
   for (let attempt = 1; attempt <= STYLE_ATTEMPTS; attempt++) {
-    const manifest = await getJSON('/v1/manifest', attempt === 1 ? 'no-cache' : 'reload');
+    const manifest = await getJSON(apiURL('v1/manifest'), attempt === 1 ? 'no-cache' : 'reload');
     const res = await fetch(manifest.style_url, { headers: { Accept: 'application/json' } });
     const body = await res.json().catch(() => null);
     if (res.ok && body) {
@@ -98,7 +105,7 @@ form.addEventListener('submit', async (event) => {
   setStatus('Searching…');
   try {
     const params = new URLSearchParams({ q, limit: '10', release_id: releaseId });
-    const body = await getJSON(`/v1/search?${params}`);
+    const body = await getJSON(apiURL(`v1/search?${params}`));
     setStatus(`${body.results.length} result(s) for “${body.query}”`);
     for (const r of body.results) {
       const li = document.createElement('li');

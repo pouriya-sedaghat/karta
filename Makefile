@@ -6,12 +6,18 @@ COMPOSE        ?= docker compose
 TEST_PROJECT   ?= karta-test
 TEST_COMPOSE   := $(COMPOSE) -p $(TEST_PROJECT) -f compose.yaml -f compose.test.yaml
 OFFLINE_COMPOSE := $(COMPOSE) -p karta-offline -f compose.yaml -f compose.offline.yaml
+# A plain bridge network, like compose.yaml's `frontend`, attached to the
+# offline API only as the negative control of `make test-offline`.
+OFFLINE_PROBE_NET := karta-offline_frontend-probe
 VERSION        ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
 # Optional PEM bundle for TLS-intercepting build networks (passed as a build secret).
 KARTA_BUILD_CA_FILE ?=
 comma          := ,
 BUILD_SECRET   := $(if $(KARTA_BUILD_CA_FILE),--secret id=build_ca$(comma)src=$(KARTA_BUILD_CA_FILE),)
 BASE_URL       ?= http://localhost:8080
+# Public base URL for `make test-browser-prefix`: a test proxy on this address
+# serves Karta under /maps and strips the prefix before forwarding to BASE_URL.
+PREFIX_BASE_URL ?= http://127.0.0.1:18091/maps
 ARTIFACTS      ?= artifacts
 
 # Tool versions for static and security checks (run with `go run`, no global installs).
@@ -134,20 +140,35 @@ test-browser-tehran: ## Render the real Chitgar release (after `make import-tehr
 	KARTA_TEST_SEARCH='{"q":"دریاچه چیتگر","expect":"دریاچه چیتگر"}' \
 	go test -tags browser -count=1 -v ./tests/browser/
 
+.PHONY: test-browser-prefix
+test-browser-prefix: ## Browser tests through a proxy serving Karta under /maps (running stack; restarts the API with PREFIX_BASE_URL, then restores it)
+	@mkdir -p $(ARTIFACTS)
+	KARTA_PUBLIC_BASE_URL=$(PREFIX_BASE_URL) $(COMPOSE) up -d --no-deps api
+	@$(MAKE) -s wait-ready
+	KARTA_TEST_BASE_URL=$(PREFIX_BASE_URL) KARTA_TEST_PREFIX_UPSTREAM=$(BASE_URL) \
+	KARTA_TEST_ARTIFACTS=$(CURDIR)/$(ARTIFACTS)/prefix go test -tags browser -count=1 -v ./tests/browser/ ; \
+	  status=$$?; $(COMPOSE) up -d --no-deps api; $(MAKE) -s wait-ready || status=1; exit $$status
+
 .PHONY: test-offline
-test-offline: secrets ## Disconnected run: API and DB on an internal-only network, fixture imported, browser via container IP
+test-offline: secrets ## Disconnected run: API and DB on an internal-only network (checked), fixture imported, browser via container IP
 	$(OFFLINE_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true
+	-@docker network rm $(OFFLINE_PROBE_NET) >/dev/null 2>&1
 	$(OFFLINE_COMPOSE) up -d --wait db
 	$(OFFLINE_COMPOSE) run --rm -T importer --snapshot /data/testdata/fixture/karta-fixture.osm --region /config/regions/fixture.json > /dev/null
 	$(OFFLINE_COMPOSE) up -d api
 	@mkdir -p $(ARTIFACTS)
-	@ip=$$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $$($(OFFLINE_COMPOSE) ps -q api)); \
-	  echo "api container IP $$ip (no published port, no external route)"; \
+	@api=$$($(OFFLINE_COMPOSE) ps -q api); probe=karta-importer:$${KARTA_IMAGE_TAG:-local}; \
+	  cleanup() { docker network rm $(OFFLINE_PROBE_NET) >/dev/null 2>&1 || true; $(OFFLINE_COMPOSE) down -v --remove-orphans; }; \
+	  echo "negative control: the isolation check must fail while the api is also on a frontend (non-internal) network"; \
+	  docker network create $(OFFLINE_PROBE_NET) >/dev/null && docker network connect $(OFFLINE_PROBE_NET) $$api || { cleanup; exit 1; }; \
+	  if scripts/check-isolated.sh $$api karta-offline_backend $$probe; then control=passed; else control=failed; fi; \
+	  docker network disconnect $(OFFLINE_PROBE_NET) $$api && docker network rm $(OFFLINE_PROBE_NET) >/dev/null || { cleanup; exit 1; }; \
+	  if [ $$control = passed ]; then echo "the isolation check passed although the api was on a frontend network" >&2; cleanup; exit 1; fi; \
+	  scripts/check-isolated.sh $$api karta-offline_backend $$probe || { cleanup; exit 1; }; \
+	  ip=$$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $$api); \
+	  echo "api container IP $$ip"; \
 	  for i in $$(seq 1 30); do curl -fsS http://$$ip:8080/health/ready >/dev/null 2>&1 && break; sleep 1; done; \
-	  $(OFFLINE_COMPOSE) exec -T api /usr/local/bin/karta healthcheck; \
-	  if $(OFFLINE_COMPOSE) exec -T api /usr/local/bin/karta healthcheck --live --url http://1.1.1.1 2>/dev/null; then \
-	    echo "the api container can reach an external host; the offline network is not isolated" >&2; exit 1; \
-	  else echo "confirmed: the api container has no route to external hosts"; fi; \
+	  $(OFFLINE_COMPOSE) exec -T api /usr/local/bin/karta healthcheck || { cleanup; exit 1; }; \
 	  KARTA_TEST_BASE_URL=http://karta.internal:8080 KARTA_TEST_RESOLVE=karta.internal=$$ip \
 	  KARTA_TEST_ARTIFACTS=$(CURDIR)/$(ARTIFACTS)/offline go test -tags browser -count=1 -v ./tests/browser/ ; \
-	  status=$$?; $(OFFLINE_COMPOSE) down -v --remove-orphans; exit $$status
+	  status=$$?; cleanup; exit $$status

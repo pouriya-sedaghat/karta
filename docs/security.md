@@ -39,8 +39,11 @@ flowchart LR
   (`KARTA_HTTP_BIND`); put TLS termination in front of it for any other exposure.
 * The running API makes no outbound connections: it needs the database and
   nothing else, and keeps answering during an internet outage. `make
-  test-offline` runs it with no external route and checks that from the
-  browser's point of view too.
+  test-offline` runs it with no external route. It checks the container's
+  network attachments, the network's `internal` flag, published ports and
+  default routes (`scripts/check-isolated.sh`, with a negative control on a
+  frontend-like network), and checks the result from the browser's point of
+  view too.
 * CORS is off unless origins are listed in `KARTA_CORS_ALLOWED_ORIGINS`;
   credentials are never allowed.
 

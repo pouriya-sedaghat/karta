@@ -12,7 +12,7 @@ The contract is [`openapi/openapi.yaml`](../openapi/openapi.yaml) (also served a
 | `GET /v1/releases/{release_id}/tiles/{z}/{x}/{y}.pbf` | vector tile, z 0–16 |
 | `GET /v1/fonts/{fontstack}/{range}.pbf` | glyph ranges (`Vazirmatn Regular`, `Vazirmatn Bold`) |
 | `GET /health/live`, `GET /health/ready` | liveness; readiness with `reason` |
-| `GET /demo/` | MapLibre demo (same-origin, strict CSP) |
+| `GET /demo/` | MapLibre demo (same-origin, strict CSP); `/` and `/demo` redirect to it with a relative `Location: demo/`, so it also works under a path prefix (`docs/runbook.md`) |
 
 ## Search
 

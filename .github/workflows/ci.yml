@@ -53,6 +53,7 @@ jobs:
           make -s import-fixture > artifacts/fixture-import.json
           make wait-ready
           make test-browser
+          make test-browser-prefix
           make reset
       - name: disconnected-network test
         run: make test-offline

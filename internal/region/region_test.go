@@ -59,6 +59,25 @@ func TestSameBBox(t *testing.T) {
 	}
 }
 
+// SameBBox decides whether a snapshot header or provenance box matches the
+// region. A non-finite coordinate on either side, in any position, is no match;
+// NaN in particular slips through a plain "difference > tolerance" test.
+func TestSameBBoxRejectsNonFinite(t *testing.T) {
+	good := [4]float64{51.175, 35.705, 51.285, 35.785}
+	for i := range good {
+		for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+			b := good
+			b[i] = bad
+			if SameBBox(b, good) || SameBBox(good, b) || SameBBox(b, b) {
+				t.Errorf("coordinate %d = %v matched", i, bad)
+			}
+		}
+	}
+	if !SameBBox(good, good) {
+		t.Error("identical finite boxes do not match")
+	}
+}
+
 // JSON cannot carry NaN or infinity, but Validate is also the check for
 // configurations built in code; every range check must reject them.
 func TestNonFiniteValuesRejected(t *testing.T) {

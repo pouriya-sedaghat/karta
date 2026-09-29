@@ -206,7 +206,10 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 			return nil, fmt.Errorf("%w: provenance: %v", ErrInput, err)
 		}
 		pb, err := s.BBox()
-		if err != nil || !region.SameBBox(pb, cfg.BBox) {
+		if err != nil {
+			return nil, fmt.Errorf("%w: provenance: %v", ErrInput, err)
+		}
+		if !region.SameBBox(pb, cfg.BBox) {
 			return nil, fmt.Errorf("%w: provenance box %q does not match region %q box %v", ErrInput, s.BBoxWGS84, cfg.ID, cfg.BBox)
 		}
 		prov = &s

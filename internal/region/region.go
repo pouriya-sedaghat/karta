@@ -171,11 +171,13 @@ func ValidBBox(b [4]float64) error {
 
 // SameBBox compares boxes with a tolerance of 1e-7 degrees (about 1 cm),
 // the precision of OSM coordinates. It only decides whether a snapshot's
-// header box matches the region; the release id and everything served use
-// the region's exact values.
+// header or provenance box matches the region; the release id and everything
+// served use the region's exact values. A box with a non-finite coordinate
+// matches nothing: the difference with NaN is NaN, and NaN > 1e-7 is false,
+// so the tolerance test alone would accept it.
 func SameBBox(a, b [4]float64) bool {
 	for i := range a {
-		if math.Abs(a[i]-b[i]) > 1e-7 {
+		if !finite(a[i]) || !finite(b[i]) || math.Abs(a[i]-b[i]) > 1e-7 {
 			return false
 		}
 	}

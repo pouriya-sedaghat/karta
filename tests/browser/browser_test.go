@@ -18,6 +18,10 @@
 //	KARTA_TEST_VIEWS       JSON views to check (default: fixture views)
 //	KARTA_TEST_SEARCH      JSON {"q": ..., "expect": ...} for the demo search box
 //	KARTA_TEST_ARTIFACTS   directory for screenshots (default artifacts/browser)
+//	KARTA_TEST_PREFIX_UPSTREAM
+//	                       optional API origin; when set, all tests run through a
+//	                       reverse proxy serving Karta under the path of
+//	                       KARTA_TEST_BASE_URL (prefix_test.go)
 package browser
 
 import (
@@ -157,7 +161,7 @@ func TestDemoRendersOffline(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, base, bu := startBrowser(t)
+	ctx, base, _ := startBrowser(t)
 
 	rec := &recorder{statuses: map[string]int64{}}
 	chromedp.ListenTarget(ctx, func(ev any) {
@@ -283,7 +287,8 @@ func TestDemoRendersOffline(t *testing.T) {
 		}
 		rec.mu.Lock()
 		defer rec.mu.Unlock()
-		origin := bu.Scheme + "://" + bu.Host + "/"
+		// The base URL, including any path prefix (`make test-browser-prefix`).
+		origin := base + "/"
 		var outside []string
 		glyphRanges := map[string]int64{}
 		for _, u := range rec.requests {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -65,7 +66,11 @@ func Load(path string) (Sidecar, error) {
 	return s, nil
 }
 
-// BBox parses bbox_wgs84 ("west,south,east,north").
+// bboxNames are the bbox_wgs84 coordinates in order.
+var bboxNames = [4]string{"west", "south", "east", "north"}
+
+// BBox parses bbox_wgs84 ("west,south,east,north"). strconv.ParseFloat also
+// accepts NaN and infinities; those are not coordinates and are rejected.
 func (s Sidecar) BBox() ([4]float64, error) {
 	var out [4]float64
 	parts := strings.Split(s.BBoxWGS84, ",")
@@ -76,6 +81,9 @@ func (s Sidecar) BBox() ([4]float64, error) {
 		v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
 		if err != nil {
 			return out, fmt.Errorf("bbox_wgs84: %w", err)
+		}
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return out, fmt.Errorf("bbox_wgs84 %s %q is not a finite number", bboxNames[i], strings.TrimSpace(p))
 		}
 		out[i] = v
 	}

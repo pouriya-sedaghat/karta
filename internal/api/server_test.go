@@ -194,7 +194,7 @@ func TestDemoFiles(t *testing.T) {
 	if rec.Code != 200 || !strings.Contains(rec.Header().Get("Content-Security-Policy"), "connect-src 'self'") {
 		t.Fatalf("demo %d %v", rec.Code, rec.Header())
 	}
-	if rec := call(t, h, "GET", "/", nil, nil); rec.Code != 302 || rec.Header().Get("Location") != "/demo/" {
+	if rec := call(t, h, "GET", "/", nil, nil); rec.Code != 302 || rec.Header().Get("Location") != "demo/" {
 		t.Errorf("root %d %v", rec.Code, rec.Header())
 	}
 	for _, p := range []string{"/demo/vendor/", "/demo/missing.js", "/demo/secret.env", "/demo/%2e%2e/%2e%2e/etc/passwd"} {
