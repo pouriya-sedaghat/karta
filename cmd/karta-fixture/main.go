@@ -38,7 +38,7 @@ func main() {
 			fatal(err)
 		}
 		d, err := pbfwrite.ParseXML(src)
-		src.Close()
+		_ = src.Close()
 		if err != nil {
 			fatal(fmt.Errorf("%s: %w", s.Source, err))
 		}

@@ -134,7 +134,8 @@ release with a database session, marks the release `removing` under a row
 lock (so no rollback can pick it), drops the database without `FORCE` (the
 drop fails if a session appears), then marks it `removed`. It runs after each
 publication, every `KARTA_CLEANUP_INTERVAL`, and on operator request (with a
-dry run).
+dry run). Every removal is audited; an operator's cleanup request is also
+audited as a whole, including a dry run or one that removes nothing.
 
 ### Recovery
 
@@ -179,6 +180,16 @@ refused (`release_incompatible`) until the snapshot is published again, which
 builds a new release id on the new toolchain. Immutable tile URLs therefore
 stay valid across database image upgrades: they are served only by the
 toolchain that produced them, and never by another.
+
+### State names
+
+ADR 0001 sketched `discovered`, `staging`, `validating`, `ready`, `active`,
+`failed`, `retired`. They are implemented as submission states (`processing`
+covers discovery, staging and verification; outcomes `published`, `ready`,
+`duplicate`, `rejected`, `failed`, `interrupted`) and release states
+(`importing`, `validating`, `ready`, `active`, `retired`, `failed`, plus
+`removing` and `removed` for cleanup), so a rejected file never creates a
+release row.
 
 ## Registry schema version 2 (stored-data migration)
 

@@ -293,15 +293,15 @@ func openListed(dir, name string, want *FileState) (*os.File, error) {
 	}
 	fi, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, reject(CodeIO, "%s: %v", name, err)
 	}
 	if !fi.Mode().IsRegular() {
-		f.Close()
+		_ = f.Close()
 		return nil, reject(CodeNotRegular, "%s is not a regular file", name)
 	}
 	if got := stateOf(fi); got.key() != want.key() {
-		f.Close()
+		_ = f.Close()
 		return nil, reject(CodeChanged, "%s changed after it was listed", name)
 	}
 	return f, nil
@@ -418,11 +418,11 @@ func writeNew(path string, b []byte) error {
 		return classifyWrite(err)
 	}
 	if _, err := f.Write(b); err != nil {
-		f.Close()
+		_ = f.Close()
 		return classifyWrite(err)
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return classifyWrite(err)
 	}
 	return classifyWrite(f.Close())
@@ -453,7 +453,7 @@ func copyVerified(dir, name string, want *FileState, dst string, limit int64) (s
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(src, limit+1))
 	if err != nil {
-		out.Close()
+		_ = out.Close()
 		var pe *fs.PathError
 		if errors.As(err, &pe) && pe.Path == src.Name() {
 			return "", 0, reject(CodeIO, "read %s: %v", name, err)
@@ -461,7 +461,7 @@ func copyVerified(dir, name string, want *FileState, dst string, limit int64) (s
 		return "", 0, classifyWrite(err)
 	}
 	if err := out.Sync(); err != nil {
-		out.Close()
+		_ = out.Close()
 		return "", 0, classifyWrite(err)
 	}
 	if err := out.Close(); err != nil {

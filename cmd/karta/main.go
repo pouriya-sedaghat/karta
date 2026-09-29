@@ -483,7 +483,7 @@ func runOperator(args []string) int {
 		fmt.Fprintln(os.Stderr, "karta operator:", err)
 		return exitFailure
 	}
-	os.Stdout.Write(resp.Body)
+	_, _ = os.Stdout.Write(resp.Body)
 	fmt.Println()
 	if resp.Status/100 != 2 {
 		fmt.Fprintf(os.Stderr, "karta operator: %s %s: HTTP %d\n", method, filepath.Clean(path), resp.Status)

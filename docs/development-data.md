@@ -38,6 +38,48 @@ These observations validate the **raw development input**, not the Stage 1 impor
 * Tiles: z14 `14/10522/6448` over the lake is 15,978 bytes with water 3, landcover 13, buildings 29, roads 166, places 2, pois 5; z15 `15/21044/12898` (freeway and Chitgar forest park) 9,561 bytes; z12 overview 45,834 bytes. The browser test renders the lake, park/road, overview and Iran Mall views with Persian labels placed and saves screenshots.
 * Cost: import 3.1–4.1 s end to end (5.3 s including container start) (osm2pgsql 0.5–0.8 s, post-import SQL 2.1–2.6 s); osm2pgsql peak RSS 36 MB; PostgreSQL container peak about 139 MiB during import; release database 34 MB (PostgreSQL data directory 132 MB including template and registry).
 
+## Stage 2 publication of this snapshot (2026-09-29)
+
+The same two files were supplied again for Stage 2 and placed in `data/local/`.
+Before use: the PBF's SHA-256 was exactly
+`7d0e69a2d5e1ad184ee48637626882bb8bcb7acd8e95123e05d0697ce216191e`; the
+sidecar's `output_sha256` and output size (1,149,950 bytes) matched the file;
+its `bbox_wgs84`, the extract's recorded header box and the PBF header box
+equal the region box `51.175,35.705,51.285,35.785`; its source timestamps
+(`osmosis_replication_timestamp` and `timestamp`, both 2026-09-27T20:23:36Z)
+agree, are not in the future, and no object in the source or the extract is
+newer (last object 2026-09-27T20:17:59Z and 14:34:58Z). The claim that the
+extract was cut from an Iran PBF with SHA-256 `fbb1b010…4529` is recorded, not
+verified: that original file was not available.
+
+`make publish-tehran` submitted the files to the inbox with the completion
+protocol; the publisher scanned the whole PBF (125,907 nodes, 18,619 ways and
+267 relations, the counts of the independent scan above), verified the
+sidecar, took the data timestamp from its source header, found the digest
+pinned in `config/regions/tehran-chitgar.json`, built and validated a
+candidate and activated it:
+
+* Release id `rf210a8fe8237f20095686597`, the **same id as the Stage 1
+  import** (identical inputs, toolchain and schema give the identical release
+  and URLs), with the same row counts as above and all 24 checks passing.
+* Build 3.4 s (osm2pgsql 0.61 s, post-import SQL 2.27 s); from writing the
+  ready marker to published 18.6 s and to API readiness 20.7 s (the 5 s settle
+  interval and the 10 s inbox poll dominate). osm2pgsql peak RSS 36 MB, the
+  publisher process 18 MB; release database 35.6 MB (33.9 MiB); PostgreSQL data
+  directory 131 MB.
+* `دریاچه چیتگر` and `Chitgar Lake` (and `lang=en`) return way `1259635603`
+  first and relation `8128152` second; tiles `14/10522/6448` and
+  `15/21044/12898` are 15,978 and 9,561 bytes as in Stage 1;
+  `make test-browser-tehran` renders the lake, park/road, overview and Iran
+  Mall views with Persian labels (all requests to the local origin).
+* Submitting the same file again was `duplicate_active`; `make import-tehran`
+  exited 0 as already active; a copy truncated to half its size was rejected
+  as `malformed_snapshot` ("truncated PBF OSMData blob at byte 530035"). The
+  active release did not change.
+
+Switching, rollback and cleanup were tested with the two committed fixture
+snapshots, not with this single real snapshot.
+
 ## Obtain and extract
 
 On a machine with sufficient RAM/disk (the osmium reference check can use substantial RAM even for a small extract), Python 3.9+, and [osmium-tool](https://osmcode.org/osmium-tool/) installed, download `iran-latest.osm.pbf` from [Geofabrik's Iran extract](https://download.geofabrik.de/asia/iran.html) using a browser or your normal trusted downloader. Record its download URL, date and published checksum if one is provided. Do not commit the input or the resulting PBF. Run:
@@ -51,7 +93,7 @@ python3 scripts/extract_tehran.py \
 
 To override the development box, pass `--bbox WEST,SOUTH,EAST,NORTH`. If the distributor provides an independently verified SHA-256, pass it as `--expected-sha256 HEX`. Use an **absolute** path to the input so that the command works from the repository root. The script fails rather than overwriting an existing extract; use a different output name for a newer source. It creates `tehran-chitgar.osm.pbf` and `tehran-chitgar.osm.pbf.provenance.json` beside it. The provenance contains both SHA-256 digests, the selection box, osmium version, full-file information and attribution. The script writes to temporary files, verifies the full extract can be parsed, is nonempty and that all way node references exist, then publishes the files. It uses `smart` extraction to preserve multipolygon geometry at the boundary; other relation types may be incomplete. An `osmium check-refs -r` failure alone does not imply the extract is invalid for this use.
 
-Do not copy the PBF directly into the runtime update inbox: the extraction tool produces a **development data source**, not a release. A future import still has to validate its configured region, content, provenance and version before activation. Geofabrik may update the `latest` input at any time; the SHA-256 in the sidecar is the exact snapshot identity. If only the current file name is known, source data recency must be taken from recorded source metadata, never inferred from the output file's modification time.
+Do not copy the PBF directly into the publication inbox: submit it with `scripts/submit.sh` (or `make publish-tehran`), which writes the ready marker last. The extraction tool produces a **development data source**, not a release: the publisher still verifies the region, content, provenance and data timestamp, and a digest that is not pinned in the region file must be authorized by an operator (`docs/runbook.md`) before it is imported. Geofabrik may update the `latest` input at any time; the SHA-256 in the sidecar is the exact snapshot identity. If only the current file name is known, source data recency must be taken from recorded source metadata, never inferred from the output file's modification time.
 
 ## Verify before use
 

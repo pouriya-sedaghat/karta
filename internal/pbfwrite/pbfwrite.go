@@ -173,7 +173,7 @@ type xmlRef struct {
 func tags(in []xmlTag) []Tag {
 	out := make([]Tag, len(in))
 	for i, t := range in {
-		out[i] = Tag{K: t.K, V: t.V}
+		out[i] = Tag(t)
 	}
 	return out
 }

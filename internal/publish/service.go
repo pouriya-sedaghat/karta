@@ -421,8 +421,8 @@ type Capacity struct {
 
 func (s *Service) capacity(ctx context.Context, snapshotBytes int64, regionID string) (Capacity, error) {
 	c := Capacity{BudgetBytes: s.cfg.StorageBudgetBytes, MinFreeBytes: s.cfg.MinFreeBytes}
-	if err := s.reg.QueryRow(ctx, `
-SELECT COALESCE(sum(pg_database_size(datname)), 0)::bigint FROM pg_database WHERE datname ~ '^karta_(r|c)[0-9a-f]{24}$'`).Scan(&c.ReleaseBytes); err != nil {
+	var err error
+	if c.ReleaseBytes, err = s.releaseBytes(ctx); err != nil {
 		return c, err
 	}
 	var prev int64
@@ -446,6 +446,41 @@ WHERE region_id = $1 AND state IN ('ready', 'active', 'retired')`, regionID).Sca
 		}
 	}
 	return c, nil
+}
+
+// releaseBytes sums the sizes of the release and candidate databases. Each
+// is sized separately: a candidate can be dropped concurrently (a duplicate
+// submission drops its candidate at once). A database that disappears
+// between the listing and its sizing yields NULL (dropped before the name
+// lookup) or an undefined-database error (dropped between the lookup and the
+// privilege check); either way it is skipped instead of failing the sum, as
+// one aggregate query over pg_database would.
+func (s *Service) releaseBytes(ctx context.Context) (int64, error) {
+	rows, err := s.reg.Query(ctx, `SELECT datname FROM pg_database WHERE datname ~ '^karta_(r|c)[0-9a-f]{24}$'`)
+	if err != nil {
+		return 0, err
+	}
+	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, name := range names {
+		var n *int64
+		err := s.reg.QueryRow(ctx, `SELECT pg_database_size($1::name)`, name).Scan(&n)
+		var pgErr *pgconn.PgError
+		switch {
+		case err == nil:
+			if n != nil {
+				total += *n
+			}
+		case errors.As(err, &pgErr) && (pgErr.Code == "3D000" || pgErr.Code == "58P01"):
+			// dropped (or being dropped) since the listing
+		default:
+			return 0, err
+		}
+	}
+	return total, nil
 }
 
 // checkCapacity refuses a build that would exceed the storage budget for
@@ -906,6 +941,20 @@ func (s *Service) Cleanup(ctx context.Context, p Principal, reason string, dryRu
 		activeID = active.ID
 	}
 	res.Decisions = Retention{Keep: s.cfg.RetainReleases, Margin: s.cfg.CleanupMargin}.Select(rels, activeID, s.now())
+	// An operator's cleanup request is audited as a whole (each removal is
+	// audited too); automatic cleanups only audit what they remove.
+	if p.Source == "operator_api" {
+		defer func() {
+			outcome := registry.OutcomeSucceeded
+			if dryRun || len(res.Removed) == 0 {
+				outcome = registry.OutcomeNoop
+			}
+			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			_ = registry.Audit(cctx, s.reg, registry.AuditEntry{Actor: p.Name, Source: p.Source, Action: "cleanup", Outcome: outcome,
+				Reason: reason, RequestID: p.RequestID, Detail: map[string]any{"dry_run": dryRun, "removed": res.Removed, "skipped": res.Skipped}})
+		}()
+	}
 	if dryRun {
 		return res, nil
 	}
@@ -1019,7 +1068,8 @@ func (s *Service) Recover(ctx context.Context, cleanStaging bool) (RecoveryRepor
 			continue
 		}
 		if st.state == registry.StateRemoving {
-			if err := registry.MarkRemoved(ctx, conn, st.id); err != nil {
+			// A concurrent cleanup may have finished the same removal.
+			if err := registry.MarkRemoved(ctx, conn, st.id); err != nil && !errors.Is(err, registry.ErrNotEligible) {
 				return rep, err
 			}
 			_ = registry.Audit(ctx, conn, registry.AuditEntry{Actor: sys.Name, Source: sys.Source, Action: "remove_release", Target: st.id,
@@ -1088,7 +1138,7 @@ func LockStaging(dir string) (*os.File, error) {
 		return nil, err
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil { // #nosec G115 -- file descriptors are small
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("staging directory %s is used by another publisher: %w", dir, err)
 	}
 	return f, nil

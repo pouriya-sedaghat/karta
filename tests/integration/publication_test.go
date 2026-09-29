@@ -512,6 +512,18 @@ func databases(t *testing.T) map[string]bool {
 	return out
 }
 
+// waitCandidate waits until a build has created its candidate database.
+func waitCandidate(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for candidates(t) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no candidate database appeared")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func candidates(t *testing.T) int {
 	t.Helper()
 	n := 0
@@ -749,6 +761,7 @@ func TestPublication(t *testing.T) {
 		importLoad := startLoad(2)
 		submit(t, "b", dataB, nil, "")
 		waitJobPhase(t, "building", 30*time.Second)
+		waitCandidate(t)
 		// While the candidate imports, the API serves A and nothing else.
 		if st := status(t); st.activeID() != relA || candidates(t) != 1 {
 			t.Fatalf("during import: active %s, candidates %d", st.activeID(), candidates(t))
@@ -787,10 +800,52 @@ func TestPublication(t *testing.T) {
 	}
 
 	t.Run("duplicate and older submissions change nothing", func(t *testing.T) {
+		// A duplicate builds a candidate database and drops it at once; the
+		// operator status sizes every database meanwhile and must not fail
+		// on one that disappears (a race these tests once caught).
+		stopPoll := make(chan struct{})
+		polled, pollErrs := 0, []string{}
+		var pollWG sync.WaitGroup
+		pollWG.Add(1)
+		go func() {
+			defer pollWG.Done()
+			for {
+				select {
+				case <-stopPoll:
+					return
+				default:
+				}
+				req, _ := http.NewRequest(http.MethodGet, opBase+"/v1/operator/status", nil)
+				req.Header.Set("Authorization", "Bearer "+monitor)
+				resp, err := client.Do(req)
+				polled++
+				if err != nil {
+					pollErrs = append(pollErrs, err.Error())
+					continue
+				}
+				b, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					pollErrs = append(pollErrs, fmt.Sprintf("%d %s", resp.StatusCode, b))
+				}
+			}
+		}()
+		defer func() {
+			close(stopPoll)
+			pollWG.Wait()
+			if len(pollErrs) > 0 {
+				t.Errorf("%d of %d status requests failed during duplicate submissions: %v", len(pollErrs), polled, pollErrs[0])
+			}
+		}()
+		for i := 0; i < 5; i++ {
+			submit(t, fmt.Sprintf("b-dup-%d", i), dataB, nil, "")
+		}
 		submit(t, "b-again", dataB, nil, "")
 		submit(t, "a-again", dataA, nil, "")
-		if s := waitSubmission(t, "b-again", 60*time.Second); s.State != "duplicate" || s.code() != "duplicate_active" || s.release() != relB {
-			t.Errorf("duplicate: %+v", s)
+		for _, name := range []string{"b-dup-0", "b-dup-1", "b-dup-2", "b-dup-3", "b-dup-4", "b-again"} {
+			if s := waitSubmission(t, name, 60*time.Second); s.State != "duplicate" || s.code() != "duplicate_active" || s.release() != relB {
+				t.Errorf("duplicate %s: %+v", name, s)
+			}
 		}
 		if s := waitSubmission(t, "a-again", 60*time.Second); s.State != "rejected" || s.code() != "older_than_active" {
 			t.Errorf("older: %+v", s)
@@ -1032,13 +1087,59 @@ func TestPublication(t *testing.T) {
 			})
 		}
 
+		// An operator rollback uses the same pointer transaction: a crash just
+		// before its commit changes nothing, just after it the rollback holds.
+		for _, fp := range []string{"activate.before_commit", "activate.after_commit"} {
+			t.Run("rollback interrupted at "+fp, func(t *testing.T) {
+				st := status(t)
+				var target string
+				for _, r := range st.Releases {
+					if r.State == "retired" && r.RollbackEligible {
+						target = r.ID
+						break
+					}
+				}
+				if target == "" {
+					t.Fatal("no rollback target")
+				}
+				before := activeFromRegistry(t)
+				restartPublisher(t, map[string]string{"KARTA_TEST_FAILPOINTS": fp})
+				opTolerant(t, http.MethodPost, "/v1/operator/rollback", admin, map[string]any{"release_id": target, "reason": "rollback interrupted at " + fp})
+				if code := waitPublisherExit(t, 30*time.Second); code != 99 {
+					t.Fatalf("exit %d", code)
+				}
+				got := activeFromRegistry(t)
+				switch fp {
+				case "activate.before_commit":
+					if got != before {
+						t.Fatalf("active %s after a crash before the commit, want %s", got, before)
+					}
+				default:
+					if got != target {
+						t.Fatalf("active %s after a crash after the commit, want %s", got, target)
+					}
+				}
+				restartPublisher(t, nil)
+				waitManifest(t, got)
+				assertRegistryConsistent(t)
+				// Back to the release that was active, explicitly.
+				if got != before {
+					r := op(t, http.MethodPost, "/v1/operator/releases/"+before+"/activate", admin, map[string]any{"reason": "undo the test rollback"})
+					if r.status != 200 {
+						t.Fatalf("activate %s: %d %s", before, r.status, r.body)
+					}
+					waitManifest(t, before)
+				}
+			})
+		}
+
 		t.Run("kill -9 during osm2pgsql", func(t *testing.T) {
 			data := variant(t, at("2026-04-20T00:00:00Z"), nil, nil)
 			authorize(t, data, "integration test: kill during import")
 			restartPublisher(t, map[string]string{"KARTA_TEST_OSM2PGSQL": "/usr/local/bin/slow-osm2pgsql"})
 			submit(t, "killed", data, nil, "")
 			waitJobPhase(t, "building", 30*time.Second)
-			time.Sleep(2 * time.Second)
+			waitCandidate(t)
 			if out, err := exec.Command("docker", "kill", "-s", "KILL", publisherContainer(t)).CombinedOutput(); err != nil {
 				t.Fatalf("kill: %v %s", err, out)
 			}
@@ -1188,6 +1289,10 @@ func TestPublication(t *testing.T) {
 	})
 
 	t.Run("disk exhaustion fails safely", func(t *testing.T) {
+		t.Cleanup(func() {
+			restartPublisher(t, nil)
+			active = activeFromRegistry(t)
+		})
 		// 1. The storage budget refuses a build before it starts.
 		data := variant(t, at("2026-06-01T00:00:00Z"), nil, nil)
 		authorize(t, data, "integration test: disk exhaustion")
@@ -1226,12 +1331,11 @@ func TestPublication(t *testing.T) {
 			t.Fatalf("after freeing space: %+v", s)
 		}
 		recordMeasurement(t, "tight_tablespace_bytes_free_before_import", tightAvail)
-		restartPublisher(t, nil)
-		active = activeFromRegistry(t)
-		waitManifest(t, active)
+		waitManifest(t, activeFromRegistry(t))
 	})
 
 	t.Run("an incompatible release is not rolled back to", func(t *testing.T) {
+		active = activeFromRegistry(t)
 		st := status(t)
 		var target *opRelease
 		for i := range st.Releases {
@@ -1267,11 +1371,13 @@ func TestPublication(t *testing.T) {
 	recordMeasurement(t, "load_during_publication_test", sum)
 
 	t.Run("a database restart during an import is retried", func(t *testing.T) {
+		t.Cleanup(func() { restartPublisher(t, nil) })
 		data := variant(t, at("2026-07-01T00:00:00Z"), nil, nil)
 		authorize(t, data, "integration test: database restart")
 		restartPublisher(t, map[string]string{"KARTA_TEST_OSM2PGSQL": "/usr/local/bin/slow-osm2pgsql"})
 		submit(t, "db-restart", data, nil, "")
 		waitJobPhase(t, "building", 30*time.Second)
+		waitCandidate(t)
 		if _, stderr, code := compose(t, "restart", "db"); code != 0 {
 			t.Fatalf("restart db: %s", stderr)
 		}
@@ -1290,6 +1396,7 @@ func TestPublication(t *testing.T) {
 	})
 
 	t.Run("serving refuses a release built with another database toolchain", func(t *testing.T) {
+		active = activeFromRegistry(t)
 		conn := superuser(t, "karta_"+active)
 		defer conn.Close(context.Background())
 		ctx := context.Background()
@@ -1331,7 +1438,7 @@ func TestPublication(t *testing.T) {
 		}
 		for _, want := range []string{
 			"operator_api/status/denied", "operator_api/rollback/denied", "operator_api/rollback/succeeded", "operator_api/rollback/rejected",
-			"operator_api/activate/succeeded", "operator_api/authorize_digest/succeeded",
+			"operator_api/activate/succeeded", "operator_api/authorize_digest/succeeded", "operator_api/cleanup/succeeded", "operator_api/cleanup/noop",
 			"inbox/publish/succeeded", "inbox/submission/succeeded", "inbox/submission/rejected", "inbox/submission/failed",
 			"inbox/import_started/succeeded", "inbox/import_failed/failed", "system/recover/succeeded", "operator_api/remove_release/succeeded",
 		} {
@@ -1515,6 +1622,11 @@ func blobBoundary(t *testing.T, b []byte) int {
 // fillTightTablespace creates the karta_tight tablespace on the db
 // container's small tmpfs, lets karta_importer use it, and fills it so a
 // new database fits but an import does not. It returns the bytes left.
+//
+// The space a database copy really takes is measured with df: PostgreSQL
+// copies a template (strategy WAL_LOG) into files that are largely sparse,
+// so pg_database_size (the files' apparent size, about 16 MB here) is far
+// more than the blocks tmpfs allocates (about 2 MB).
 func fillTightTablespace(t *testing.T) int64 {
 	t.Helper()
 	ctx := context.Background()
@@ -1523,33 +1635,32 @@ func fillTightTablespace(t *testing.T) int64 {
 	for _, sql := range []string{
 		`CREATE TABLESPACE karta_tight LOCATION '/var/lib/postgresql/tight'`,
 		`GRANT CREATE ON TABLESPACE karta_tight TO karta_importer`,
-		`CREATE DATABASE karta_probe TEMPLATE karta_template TABLESPACE karta_tight`,
 	} {
 		if _, err := pg.Exec(ctx, sql); err != nil {
 			t.Fatalf("%s: %v", sql, err)
 		}
 	}
-	var templateBytes int64
-	if err := pg.QueryRow(ctx, `SELECT pg_database_size('karta_probe')`).Scan(&templateBytes); err != nil {
+	empty := tightAvail(t)
+	if _, err := pg.Exec(ctx, `CREATE DATABASE karta_probe TEMPLATE karta_template TABLESPACE karta_tight`); err != nil {
 		t.Fatal(err)
 	}
+	copyCost := empty - tightAvail(t)
 	if _, err := pg.Exec(ctx, `DROP DATABASE karta_probe`); err != nil {
 		t.Fatal(err)
 	}
 	avail := tightAvail(t)
-	// Leave room for the template copy plus 256 KiB; the fixture import
-	// needs several MiB more (its release databases are about 17 MB, the
-	// template's copy is measured above).
-	filler := avail - templateBytes - 256<<10
-	if filler <= 0 {
-		t.Fatalf("tight filesystem too small: %d available, template %d", avail, templateBytes)
+	// Leave room for the template copy plus 256 KiB; importing the fixture
+	// writes several MiB more.
+	filler := avail - copyCost - 256<<10
+	if copyCost <= 0 || filler <= 0 {
+		t.Fatalf("tight filesystem: %d available, a template copy takes %d", avail, copyCost)
 	}
 	if out, _, code := compose(t, "exec", "-T", "db", "sh", "-c",
 		fmt.Sprintf("'head -c %d /dev/zero > /var/lib/postgresql/tight/filler && sync'", filler)); code != 0 {
 		t.Fatalf("fill: %s", out)
 	}
 	left := tightAvail(t)
-	t.Logf("tight tablespace: template copy %d bytes, %d bytes left after filling", templateBytes, left)
+	t.Logf("tight tablespace: a template copy allocates %d bytes; %d bytes left after filling", copyCost, left)
 	return left
 }
 
