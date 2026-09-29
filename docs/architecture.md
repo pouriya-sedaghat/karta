@@ -8,7 +8,13 @@ Status: proposed baseline, 2026-09-28. This document is a contract for implement
 - `apps -> core -> karta`: Karta owns geographic data and APIs. It must not know application-specific types, user accounts, or upstream project packages. `core` calls a versioned Karta API and can expose an adapter to apps.
 - A *successful update* means a complete new release is validated and activated without stopping serving traffic. Internet failure must not prevent requests against the active release. A failed import never changes the active release.
 - Address-level geocoding, routing, live editing, and planet-scale capacity are not MVP commitments. Place/POI search includes Unicode names and `name:fa`; ranking and language behavior require evaluation on the chosen region.
-- Geography, runtime host, hardware budget, QPS, acceptable staleness, and deployment topology remain configurable/open. A small, licensed extract is used for integration tests; no country is presumed.
+- Production geography, runtime host, hardware budget, QPS, acceptable staleness, and deployment topology remain configurable/open. For development, use a deterministic committed fixture in CI and a real Chitgar Lake area extract from an Iran PBF for acceptance; see [development data](development-data.md). Neither the Tehran selection nor its raw data is hard-coded into production APIs.
+
+## Feature completeness and evolution
+
+Each accepted stage must deliver its **stated capability end to end**: input validation, secure request behavior, documented configuration, operational errors and diagnostics, positive and negative tests, restart and recovery behavior, and a real-data demonstration where applicable. A stage is not complete because its happy path runs. Stages add new capabilities across stable module and API boundaries; they do not postpone the quality of already shipped capabilities. This cannot eliminate future design changes, so capture a short ADR and migration plan before breaking a published API or changing stored release data. Keep map and named-place search deliberately bounded; full address geocoding and routing require separately specified feature contracts.
+
+Explicit separation: generic region definitions and source adapters; isolated, versioned release builder; registry and activation; read-only query serving; tile/style asset serving; independent operator interface. Configuration must not contain credentials in source, paths must be restricted, database roles scoped, and public HTTP handlers must validate inputs and apply resource and timeout limits. Threat-model the inbox, download source, PostgreSQL access, caches, and operator actions before their respective features ship. Publish an OpenAPI schema and compatibility policy for the public contract; include any migration in the PR that changes it.
 
 ## System boundary
 
@@ -51,7 +57,7 @@ The first implementation uses complete PBF snapshots and independent shadow impo
 - `/health/live` is process health; `/health/ready` requires a serving release and its data dependencies. An operator-only update/status/rollback interface must be authenticated and separate from public queries.
 - Structured logs, a release/update state machine (`discovered`, `staging`, `validating`, `ready`, `active`, `failed`, `retired`), metrics for freshness, failures, duration, active release, request errors and disk space; alerts for prolonged staleness, no serving release and rollback failures.
 
-The first running version may use one host with Docker Compose. Do not call it highly available. Define baseline performance and resource targets after the region and expected traffic are known. Cover restart after a failed import, simultaneous online/manual candidates, release pinning during switch, rollback, lost network, incomplete files, repeated files, and old-release cleanup in integration tests.
+The first running version may use one host with Docker Compose. Do not call it highly available. Define baseline performance and resource targets after the region and expected traffic are known. Cover restart after a failed import, simultaneous online/manual candidates, release pinning during switch, rollback, lost network, incomplete files, repeated files, and old-release cleanup in integration tests. Record disk/RAM/CPU usage when importing the real Tehran sample; estimate space for at least the active, candidate and retained release before accepting a production geography.
 
 ## Licensing and provenance
 
