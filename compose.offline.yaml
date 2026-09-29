@@ -1,0 +1,10 @@
+# Simulated disconnected run: the API joins only the internal `backend`
+# network, so neither it nor PostgreSQL has any route outside Docker, and no
+# port is published. Clients on the Docker host reach the API by container IP
+# (see `make test-offline`), addressed as http://karta.internal:8080.
+services:
+  api:
+    ports: !reset []
+    networks: !override [backend]
+    environment:
+      KARTA_PUBLIC_BASE_URL: http://karta.internal:8080

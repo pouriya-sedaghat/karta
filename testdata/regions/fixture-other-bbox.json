@@ -1,0 +1,8 @@
+{
+  "id": "fixture-elsewhere",
+  "name": "A region whose box differs from the fixture header (negative test)",
+  "bbox": [0.0, 0.0, 0.03, 0.02],
+  "source": { "require_provenance": false },
+  "view": { "center": [0.01, 0.0075], "zoom": 15 },
+  "validation": { "min_counts": {}, "search": [], "tiles": [] }
+}

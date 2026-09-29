@@ -1,0 +1,32 @@
+{
+  "id": "tehran-chitgar",
+  "name": "Chitgar Lake area, Tehran (development sample)",
+  "bbox": [51.175, 35.705, 51.285, 35.785],
+  "source": {
+    "expected_sha256": "7d0e69a2d5e1ad184ee48637626882bb8bcb7acd8e95123e05d0697ce216191e",
+    "require_provenance": true
+  },
+  "view": { "center": [51.215, 35.745], "zoom": 13 },
+  "validation": {
+    "min_counts": {
+      "roads": 3500,
+      "water": 40,
+      "waterways": 15,
+      "landcover": 1000,
+      "buildings": 4000,
+      "features": 1300,
+      "place_names": 1600
+    },
+    "search": [
+      { "q": "دریاچه چیتگر", "osm_type": "way", "osm_id": 1259635603, "max_position": 1 },
+      { "q": "Chitgar Lake", "osm_type": "way", "osm_id": 1259635603, "max_position": 1 },
+      { "q": "Chitgar Lake", "lang": "en", "osm_type": "way", "osm_id": 1259635603, "max_position": 1 }
+    ],
+    "tiles": [
+      { "lon": 51.21494, "lat": 35.74558, "z": 14, "layers": ["water", "pois", "roads"] },
+      { "lon": 51.20734, "lat": 35.73096, "z": 14, "layers": ["landcover", "roads"] },
+      { "lon": 51.2054, "lat": 35.7215, "z": 15, "layers": ["landcover", "roads"] },
+      { "lon": 51.215, "lat": 35.745, "z": 12, "layers": ["water", "landcover", "roads", "pois"] }
+    ]
+  }
+}

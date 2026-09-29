@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Karta synthetic test fixture. Hand-written; not derived from OpenStreetMap data.
+     Dedicated to the public domain under CC0 1.0 (see LICENSE.md in this directory).
+     Region: lon 0.000..0.020, lat 0.000..0.015 (config/regions/fixture.json).
+     Objects are sorted by type then id, as osm2pgsql expects. -->
+<osm version="0.6" generator="karta-fixture/1" timestamp="2026-01-01T00:00:00Z">
+  <bounds minlat="0.0000000" minlon="0.0000000" maxlat="0.0150000" maxlon="0.0200000"/>
+  <!-- Lake (way 100) -->
+  <node id="1" lat="0.0020000" lon="0.0020000"/>
+  <node id="2" lat="0.0020000" lon="0.0060000"/>
+  <node id="3" lat="0.0050000" lon="0.0060000"/>
+  <node id="4" lat="0.0050000" lon="0.0020000"/>
+  <!-- Pond multipolygon outer (way 101) and inner island (way 102) -->
+  <node id="10" lat="0.0100000" lon="0.0100000"/>
+  <node id="11" lat="0.0100000" lon="0.0140000"/>
+  <node id="12" lat="0.0130000" lon="0.0140000"/>
+  <node id="13" lat="0.0130000" lon="0.0100000"/>
+  <node id="15" lat="0.0110000" lon="0.0110000"/>
+  <node id="16" lat="0.0110000" lon="0.0120000"/>
+  <node id="17" lat="0.0120000" lon="0.0120000"/>
+  <node id="18" lat="0.0120000" lon="0.0110000"/>
+  <!-- Park (way 103) -->
+  <node id="20" lat="0.0060000" lon="0.0070000"/>
+  <node id="21" lat="0.0060000" lon="0.0120000"/>
+  <node id="22" lat="0.0090000" lon="0.0120000"/>
+  <node id="23" lat="0.0090000" lon="0.0070000"/>
+  <!-- Self-intersecting "bowtie" grass (way 104) -->
+  <node id="25" lat="0.0020000" lon="0.0150000"/>
+  <node id="26" lat="0.0050000" lon="0.0180000"/>
+  <node id="27" lat="0.0020000" lon="0.0180000"/>
+  <node id="28" lat="0.0050000" lon="0.0150000"/>
+  <!-- Residential landuse covering most of the region (way 105) -->
+  <node id="30" lat="0.0005000" lon="0.0005000"/>
+  <node id="31" lat="0.0005000" lon="0.0195000"/>
+  <node id="32" lat="0.0145000" lon="0.0195000"/>
+  <node id="33" lat="0.0145000" lon="0.0005000"/>
+  <!-- Primary road crossing the east boundary (way 200) and a residential street (way 201) -->
+  <node id="40" lat="0.0075000" lon="0.0000000"/>
+  <node id="41" lat="0.0075000" lon="0.0100000"/>
+  <node id="42" lat="0.0075000" lon="0.0250000"/>
+  <node id="44" lat="0.0140000" lon="0.0100000"/>
+  <!-- Footway (way 202), subway tunnel (way 203), construction (way 204) -->
+  <node id="45" lat="0.0055000" lon="0.0030000"/>
+  <node id="46" lat="0.0065000" lon="0.0090000"/>
+  <node id="47" lat="0.0010000" lon="0.0000000"/>
+  <node id="48" lat="0.0010000" lon="0.0200000"/>
+  <node id="49" lat="0.0035000" lon="0.0060000"/>
+  <node id="50" lat="0.0010000" lon="0.0090000"/>
+  <!-- Buildings (ways 300, 301) and lake attraction outline (way 302) -->
+  <node id="51" lat="0.0030000" lon="0.0130000"/>
+  <node id="52" lat="0.0030000" lon="0.0135000"/>
+  <node id="53" lat="0.0035000" lon="0.0135000"/>
+  <node id="54" lat="0.0035000" lon="0.0130000"/>
+  <node id="56" lat="0.0090000" lon="0.0150000"/>
+  <node id="57" lat="0.0090000" lon="0.0170000"/>
+  <node id="58" lat="0.0110000" lon="0.0170000"/>
+  <node id="59" lat="0.0110000" lon="0.0150000"/>
+  <node id="61" lat="0.0018000" lon="0.0018000"/>
+  <node id="62" lat="0.0018000" lon="0.0062000"/>
+  <node id="63" lat="0.0052000" lon="0.0062000"/>
+  <node id="64" lat="0.0052000" lon="0.0018000"/>
+  <node id="65" lat="0.0060000" lon="0.0160000"/>
+  <node id="66" lat="0.0070000" lon="0.0180000"/>
+  <!-- Named points of interest -->
+  <node id="500" lat="0.0080000" lon="0.0050000">
+    <tag k="amenity" v="cafe"/>
+    <tag k="name" v="كافه آزمون"/>
+  </node>
+  <node id="501" lat="0.0085000" lon="0.0055000">
+    <tag k="amenity" v="restaurant"/>
+    <tag k="name" v="Café Délice"/>
+  </node>
+  <node id="502" lat="0.0090000" lon="0.0040000">
+    <tag k="shop" v="kiosk"/>
+    <tag k="name" v="Twin Kiosk"/>
+  </node>
+  <node id="503" lat="0.0095000" lon="0.0045000">
+    <tag k="shop" v="kiosk"/>
+    <tag k="name" v="Twin Kiosk"/>
+  </node>
+  <node id="504" lat="0.0100000" lon="0.0060000">
+    <tag k="shop" v="books"/>
+    <tag k="name" v="کتاب&#x200C;فروشی نمونه"/>
+  </node>
+  <node id="505" lat="0.0010000" lon="0.0100000">
+    <tag k="railway" v="station"/>
+    <tag k="public_transport" v="station"/>
+    <tag k="name" v="ایستگاه ۵"/>
+    <tag k="name:en" v="Station 5"/>
+  </node>
+  <node id="506" lat="0.0120000" lon="0.0080000">
+    <tag k="amenity" v="cafe"/>
+    <tag k="name:en" v="English Only Cafe"/>
+  </node>
+  <node id="507" lat="0.0120000" lon="0.0085000">
+    <tag k="amenity" v="bench"/>
+  </node>
+  <node id="508" lat="0.0050000" lon="0.0300000">
+    <tag k="amenity" v="cafe"/>
+    <tag k="name" v="Outside Cafe"/>
+  </node>
+  <node id="509" lat="0.0130000" lon="0.0060000">
+    <tag k="amenity" v="place_of_worship"/>
+    <tag k="name" v="مَسْجِد نمونه"/>
+  </node>
+  <node id="510" lat="0.0110000" lon="0.0090000">
+    <tag k="place" v="neighbourhood"/>
+    <tag k="name" v="محله آزمون"/>
+    <tag k="name:en" v="Test Neighbourhood"/>
+  </node>
+  <node id="511" lat="0.0040000" lon="0.0120000">
+    <tag k="place" v="suburb"/>
+    <tag k="name" v="ناحیه نمونه"/>
+    <tag k="name:en" v="Sample District"/>
+  </node>
+  <node id="512" lat="0.0065000" lon="0.0140000">
+    <tag k="shop" v="bakery"/>
+    <tag k="name" v="نانـوایی"/>
+  </node>
+  <node id="513" lat="0.0070000" lon="0.0145000">
+    <tag k="amenity" v="pharmacy"/>
+    <tag k="name" v="داروخانه علي"/>
+  </node>
+  <way id="100">
+    <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/>
+    <tag k="natural" v="water"/>
+    <tag k="water" v="lake"/>
+    <tag k="name" v="دریاچه آزمون"/>
+    <tag k="name:fa" v="دریاچه آزمون"/>
+    <tag k="name:en" v="Test Lake"/>
+  </way>
+  <way id="101">
+    <nd ref="10"/><nd ref="11"/><nd ref="12"/><nd ref="13"/><nd ref="10"/>
+  </way>
+  <way id="102">
+    <nd ref="15"/><nd ref="16"/><nd ref="17"/><nd ref="18"/><nd ref="15"/>
+  </way>
+  <way id="103">
+    <nd ref="20"/><nd ref="21"/><nd ref="22"/><nd ref="23"/><nd ref="20"/>
+    <tag k="leisure" v="park"/>
+    <tag k="name" v="پارک نمونه"/>
+    <tag k="name:en" v="Sample Park"/>
+  </way>
+  <way id="104">
+    <nd ref="25"/><nd ref="26"/><nd ref="27"/><nd ref="28"/><nd ref="25"/>
+    <tag k="landuse" v="grass"/>
+  </way>
+  <way id="105">
+    <nd ref="30"/><nd ref="31"/><nd ref="32"/><nd ref="33"/><nd ref="30"/>
+    <tag k="landuse" v="residential"/>
+  </way>
+  <way id="200">
+    <nd ref="40"/><nd ref="41"/><nd ref="42"/>
+    <tag k="highway" v="primary"/>
+    <tag k="name" v="بزرگراه آزمون"/>
+    <tag k="name:en" v="Test Expressway"/>
+    <tag k="ref" v="A1"/>
+  </way>
+  <way id="201">
+    <nd ref="41"/><nd ref="44"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="کوچه یکم"/>
+    <tag k="oneway" v="yes"/>
+  </way>
+  <way id="202">
+    <nd ref="45"/><nd ref="46"/>
+    <tag k="highway" v="footway"/>
+  </way>
+  <way id="203">
+    <nd ref="47"/><nd ref="48"/>
+    <tag k="railway" v="subway"/>
+    <tag k="tunnel" v="yes"/>
+    <tag k="name" v="خط ۵"/>
+  </way>
+  <way id="204">
+    <nd ref="65"/><nd ref="66"/>
+    <tag k="highway" v="construction"/>
+  </way>
+  <way id="205">
+    <nd ref="49"/><nd ref="50"/>
+    <tag k="waterway" v="stream"/>
+    <tag k="name" v="نهر آزمون"/>
+  </way>
+  <way id="300">
+    <nd ref="51"/><nd ref="52"/><nd ref="53"/><nd ref="54"/><nd ref="51"/>
+    <tag k="building" v="yes"/>
+  </way>
+  <way id="301">
+    <nd ref="56"/><nd ref="57"/><nd ref="58"/><nd ref="59"/><nd ref="56"/>
+    <tag k="building" v="retail"/>
+    <tag k="shop" v="mall"/>
+    <tag k="name" v="بازار نمونه"/>
+    <tag k="name:en" v="Sample Mall"/>
+  </way>
+  <way id="302">
+    <nd ref="61"/><nd ref="62"/><nd ref="63"/><nd ref="64"/><nd ref="61"/>
+    <tag k="tourism" v="attraction"/>
+    <tag k="name" v="دریاچه آزمون"/>
+    <tag k="name:en" v="Test Lake Promenade"/>
+  </way>
+  <relation id="900">
+    <member type="way" ref="101" role="outer"/>
+    <member type="way" ref="102" role="inner"/>
+    <tag k="type" v="multipolygon"/>
+    <tag k="natural" v="water"/>
+    <tag k="water" v="pond"/>
+    <tag k="name" v="برکه ۷"/>
+    <tag k="name:en" v="Pond 7"/>
+  </relation>
+  <relation id="901">
+    <member type="way" ref="999" role="outer"/>
+    <tag k="type" v="multipolygon"/>
+    <tag k="landuse" v="forest"/>
+    <tag k="name" v="جنگل ناقص"/>
+  </relation>
+  <relation id="902">
+    <member type="node" ref="505" role="stop"/>
+    <tag k="type" v="route"/>
+    <tag k="route" v="bus"/>
+    <tag k="name" v="Bus 1"/>
+    <tag k="public_transport:version" v="2"/>
+  </relation>
+</osm>

@@ -1,0 +1,8 @@
+.git
+data
+secrets
+artifacts
+web/node_modules
+web/dist
+**/*.osm.pbf
+**/*.provenance.json

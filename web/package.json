@@ -1,0 +1,13 @@
+{
+  "name": "karta-demo",
+  "private": true,
+  "description": "Minimal MapLibre integration demo for Karta; all assets are served locally by the API.",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "maplibre-gl": "6.11.2"
+  }
+}

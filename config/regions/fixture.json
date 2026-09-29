@@ -1,0 +1,84 @@
+{
+  "id": "fixture",
+  "name": "Karta synthetic test fixture",
+  "bbox": [
+    0.0,
+    0.0,
+    0.02,
+    0.015
+  ],
+  "source": {
+    "require_provenance": false
+  },
+  "view": {
+    "center": [
+      0.01,
+      0.0075
+    ],
+    "zoom": 15
+  },
+  "validation": {
+    "min_counts": {
+      "roads": 3,
+      "water": 2,
+      "waterways": 1,
+      "landcover": 2,
+      "buildings": 2,
+      "features": 15,
+      "place_names": 18
+    },
+    "search": [
+      {
+        "q": "دریاچه آزمون",
+        "osm_type": "way",
+        "osm_id": 302,
+        "max_position": 1
+      },
+      {
+        "q": "Test Lake",
+        "osm_type": "way",
+        "osm_id": 100,
+        "max_position": 1
+      },
+      {
+        "q": "كافه",
+        "osm_type": "node",
+        "osm_id": 500,
+        "max_position": 1
+      }
+    ],
+    "tiles": [
+      {
+        "lon": 0.0035,
+        "lat": 0.0035,
+        "z": 14,
+        "layers": [
+          "water",
+          "landcover",
+          "pois",
+          "roads"
+        ]
+      },
+      {
+        "lon": 0.01,
+        "lat": 0.0075,
+        "z": 15,
+        "layers": [
+          "roads",
+          "places",
+          "pois",
+          "waterways"
+        ]
+      },
+      {
+        "lon": 0.016,
+        "lat": 0.01,
+        "z": 15,
+        "layers": [
+          "buildings",
+          "pois"
+        ]
+      }
+    ]
+  }
+}

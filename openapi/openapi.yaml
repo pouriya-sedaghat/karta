@@ -1,0 +1,487 @@
+openapi: 3.0.3
+info:
+  title: Karta map and place search API
+  version: 1.0.0
+  description: |
+    Self-hosted vector map tiles and named-place/POI search over one consistent
+    OpenStreetMap snapshot (a *release*).
+
+    **Scope.** Search covers named places and points of interest only. Streets,
+    addresses, house numbers, reverse geocoding and routing are not provided.
+
+    **Releases.** A release is an immutable, validated import identified by
+    `release_id`, a hash of everything that shapes what it serves: the source
+    snapshot and provenance digests, the data timestamp, the region (id, name,
+    box, default view), the import-schema and style revisions, the attribution
+    and the toolchain versions (osm2pgsql, PostgreSQL, PostGIS, GEOS, PROJ,
+    ICU). Changing any of them yields a new id and therefore new URLs. `GET /v1/manifest` names the active
+    release; clients that need a consistent map and search session pin that
+    `release_id` in tile/style URLs (always) and in search (optional). Stage 1
+    serves one active release; requests for any other id return
+    `404 unknown_release`.
+
+    **Styles are content-addressed.** The style URL the manifest issues,
+    `/v1/releases/{release_id}/styles/{style_id}.json`, names one exact byte
+    sequence: `style_id` is the first 128 bits (32 hex digits) of SHA-256 over
+    the style bytes. The bytes depend on the release and on this server (its
+    renderer and `KARTA_PUBLIC_BASE_URL`), so after an API upgrade that renders
+    differently, or a base URL change, the same release gets a new style URL
+    and the old one returns `404 unknown_style`; a style URL never serves
+    different bytes. Clients take the style URL from the manifest (or follow
+    `/v1/releases/{release_id}/style.json`) and, on `unknown_style` (or
+    `unknown_release` after a release switch), refetch the manifest and load
+    the style it names, a bounded number of times.
+
+    **Compatibility.** `/v1` is not frozen until its first release; while
+    Stage 1 is a draft the contract can still change incompatibly (it did once:
+    `/v1/releases/{release_id}/style.json` changed from returning the style to
+    a `307`, see docs/api.md). From the first release on, changes within `/v1`
+    are additive: new endpoints, optional parameters, response fields and error
+    codes may be added; existing fields, parameters and codes are not removed
+    or redefined. Clients must ignore unknown fields. Breaking changes use a new
+    path prefix.
+
+    **CORS.** Read-only `GET`/`HEAD` from origins listed in
+    `KARTA_CORS_ALLOWED_ORIGINS` (exact origins or `*`); no credentials. Exposed
+    headers: `ETag`, `X-Request-ID`. Without configuration no cross-origin
+    access is granted.
+
+    **Requests.** Only `GET`, `HEAD` and `OPTIONS`; request bodies are rejected
+    (413). Unknown or repeated query parameters are rejected (400). Every
+    response carries `X-Request-ID`.
+
+    **Caching.** Tiles: `public, max-age=31536000, immutable` (also for `204`
+    empty tiles) with ETag `"<release_id>-<z>-<x>-<y>"`. Style (at its
+    content-addressed URL): `public, max-age=31536000, immutable` with ETag
+    `"<style_id>"`. `/v1/releases/{release_id}/style.json`: a `307` redirect to
+    the current style URL with `no-cache`. Glyphs: `public, max-age=86400` with
+    an ETag derived from the response bytes. Manifest: `no-cache` with a
+    content ETag (revalidate with `If-None-Match`). Search: `no-cache`, or
+    `public, max-age=300` when `release_id` is given. Errors: `no-store`.
+    Cache keys are the full URL: the release id keys tiles, the style id keys
+    the style bytes, so nothing needs purging when the release, the renderer or
+    `KARTA_PUBLIC_BASE_URL` changes. Exception: a `style.json` `200`
+    (`max-age=86400`) that a cache stored from a build before content-addressed
+    styles may be reused until it expires (docs/api.md, "Transition from builds
+    before content-addressed styles").
+
+    OpenStreetMap data © OpenStreetMap contributors, available under the Open
+    Database License (ODbL 1.0), https://www.openstreetmap.org/copyright.
+  license:
+    name: ODbL 1.0 (data)
+    url: https://www.openstreetmap.org/copyright
+servers:
+  - url: http://localhost:8080
+paths:
+  /health/live:
+    get:
+      summary: Process liveness
+      operationId: live
+      responses:
+        "200":
+          description: The process is running.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Live" }
+        "405": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /health/ready:
+    get:
+      summary: Readiness to serve the active release
+      operationId: ready
+      description: |
+        Ready when an active release is loaded, compatible with this server
+        (schema major version, style layers and fonts) and its database answers.
+        The state is refreshed every `KARTA_RELEASE_POLL_INTERVAL`.
+      responses:
+        "200":
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ready" }
+        "503":
+          description: Not ready; `reason` says why.
+          headers:
+            Retry-After: { $ref: "#/components/headers/RetryAfter" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ready" }
+        "405": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /v1/manifest:
+    get:
+      summary: Active release, URLs and capabilities
+      operationId: manifest
+      responses:
+        "200":
+          description: The active release.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Manifest" }
+        "304": { description: Not modified (If-None-Match matched). }
+        "400": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "405": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /v1/search:
+    get:
+      summary: Search named places and points of interest
+      operationId: search
+      description: |
+        Case-, accent- and script-variant-insensitive search. Normalization
+        (identical for the index and the query): Unicode NFKD, full case folding,
+        removal of combining marks, tatweel and invisible format characters,
+        Arabic letters mapped to Persian forms (ي/ى→ی, ك→ک, ة/ە/ہ/ھ→ه, ٱ→ا),
+        Arabic-Indic and Persian digits→ASCII, ZWNJ→space, punctuation→space.
+
+        Matching: exact, prefix, word-prefix and substring of any name tag
+        (`name`, `name:<lang>`, `alt_name`, `official_name`, `short_name`,
+        `old_name`, `int_name`, `loc_name`, `reg_name`, `nat_name`). Queries of
+        1–2 normalized characters use exact and prefix matching only.
+
+        Deterministic order: match type (exact, prefix, word_prefix,
+        substring); `importance_rank` ascending; primary names before
+        official/short names before alternative/old names; larger area first;
+        shorter matched name first; OSM type and id ascending.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Query text, 1–100 characters (at most 400 bytes UTF-8), no control characters, at least one letter or digit.
+          schema: { type: string, minLength: 1, maxLength: 100 }
+        - name: limit
+          in: query
+          description: Maximum number of results.
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+        - name: lang
+          in: query
+          description: Only match name tags with this language suffix (e.g. `fa` matches `name:fa`, `alt_name:fa`) and prefer `name:<lang>` as display name.
+          schema: { type: string, pattern: "^[a-z]{2,3}$" }
+        - name: bbox
+          in: query
+          description: Only return results whose label point lies in `west,south,east,north` (WGS84).
+          schema: { type: string, example: "51.20,35.73,51.23,35.76" }
+        - name: release_id
+          in: query
+          description: Search this release instead of the active one.
+          schema: { $ref: "#/components/schemas/ReleaseID" }
+      responses:
+        "200":
+          description: Results, possibly empty.
+          headers:
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "405": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /v1/releases/{release_id}/style.json:
+    get:
+      summary: Current style URL of a release
+      operationId: styleRedirect
+      description: |
+        Redirects to the release's current content-addressed style URL (the
+        manifest's `style_url` for the active release). It never returns style
+        bytes itself and is not cached without revalidation, so the style a
+        client receives is always named by the URL it was redirected to.
+        Builds before content-addressed styles returned the style itself here
+        with `max-age=86400`; caches may reuse such a response until it
+        expires. Revalidating it (`If-None-Match`) is answered with `307`,
+        never `304`.
+      parameters:
+        - $ref: "#/components/parameters/ReleaseIDPath"
+      responses:
+        "307":
+          description: Redirect to `/v1/releases/{release_id}/styles/{style_id}.json`.
+          headers:
+            Location:
+              description: Absolute content-addressed style URL under `KARTA_PUBLIC_BASE_URL`.
+              schema: { type: string, format: uri }
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "405": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /v1/releases/{release_id}/styles/{style_id}.json:
+    get:
+      summary: MapLibre style for a release (content-addressed)
+      operationId: style
+      description: |
+        A MapLibre style (version 8) whose source, tile URLs, glyph URLs, bounds
+        and attribution are pinned to the release and to this server's
+        `KARTA_PUBLIC_BASE_URL`. It uses only tile layers and fields listed in
+        the release's layer catalog and fontstacks served under `/v1/fonts`.
+        `style_id` is the first 128 bits of SHA-256 over the response body, so
+        the response is immutable; a `style_id` this server does not currently
+        produce for the release (for example one issued before an upgrade or a
+        base URL change) is `404 unknown_style`.
+      parameters:
+        - $ref: "#/components/parameters/ReleaseIDPath"
+        - name: style_id
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+      responses:
+        "200":
+          description: Style JSON.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+          content:
+            application/json:
+              schema: { type: object, required: [version, sources, layers, glyphs] }
+        "304": { description: Not modified. }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "405": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /v1/releases/{release_id}/tiles/{z}/{x}/{y}.pbf:
+    get:
+      summary: Mapbox Vector Tile for a release
+      operationId: tile
+      description: |
+        Web Mercator (EPSG:3857) XYZ tile, extent 4096, 64-unit buffer, not
+        compressed. Layers: `landcover`, `water`, `waterways`, `buildings`,
+        `roads`, `places`, `pois`; see docs/map-data.md for fields and zooms.
+        Valid zooms are the release's `minzoom`..`maxzoom` (0..16); clients
+        overzoom above `maxzoom`.
+      parameters:
+        - $ref: "#/components/parameters/ReleaseIDPath"
+        - { name: z, in: path, required: true, schema: { type: integer, minimum: 0, maximum: 16 } }
+        - { name: x, in: path, required: true, schema: { type: integer, minimum: 0 } }
+        - { name: y, in: path, required: true, schema: { type: integer, minimum: 0 } }
+      responses:
+        "200":
+          description: Non-empty tile.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+          content:
+            application/vnd.mapbox-vector-tile:
+              schema: { type: string, format: binary }
+        "204":
+          description: Valid tile without features (outside the region or empty). Cached like a tile.
+        "304": { description: Not modified. }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "405": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /v1/fonts/{fontstack}/{range}.pbf:
+    get:
+      summary: Signed-distance-field glyph range
+      operationId: glyphs
+      description: MapLibre glyph PBF for 256 code points. Blocks the font does not cover are valid and empty.
+      parameters:
+        - { name: fontstack, in: path, required: true, schema: { type: string, enum: ["Vazirmatn Regular", "Vazirmatn Bold"] } }
+        - { name: range, in: path, required: true, description: "N-(N+255), N a multiple of 256 below 65536", schema: { type: string, pattern: "^[0-9]+-[0-9]+$" } }
+      responses:
+        "200":
+          description: Glyph range.
+          content:
+            application/x-protobuf:
+              schema: { type: string, format: binary }
+        "304": { description: Not modified. }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "405": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /v1/openapi.yaml:
+    get:
+      summary: This document
+      operationId: openapi
+      responses:
+        "200":
+          description: OpenAPI document.
+          content:
+            application/yaml:
+              schema: { type: string }
+        "405": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+components:
+  headers:
+    ETag:
+      description: Strong validator; send in If-None-Match.
+      schema: { type: string }
+    CacheControl:
+      description: Caching policy (see the API description).
+      schema: { type: string }
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema: { type: integer }
+  parameters:
+    ReleaseIDPath:
+      name: release_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/ReleaseID" }
+  responses:
+    Error:
+      description: Client error (400 invalid input, 404 unknown resource, 405 method other than GET/HEAD/OPTIONS, 413 request with a body).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unavailable:
+      description: No release served, or the data store is unavailable or too slow.
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    ReleaseID:
+      type: string
+      pattern: "^r[0-9a-f]{24}$"
+      example: r0123456789abcdef01234567
+    BBox:
+      type: array
+      description: west, south, east, north (WGS84 degrees)
+      items: { type: number }
+      minItems: 4
+      maxItems: 4
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [invalid_parameter, unknown_parameter, invalid_query, unknown_release, unknown_style, no_active_release,
+                     invalid_tile_coordinates, tile_zoom_out_of_range, unknown_fontstack, not_found,
+                     method_not_allowed, request_body_not_allowed, timeout, service_unavailable, internal_error]
+            message: { type: string }
+            parameter: { type: string, description: "Offending parameter, when there is one." }
+            request_id: { type: string }
+    Live:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+    Ready:
+      type: object
+      required: [status, reason, release_id, checked_at]
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        reason:
+          type: string
+          enum: [ready, starting, no_active_release, database_unavailable, release_incompatible, registry_error]
+        release_id: { allOf: [{ $ref: "#/components/schemas/ReleaseID" }], nullable: true }
+        detail: { type: string }
+        checked_at: { type: string, format: date-time }
+    Manifest:
+      type: object
+      required: [api_version, release, style_url, tiles, search, default_view, attribution, capabilities, freshness]
+      properties:
+        api_version: { type: string, enum: ["1"] }
+        release:
+          type: object
+          required: [release_id, region, osm_data_timestamp, osm_data_timestamp_source, source_sha256, imported_at, schema_revision, style_revision]
+          properties:
+            release_id: { $ref: "#/components/schemas/ReleaseID" }
+            region:
+              type: object
+              required: [id, name, bbox]
+              properties:
+                id: { type: string }
+                name: { type: string }
+                bbox: { $ref: "#/components/schemas/BBox" }
+            osm_data_timestamp: { type: string, format: date-time, description: Snapshot time of the OSM data. }
+            osm_data_timestamp_source: { type: string, description: Where the timestamp was read from (provenance sidecar or file header). }
+            source_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+            imported_at: { type: string, format: date-time }
+            schema_revision: { type: string }
+            style_revision: { type: string }
+        style_url:
+          type: string
+          format: uri
+          description: Content-addressed style URL, `…/v1/releases/{release_id}/styles/{style_id}.json`; it changes whenever the style bytes change.
+        tiles:
+          type: object
+          required: [url_template, format, minzoom, maxzoom, bounds, layers]
+          properties:
+            url_template: { type: string }
+            format: { type: string, enum: [mvt] }
+            minzoom: { type: integer }
+            maxzoom: { type: integer }
+            bounds: { $ref: "#/components/schemas/BBox" }
+            layers: { type: array, items: { type: string } }
+        search:
+          type: object
+          required: [url, scope, max_limit, max_query_chars, filters]
+          properties:
+            url: { type: string, format: uri }
+            scope: { type: string }
+            max_limit: { type: integer }
+            max_query_chars: { type: integer }
+            filters: { type: array, items: { type: string } }
+        default_view:
+          type: object
+          required: [center, zoom]
+          properties:
+            center: { type: array, items: { type: number }, minItems: 2, maxItems: 2 }
+            zoom: { type: number }
+        attribution:
+          type: object
+          required: [text, html, license, license_url]
+          properties:
+            text: { type: string }
+            html: { type: string }
+            license: { type: string }
+            license_url: { type: string, format: uri }
+        capabilities:
+          type: object
+          additionalProperties: { type: boolean }
+        freshness:
+          type: object
+          required: [update_mode, osm_data_timestamp]
+          properties:
+            update_mode: { type: string, enum: [static], description: Stage 1 serves a fixed snapshot; no update mechanism is available. }
+            osm_data_timestamp: { type: string, format: date-time }
+    SearchResponse:
+      type: object
+      required: [release_id, query, normalized_query, limit, lang, bbox, results]
+      properties:
+        release_id: { $ref: "#/components/schemas/ReleaseID" }
+        query: { type: string }
+        normalized_query: { type: string }
+        limit: { type: integer }
+        lang: { type: string, nullable: true }
+        bbox: { allOf: [{ $ref: "#/components/schemas/BBox" }], nullable: true }
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/SearchResult" }
+    SearchResult:
+      type: object
+      required: [id, osm_type, osm_id, display_name, names, category, subcategory, lon, lat, bbox, importance_rank, match]
+      properties:
+        id: { type: string, description: "Stable OSM identifier, e.g. way/1259635603", example: way/1259635603 }
+        osm_type: { type: string, enum: [node, way, relation] }
+        osm_id: { type: integer, format: int64 }
+        display_name: { type: string, description: "name:<lang> when lang is given and present, else name, else name:fa, else name:en" }
+        names:
+          type: object
+          description: The feature's name, name:fa, name:en (and name:<lang>) tags where present.
+          additionalProperties: { type: string }
+        category: { type: string, description: "OSM key that classified the feature, e.g. tourism." }
+        subcategory: { type: string, description: "Value of that key, e.g. attraction." }
+        lon: { type: number, description: Label point longitude (WGS84). }
+        lat: { type: number, description: Label point latitude (WGS84). }
+        bbox: { $ref: "#/components/schemas/BBox" }
+        importance_rank: { type: integer, description: Lower is more important. }
+        match:
+          type: object
+          required: [key, value, language, type]
+          properties:
+            key: { type: string, description: "Name tag that matched, e.g. name:en." }
+            value: { type: string }
+            language: { type: string, nullable: true, description: Language suffix of the tag; null for tags without one such as `name`. }
+            type: { type: string, enum: [exact, prefix, word_prefix, substring] }
