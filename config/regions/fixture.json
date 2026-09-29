@@ -8,6 +8,11 @@
     0.015
   ],
   "source": {
+    "allowed_sha256": [
+      "0dbba74d86e68fc4cc8c13849ad23ccae5a82d1cf332077288039a8b8dfc5ed8",
+      "6a0672e252f62b03971106770d539e2ea506b85db535dfa28354c1bc66a0a94f",
+      "493f7292f7f6bebaef9e8af21d3c3da053ad18938381764a61fad2b4a980bc38"
+    ],
     "require_provenance": false
   },
   "view": {
@@ -18,6 +23,7 @@
     "zoom": 15
   },
   "validation": {
+    "max_drop_fraction": 0.5,
     "min_counts": {
       "roads": 3,
       "water": 2,

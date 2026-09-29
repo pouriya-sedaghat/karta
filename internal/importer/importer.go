@@ -1,18 +1,34 @@
-// Package importer builds one immutable release database from an OSM
-// snapshot and registers it. The pipeline:
+// Package importer verifies an OSM snapshot and builds one immutable,
+// validated release database from it. It does not activate releases: the
+// publication service (package publish) decides whether and when a built
+// release becomes active.
 //
-//  1. verify the input: regular file, size limit, SHA-256 against the region's
-//     pinned digest, provenance sidecar, header box and data timestamp
-//  2. derive the release id and take the registry import lock
-//  3. create an isolated database from the PostGIS template and import with
-//     osm2pgsql (flex), then run the post-import SQL in one transaction
-//  4. validate: row-count gates, the tile layer contract, the style against
-//     the layer catalog and served fonts, representative tiles and searches
-//  5. record metadata, make the database read-only and activate it (Stage 1:
-//     only when no release is active yet)
+// Verify checks the input without touching any database except for a
+// read-only lookup of operator authorizations:
 //
-// Any failure drops the candidate database and records the reason; an
-// existing active release is never touched.
+//   - a regular file within the size limit, scanned completely (osmfile)
+//   - the snapshot's box (PBF header or provenance) equals the region box
+//   - the provenance sidecar, when present or required, matches the file and
+//     is internally consistent (provenance.Verify)
+//   - the data timestamp comes from the provenance source header or the
+//     snapshot header (never a file time), is consistent between them, and
+//     is neither before OSM existed nor in the future
+//   - the SHA-256 is pinned in the region configuration or authorized for
+//     the region by an operator
+//
+// Build then, under the caller's build lock:
+//
+//  1. creates an isolated candidate database from the PostGIS template and
+//     derives the release id (it includes the database toolchain)
+//  2. returns the existing release if that id is already built
+//  3. imports with osm2pgsql (flex) and runs the post-import SQL
+//  4. validates: row-count gates, the drop relative to the active release,
+//     the tile layer contract, the style, representative tiles and searches
+//  5. records metadata, makes the database read-only, renames it to
+//     karta_<release_id> and marks the release ready
+//
+// Any failure drops the candidate database and records the reason; no
+// existing release is touched.
 package importer
 
 import (
@@ -26,6 +42,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,8 +53,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/pouriya-sedaghat/karta/internal/dbconn"
+	"github.com/pouriya-sedaghat/karta/internal/failpoint"
 	"github.com/pouriya-sedaghat/karta/internal/glyphs"
 	"github.com/pouriya-sedaghat/karta/internal/mvt"
 	"github.com/pouriya-sedaghat/karta/internal/osmfile"
@@ -48,14 +67,51 @@ import (
 	"github.com/pouriya-sedaghat/karta/internal/schema"
 	"github.com/pouriya-sedaghat/karta/internal/search"
 	"github.com/pouriya-sedaghat/karta/internal/style"
+	"github.com/pouriya-sedaghat/karta/internal/toolchain"
 )
 
 // Error classes, mapped to distinct process exit codes by the CLI.
 var (
-	ErrInput        = errors.New("input verification failed")
-	ErrActiveExists = errors.New("a different release is already active")
-	ErrValidation   = errors.New("release validation failed")
+	ErrInput      = errors.New("input verification failed")
+	ErrValidation = errors.New("release validation failed")
+	// ErrStorage is a build that ran out of disk space.
+	ErrStorage = errors.New("insufficient storage")
 )
+
+// Input rejection codes (recorded with submissions and audit records).
+const (
+	CodeRegionConfig       = "region_config"
+	CodeMalformed          = "malformed_snapshot"
+	CodeRegionMismatch     = "region_mismatch"
+	CodeProvenanceRequired = "provenance_required"
+	CodeProvenanceInvalid  = "provenance_invalid"
+	CodeTimestampMissing   = "timestamp_missing"
+	CodeTimestampUntrusted = "timestamp_untrusted"
+	CodeUnauthorizedDigest = "unauthorized_digest"
+	CodeSnapshotChanged    = "snapshot_changed"
+)
+
+// InputError is an input rejection with a stable code.
+type InputError struct {
+	Code string
+	Msg  string
+}
+
+func (e *InputError) Error() string { return e.Msg }
+func (e *InputError) Unwrap() error { return ErrInput }
+
+func inputErr(code, format string, args ...any) error {
+	return &InputError{Code: code, Msg: fmt.Sprintf(format, args...)}
+}
+
+// InputCode returns the rejection code of an input error, or "".
+func InputCode(err error) string {
+	var ie *InputError
+	if errors.As(err, &ie) {
+		return ie.Code
+	}
+	return ""
+}
 
 // Attribution and license recorded in every release.
 const (
@@ -64,30 +120,166 @@ const (
 	LicenseURL  = "https://www.openstreetmap.org/copyright"
 )
 
-// Options configure one import run.
-type Options struct {
+// Plausible data timestamps: not before OpenStreetMap existed.
+var minDataTimestamp = time.Date(2004, 8, 9, 0, 0, 0, 0, time.UTC)
+
+// Authorizer reports whether an operator authorized a digest for the region,
+// returning a description of the authorization ("" if none).
+type Authorizer func(ctx context.Context, regionID, digest string, size int64) (string, error)
+
+// VerifyOptions configure input verification.
+type VerifyOptions struct {
 	SnapshotPath string
-	RegionPath   string
 	// ProvenancePath defaults to <snapshot>.provenance.json when that exists.
 	ProvenancePath string
+	Region         region.Config
 	MaxInputBytes  int64
-	Osm2pgsql      string
-	CacheMB        int
-	Processes      int
-	Slim           bool
-	DB             dbconn.Params
-	RegistryDB     string
-	TemplateDB     string
-	KeepFailed     bool
-	Version        string
-	LockTimeout    time.Duration
+	// MaxFutureSkew bounds how far in the future a data timestamp may be.
+	MaxFutureSkew time.Duration
+	Now           func() time.Time
+	// Authorize is consulted when the digest is not pinned in the region.
+	Authorize Authorizer
 }
 
-// Result of a run.
-type Result struct {
-	ReleaseID     string  `json:"release_id"`
-	AlreadyActive bool    `json:"already_active"`
-	Report        *Report `json:"report,omitempty"`
+// Verified is a snapshot that passed every input check.
+type Verified struct {
+	Region     region.Config
+	Info       osmfile.Info
+	Provenance *provenance.Sidecar
+	// ProvenanceSHA256 is the digest of the sidecar bytes ("" without one).
+	ProvenanceSHA256 string
+	Source           SourceReport
+}
+
+// Verify checks a snapshot (see the package documentation).
+func Verify(ctx context.Context, o VerifyOptions) (*Verified, error) {
+	cfg := o.Region
+	now := time.Now
+	if o.Now != nil {
+		now = o.Now
+	}
+	info, err := osmfile.Inspect(o.SnapshotPath, o.MaxInputBytes)
+	if err != nil {
+		return nil, inputErr(CodeMalformed, "%v", err)
+	}
+	src := SourceReport{File: filepath.Base(info.Path), Format: string(info.Format), Size: info.Size, SHA256: info.SHA256,
+		HeaderBBox: info.BBox, Objects: map[string]int64{"nodes": info.Nodes, "ways": info.Ways, "relations": info.Relations}}
+	if info.BBox != nil && !region.SameBBox(*info.BBox, cfg.BBox) {
+		return nil, inputErr(CodeRegionMismatch, "file header box %v differs from region %q box %v; the snapshot belongs to another extract",
+			*info.BBox, cfg.ID, cfg.BBox)
+	}
+	var prov *provenance.Sidecar
+	var provTS time.Time
+	provPath := o.ProvenancePath
+	if provPath == "" {
+		if _, err := os.Lstat(o.SnapshotPath + ".provenance.json"); err == nil {
+			provPath = o.SnapshotPath + ".provenance.json"
+		}
+	}
+	if provPath != "" {
+		s, err := provenance.Load(provPath)
+		if err != nil {
+			return nil, inputErr(CodeProvenanceInvalid, "provenance: %v", err)
+		}
+		box, ts, err := s.Verify(info.SHA256, info.Size)
+		if err != nil {
+			return nil, inputErr(CodeProvenanceInvalid, "provenance: %v", err)
+		}
+		if !region.SameBBox(box, cfg.BBox) {
+			return nil, inputErr(CodeRegionMismatch, "provenance box %q does not match region %q box %v", s.BBoxWGS84, cfg.ID, cfg.BBox)
+		}
+		prov, provTS = &s, ts
+		src.Provenance = true
+	} else if cfg.Source.RequireProvenance {
+		return nil, inputErr(CodeProvenanceRequired, "region %q requires %s", cfg.ID, filepath.Base(o.SnapshotPath)+".provenance.json")
+	}
+	if info.BBox == nil && prov == nil {
+		return nil, inputErr(CodeRegionMismatch, "the snapshot has no header box and no provenance sidecar, so its extract cannot be matched to region %q", cfg.ID)
+	}
+	src.DataTimestamp, src.DataTimestampSource, err = trustedTimestamp(info, prov, provTS, now(), o.MaxFutureSkew)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case cfg.Source.Pinned(info.SHA256):
+		src.AuthorizedBy = "region configuration"
+	case o.Authorize != nil:
+		by, err := o.Authorize(ctx, cfg.ID, info.SHA256, info.Size)
+		if err != nil {
+			return nil, fmt.Errorf("look up digest authorizations: %w", err)
+		}
+		src.AuthorizedBy = by
+	}
+	if src.AuthorizedBy == "" {
+		return nil, inputErr(CodeUnauthorizedDigest,
+			"SHA-256 %s (%d bytes) of %s is not pinned in region %q and not authorized by an operator; refusing to import a different snapshot "+
+				"(verify it, then authorize it: docs/runbook.md, \"Authorize a new snapshot\")", info.SHA256, info.Size, filepath.Base(info.Path), cfg.ID)
+	}
+	v := &Verified{Region: cfg, Info: info, Provenance: prov, Source: src}
+	if prov != nil {
+		sum := sha256.Sum256(prov.Raw)
+		v.ProvenanceSHA256 = hex.EncodeToString(sum[:])
+	}
+	return v, nil
+}
+
+// trustedTimestamp picks the release's data timestamp. The provenance source
+// header wins (an extract's own header has none); a snapshot header
+// timestamp must then agree with it. File modification times are never used.
+func trustedTimestamp(info osmfile.Info, prov *provenance.Sidecar, provTS, now time.Time, skew time.Duration) (time.Time, string, error) {
+	var ts time.Time
+	var source string
+	switch {
+	case prov != nil:
+		ts, source = provTS, "provenance.source_fileinfo.header"
+		if info.Timestamp != nil && !info.Timestamp.Equal(provTS) {
+			return ts, source, inputErr(CodeTimestampUntrusted, "snapshot header timestamp %s disagrees with the provenance source timestamp %s",
+				info.Timestamp.Format(time.RFC3339), provTS.Format(time.RFC3339))
+		}
+	case info.Timestamp != nil:
+		ts, source = *info.Timestamp, string(info.Format)+"_header"
+	default:
+		return ts, source, inputErr(CodeTimestampMissing, "no trustworthy data timestamp (no provenance sidecar and none in the file header)")
+	}
+	if ts.Before(minDataTimestamp) {
+		return ts, source, inputErr(CodeTimestampUntrusted, "data timestamp %s is before OpenStreetMap existed", ts.Format(time.RFC3339))
+	}
+	if ts.After(now.Add(skew)) {
+		return ts, source, inputErr(CodeTimestampUntrusted, "data timestamp %s is in the future (now %s, allowed skew %s)",
+			ts.Format(time.RFC3339), now.UTC().Format(time.RFC3339), skew)
+	}
+	return ts, source, nil
+}
+
+// BuildOptions configure one build.
+type BuildOptions struct {
+	Osm2pgsql  string
+	CacheMB    int
+	Processes  int
+	Slim       bool
+	DB         dbconn.Params
+	TemplateDB string
+	// Tablespace, when set, holds new release databases.
+	Tablespace string
+	KeepFailed bool
+	Version    string
+	// Actor and Source attribute registry audit records.
+	Actor        string
+	Source       string
+	SubmissionID *int64
+	// ActiveCounts are the active release's row counts, for the relative
+	// drop check (nil when there is no active release of this region).
+	ActiveCounts map[string]int64
+	ActiveID     string
+}
+
+// Built is the result of Build.
+type Built struct {
+	ReleaseID string
+	// Existing is set when the release was already built (nothing was
+	// imported); it is the registry row.
+	Existing *registry.Release
+	Report   *Report
 }
 
 // Report is the machine-readable import record, stored with the release.
@@ -114,14 +306,16 @@ type Report struct {
 
 // SourceReport describes the verified input.
 type SourceReport struct {
-	File                string      `json:"file"`
-	Format              string      `json:"format"`
-	Size                int64       `json:"size_bytes"`
-	SHA256              string      `json:"sha256"`
-	HeaderBBox          *[4]float64 `json:"header_bbox"`
-	DataTimestamp       time.Time   `json:"data_timestamp"`
-	DataTimestampSource string      `json:"data_timestamp_source"`
-	Provenance          bool        `json:"provenance_verified"`
+	File                string           `json:"file"`
+	Format              string           `json:"format"`
+	Size                int64            `json:"size_bytes"`
+	SHA256              string           `json:"sha256"`
+	HeaderBBox          *[4]float64      `json:"header_bbox"`
+	DataTimestamp       time.Time        `json:"data_timestamp"`
+	DataTimestampSource string           `json:"data_timestamp_source"`
+	Provenance          bool             `json:"provenance_verified"`
+	AuthorizedBy        string           `json:"authorized_by"`
+	Objects             map[string]int64 `json:"objects,omitempty"`
 }
 
 // NameReport distinguishes explicit name:fa tags from Persian-script names.
@@ -164,71 +358,30 @@ type ResourceReport struct {
 	DatabaseBytes      int64 `json:"database_bytes"`
 }
 
-// Run executes the pipeline.
-func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
+// storageError classifies a failure caused by a full disk: PostgreSQL's
+// insufficient-resources class (53100 disk_full) or an ENOSPC message from a
+// tool.
+func storageError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if (errors.As(err, &pgErr) && pgErr.Code == "53100") || strings.Contains(err.Error(), "No space left on device") ||
+		strings.Contains(err.Error(), "could not extend file") {
+		return fmt.Errorf("%w: %v", ErrStorage, err)
+	}
+	return err
+}
+
+// Build imports a verified snapshot into a new candidate database and
+// records it as a ready release. The caller holds the build lock on reg.
+func Build(ctx context.Context, reg *pgx.Conn, v *Verified, opts BuildOptions, log *slog.Logger) (*Built, error) {
 	start := time.Now()
 	timings := map[string]float64{}
 	lap := func(name string, t time.Time) { timings[name] = round3(time.Since(t).Seconds()) }
+	cfg, src := v.Region, v.Source
 
-	// 1. Verify input -----------------------------------------------------
 	t := time.Now()
-	cfg, err := region.Load(opts.RegionPath)
-	if err != nil {
-		return nil, fmt.Errorf("%w: region: %v", ErrInput, err)
-	}
-	info, err := osmfile.Inspect(opts.SnapshotPath, opts.MaxInputBytes)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInput, err)
-	}
-	log.Info("snapshot inspected", "file", filepath.Base(info.Path), "bytes", info.Size, "sha256", info.SHA256)
-	if want := cfg.Source.ExpectedSHA256; want != "" && info.SHA256 != want {
-		return nil, fmt.Errorf("%w: SHA-256 of %s is %s but region %q pins %s; refusing to import a different snapshot",
-			ErrInput, filepath.Base(info.Path), info.SHA256, cfg.ID, want)
-	}
-	src := SourceReport{File: filepath.Base(info.Path), Format: string(info.Format), Size: info.Size, SHA256: info.SHA256, HeaderBBox: info.BBox}
-	if info.BBox != nil && !region.SameBBox(*info.BBox, cfg.BBox) {
-		return nil, fmt.Errorf("%w: file header box %v differs from region %q box %v; the snapshot belongs to another extract",
-			ErrInput, *info.BBox, cfg.ID, cfg.BBox)
-	}
-	var prov *provenance.Sidecar
-	provPath := opts.ProvenancePath
-	if provPath == "" {
-		if _, err := os.Lstat(opts.SnapshotPath + ".provenance.json"); err == nil {
-			provPath = opts.SnapshotPath + ".provenance.json"
-		}
-	}
-	if provPath != "" {
-		s, err := provenance.Load(provPath)
-		if err != nil {
-			return nil, fmt.Errorf("%w: provenance: %v", ErrInput, err)
-		}
-		if err := s.Check(info.SHA256, info.Size); err != nil {
-			return nil, fmt.Errorf("%w: provenance: %v", ErrInput, err)
-		}
-		pb, err := s.BBox()
-		if err != nil {
-			return nil, fmt.Errorf("%w: provenance: %v", ErrInput, err)
-		}
-		if !region.SameBBox(pb, cfg.BBox) {
-			return nil, fmt.Errorf("%w: provenance box %q does not match region %q box %v", ErrInput, s.BBoxWGS84, cfg.ID, cfg.BBox)
-		}
-		prov = &s
-		src.Provenance = true
-	} else if cfg.Source.RequireProvenance {
-		return nil, fmt.Errorf("%w: region %q requires %s", ErrInput, cfg.ID, filepath.Base(opts.SnapshotPath)+".provenance.json")
-	}
-	switch {
-	case prov != nil:
-		ts, err := prov.SourceTimestamp()
-		if err != nil {
-			return nil, fmt.Errorf("%w: provenance: %v", ErrInput, err)
-		}
-		src.DataTimestamp, src.DataTimestampSource = ts, "provenance.source_fileinfo.header"
-	case info.Timestamp != nil:
-		src.DataTimestamp, src.DataTimestampSource = *info.Timestamp, string(info.Format)+"_header"
-	default:
-		return nil, fmt.Errorf("%w: no trustworthy data timestamp (no provenance sidecar and none in the file header)", ErrInput)
-	}
 	glyphSet, err := glyphs.New()
 	if err != nil {
 		return nil, err
@@ -242,31 +395,14 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	lap("verify_input", t)
+	lap("verify_tools", t)
 
-	// 2. Lock and build a candidate ------------------------------------
 	// The release id depends on the versions of the database tools that
 	// produce tiles and search results, which are only known inside a
 	// database with PostGIS installed. The import therefore runs in a
 	// randomly named candidate database; only a fully validated candidate is
 	// renamed to karta_<release_id>.
 	schemaRev, styleRev := schema.Revision(), style.Revision()
-	provDigest := ""
-	if prov != nil {
-		sum := sha256.Sum256(prov.Raw)
-		provDigest = hex.EncodeToString(sum[:])
-	}
-	reg, err := opts.DB.Connect(ctx, opts.RegistryDB)
-	if err != nil {
-		return nil, fmt.Errorf("connect registry: %w", err)
-	}
-	defer reg.Close(context.Background())
-	if err := registry.Migrate(ctx, reg); err != nil {
-		return nil, fmt.Errorf("migrate registry: %w", err)
-	}
-	if err := registry.LockImports(ctx, reg, opts.LockTimeout); err != nil {
-		return nil, err
-	}
 	if err := dropLeftoverCandidates(ctx, reg, log); err != nil {
 		return nil, err
 	}
@@ -275,8 +411,12 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := reg.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %s TEMPLATE %s`, candidate, opts.TemplateDB)); err != nil {
-		return nil, fmt.Errorf("create candidate database from template %s: %w", opts.TemplateDB, err)
+	create := fmt.Sprintf(`CREATE DATABASE %s TEMPLATE %s`, candidate, opts.TemplateDB)
+	if opts.Tablespace != "" {
+		create += " TABLESPACE " + opts.Tablespace
+	}
+	if _, err := reg.Exec(ctx, create); err != nil {
+		return nil, storageError(fmt.Errorf("create candidate database from template %s: %w", opts.TemplateDB, err))
 	}
 	discard := func() {
 		cctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -295,55 +435,56 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 		return nil, fmt.Errorf("connect candidate database: %w", err)
 	}
 	defer rel.Close(context.Background())
-	toolchain, err := readToolchain(ctx, rel)
+	tools, err := toolchain.Read(ctx, rel)
 	if err != nil {
 		_ = rel.Close(ctx)
 		discard()
 		return nil, err
 	}
-	toolchain["osm2pgsql"] = o2pVersion
+	tools["osm2pgsql"] = o2pVersion
 
-	// 3. Identify ------------------------------------------------------------
 	inputs := releaseid.Inputs{
-		SourceSHA256: info.SHA256, ProvenanceSHA256: provDigest,
+		SourceSHA256: src.SHA256, ProvenanceSHA256: v.ProvenanceSHA256,
 		DataTimestamp: src.DataTimestamp, DataTimestampSource: src.DataTimestampSource,
 		Region: cfg.Identity(), SchemaRevision: schemaRev, StyleRevision: styleRev,
 		Attribution: Attribution, License: License, LicenseURL: LicenseURL,
-		Toolchain: toolchain,
+		Toolchain: tools,
 	}
 	id, identity, err := releaseid.Derive(inputs)
 	if err != nil {
 		_ = rel.Close(ctx)
 		discard()
-		return nil, fmt.Errorf("%w: %v", ErrInput, err)
+		return nil, inputErr(CodeRegionConfig, "%v", err)
 	}
 	dbName := releaseid.DatabaseName(id)
 	log.Info("release identified", "release_id", id, "database", dbName, "candidate", candidate,
-		"schema", schemaRev, "style", styleRev, "toolchain", toolchain)
-	active, err := registry.Active(ctx, reg)
+		"schema", schemaRev, "style", styleRev, "toolchain", tools)
+	existing, err := registry.Get(ctx, reg, id)
 	if err != nil {
 		_ = rel.Close(ctx)
 		discard()
 		return nil, err
 	}
-	if active != nil && active.ID == id {
-		_ = rel.Close(ctx)
-		discard()
-		log.Info("release is already active; nothing to do", "release_id", id)
-		return &Result{ReleaseID: id, AlreadyActive: true}, nil
+	if existing != nil {
+		switch existing.State {
+		case registry.StateActive, registry.StateReady, registry.StateRetired, registry.StateRemoving:
+			_ = rel.Close(ctx)
+			discard()
+			log.Info("release already built; nothing to import", "release_id", id, "state", existing.State)
+			return &Built{ReleaseID: id, Existing: existing}, nil
+		}
 	}
-	if active != nil {
-		_ = rel.Close(ctx)
-		discard()
-		return nil, fmt.Errorf("%w: %s is serving; Stage 1 keeps one release, so run `make reset` before importing %s (switching releases while serving is Stage 2)",
-			ErrActiveExists, active.ID, id)
-	}
-	if err := dropDatabase(ctx, reg, dbName); err != nil { // leftover of an interrupted rename
+	failpoint.Hit("build.after_create")
+	// A karta_<id> database without a ready registry row is the leftover of
+	// an interrupted rename.
+	if err := dropDatabase(ctx, reg, dbName); err != nil {
 		_ = rel.Close(ctx)
 		discard()
 		return nil, err
 	}
-	if err := registry.Begin(ctx, reg, registry.Release{ID: id, Database: dbName, RegionID: cfg.ID, SourceSHA256: info.SHA256}, schemaRev, styleRev); err != nil {
+	size := src.Size
+	if err := registry.BeginImport(ctx, reg, registry.Release{ID: id, Database: dbName, RegionID: cfg.ID, SourceSHA256: src.SHA256,
+		SourceSize: &size, SchemaRevision: schemaRev, StyleRevision: styleRev, SubmissionID: opts.SubmissionID}, opts.Actor, opts.Source); err != nil {
 		_ = rel.Close(ctx)
 		discard()
 		return nil, err
@@ -351,9 +492,10 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 	report := &Report{
 		ReleaseID: id, Region: cfg.ID, Source: src, SchemaRevision: schemaRev, StyleRevision: styleRev,
 		Osm2pgsqlVersion: o2pVersion, ImporterVersion: opts.Version, Timings: timings,
-		Identity: identity, Toolchain: toolchain,
+		Identity: identity, Toolchain: tools,
 	}
-	fail := func(cause error) (*Result, error) {
+	fail := func(cause error) (*Built, error) {
+		cause = storageError(cause)
 		cctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
 		_ = rel.Close(cctx)
@@ -361,18 +503,17 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 		if len(reason) > 2000 {
 			reason = reason[:2000]
 		}
-		if opts.KeepFailed {
+		if opts.KeepFailed && candidate != dbName {
 			log.Warn("keeping failed candidate for inspection until the next import", "database", candidate)
 		} else {
 			discard()
 		}
-		if err := registry.Fail(cctx, reg, id, reason); err != nil {
+		if err := registry.Fail(cctx, reg, id, reason, opts.Actor, opts.Source); err != nil {
 			log.Error("could not record failure", "release_id", id, "err", err)
 		}
-		return &Result{ReleaseID: id, Report: report}, cause
+		return &Built{ReleaseID: id, Report: report}, cause
 	}
 
-	// 4. Import ------------------------------------------------------------
 	if _, err := rel.Exec(ctx, schema.SetupSQL().SQL); err != nil {
 		return fail(fmt.Errorf("setup SQL: %w", err))
 	}
@@ -383,32 +524,33 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 	lap("create_database", t)
 
 	t = time.Now()
-	rss, err := runOsm2pgsql(ctx, opts, candidate, log)
+	rss, err := runOsm2pgsql(ctx, opts, v.Info.Path, candidate, log)
 	report.Resources.Osm2pgsqlMaxRSSKiB = rss
 	if err != nil {
 		return fail(err)
 	}
 	lap("osm2pgsql", t)
-	if digest, err := osmfile.Digest(opts.SnapshotPath); err != nil || digest != info.SHA256 {
-		return fail(fmt.Errorf("%w: snapshot changed during import", ErrInput))
+	if digest, err := osmfile.Digest(v.Info.Path); err != nil || digest != src.SHA256 {
+		return fail(inputErr(CodeSnapshotChanged, "snapshot changed during import"))
 	}
 
 	t = time.Now()
-	if err := registry.SetState(ctx, reg, id, registry.StateValidating, &src.DataTimestamp); err != nil {
+	if err := registry.SetValidating(ctx, reg, id, src.DataTimestamp); err != nil {
 		return fail(err)
 	}
 	if err := runPostSQL(ctx, rel); err != nil {
 		return fail(err)
 	}
 	lap("post_import_sql", t)
+	failpoint.Hit("build.after_import")
 
-	// 5. Validate ----------------------------------------------------------
 	t = time.Now()
 	if err := collect(ctx, rel, report); err != nil {
 		return fail(err)
 	}
 	report.Checks = append(report.Checks, Check{Name: "style_matches_layer_catalog", Passed: true, Detail: "all style layers, fields and fontstacks are provided"})
 	validate(ctx, rel, cfg, catalog, report)
+	relativeChecks(cfg, opts.ActiveID, opts.ActiveCounts, report)
 	lap("validate", t)
 	var failed []string
 	for _, c := range report.Checks {
@@ -420,15 +562,14 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (*Result, error) {
 		return fail(fmt.Errorf("%w: %s", ErrValidation, strings.Join(failed, "; ")))
 	}
 
-	// 6. Record, freeze, rename, activate --------------------------------
 	t = time.Now()
 	report.Resources.ImporterMaxRSSKiB = selfMaxRSS()
 	var provRaw any
-	if prov != nil {
-		provRaw = json.RawMessage(prov.Raw)
+	if v.Provenance != nil {
+		provRaw = json.RawMessage(v.Provenance.Raw)
 	}
 	layersJSON, _ := json.Marshal(catalog)
-	toolchainJSON, _ := json.Marshal(toolchain)
+	toolchainJSON, _ := json.Marshal(tools)
 	if _, err := rel.Exec(ctx, `VACUUM (ANALYZE)`); err != nil {
 		return fail(err)
 	}
@@ -449,7 +590,7 @@ INSERT INTO karta.release_info (release_id, schema_major, schema_revision, style
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now(), $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`,
 		id, schema.Major, schemaRev, styleRev, cfg.ID, cfg.Name,
 		cfg.BBox[:], cfg.View.Center[:], cfg.View.Zoom, catalog.MinZoom, catalog.MaxZoom,
-		info.SHA256, info.Size, src.DataTimestamp, src.DataTimestampSource,
+		src.SHA256, src.Size, src.DataTimestamp, src.DataTimestampSource,
 		provRaw, opts.Version, o2pVersion, Attribution, License, LicenseURL,
 		layersJSON, []byte(styleJSON), reportJSON, identity, toolchainJSON); err != nil {
 		return fail(fmt.Errorf("record release metadata: %w", err))
@@ -464,14 +605,39 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, n
 		return fail(fmt.Errorf("rename candidate to %s: %w", dbName, err))
 	}
 	candidate = dbName // a failure from here on drops the renamed database
-	if err := registry.SetState(ctx, reg, id, registry.StateReady, nil); err != nil {
+	failpoint.Hit("build.after_rename")
+	if err := registry.MarkReady(ctx, reg, id, schema.Major, report.Resources.DatabaseBytes, report.Counts); err != nil {
 		return fail(err)
 	}
-	if err := registry.ActivateFirst(ctx, reg, id); err != nil {
+	if err := registry.Audit(ctx, reg, registry.AuditEntry{Actor: opts.Actor, Source: opts.Source, Action: "import_validated", Target: id,
+		Outcome: registry.OutcomeSucceeded, Detail: map[string]any{"database_bytes": report.Resources.DatabaseBytes, "seconds": timings["total"]}}); err != nil {
 		return fail(err)
 	}
-	log.Info("release active", "release_id", id, "seconds", timings["total"])
-	return &Result{ReleaseID: id, Report: report}, nil
+	log.Info("release ready", "release_id", id, "seconds", timings["total"])
+	return &Built{ReleaseID: id, Report: report}, nil
+}
+
+// relativeChecks bounds the drop of every counted table relative to the
+// active release of the same region (validation.max_drop_fraction).
+func relativeChecks(cfg region.Config, activeID string, active map[string]int64, r *Report) {
+	f := cfg.Validation.MaxDropFraction
+	if f == nil || len(active) == 0 {
+		return
+	}
+	tables := make([]string, 0, len(active))
+	for k := range active {
+		tables = append(tables, k)
+	}
+	sort.Strings(tables)
+	for _, table := range tables {
+		prev := active[table]
+		if prev <= 0 {
+			continue
+		}
+		minimum := int64(math.Ceil(float64(prev) * (1 - *f)))
+		r.Checks = append(r.Checks, Check{Name: "relative_count_" + table, Passed: r.Counts[table] >= minimum,
+			Detail: fmt.Sprintf("%d rows; active release %s has %d, minimum %d (max drop %.0f%%)", r.Counts[table], activeID, prev, minimum, *f*100)})
+	}
 }
 
 // candidateName returns a fresh name for an import's working database.
@@ -487,6 +653,11 @@ var candidatePattern = regexp.MustCompile(`^karta_c[0-9a-f]{24}$`)
 
 // dropLeftoverCandidates removes working databases of interrupted or kept
 // failed imports. It runs under the import lock, so no import is using them.
+// DropLeftoverCandidates is dropLeftoverCandidates for recovery.
+func DropLeftoverCandidates(ctx context.Context, conn *pgx.Conn, log *slog.Logger) error {
+	return dropLeftoverCandidates(ctx, conn, log)
+}
+
 func dropLeftoverCandidates(ctx context.Context, conn *pgx.Conn, log *slog.Logger) error {
 	rows, err := conn.Query(ctx, `SELECT datname FROM pg_database WHERE datname LIKE 'karta\_c%'`)
 	if err != nil {
@@ -508,22 +679,19 @@ func dropLeftoverCandidates(ctx context.Context, conn *pgx.Conn, log *slog.Logge
 	return nil
 }
 
-// readToolchain records the versions of the database components whose
-// behaviour shapes tiles and search results.
-func readToolchain(ctx context.Context, conn *pgx.Conn) (map[string]string, error) {
-	var pg, postgis, geos, proj, trgm, icu string
-	err := conn.QueryRow(ctx, `
-SELECT split_part(current_setting('server_version'), ' ', 1),
-       public.postgis_lib_version(),
-       public.postgis_geos_version(),
-       split_part(public.postgis_proj_version(), ' ', 1),
-       (SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm'),
-       COALESCE((SELECT collversion FROM pg_collation WHERE collname = 'und-x-icu'), '')`).Scan(
-		&pg, &postgis, &geos, &proj, &trgm, &icu)
-	if err != nil {
-		return nil, fmt.Errorf("read database toolchain versions: %w", err)
+// DropDatabase drops a release or candidate database if it exists. Without
+// force it fails while any session is connected, so a database in use is
+// never removed.
+func DropDatabase(ctx context.Context, conn *pgx.Conn, name string, force bool) error {
+	if !releaseid.Valid(strings.TrimPrefix(name, "karta_")) && !candidatePattern.MatchString(name) {
+		return fmt.Errorf("refusing to drop %q: not a release or candidate database", name)
 	}
-	return map[string]string{"postgresql": pg, "postgis": postgis, "geos": geos, "proj": proj, "pg_trgm": trgm, "icu": icu}, nil
+	sql := fmt.Sprintf(`DROP DATABASE IF EXISTS %s`, name)
+	if force {
+		sql += ` WITH (FORCE)`
+	}
+	_, err := conn.Exec(ctx, sql)
+	return err
 }
 
 func dropDatabase(ctx context.Context, conn *pgx.Conn, name string) error {
@@ -560,7 +728,7 @@ func osm2pgsqlVersion(ctx context.Context, bin string) (string, error) {
 
 // runOsm2pgsql imports the snapshot. The password is passed through a
 // temporary 0600 pgpass file, never on the command line or in the environment.
-func runOsm2pgsql(ctx context.Context, opts Options, dbName string, log *slog.Logger) (int64, error) {
+func runOsm2pgsql(ctx context.Context, opts BuildOptions, snapshot, dbName string, log *slog.Logger) (int64, error) {
 	dir, err := os.MkdirTemp("", "karta-import-")
 	if err != nil {
 		return 0, err
@@ -590,7 +758,7 @@ func runOsm2pgsql(ctx context.Context, opts Options, dbName string, log *slog.Lo
 	if opts.Slim {
 		args = append(args, "--slim", "--drop")
 	}
-	args = append(args, opts.SnapshotPath)
+	args = append(args, snapshot)
 	cmd := exec.CommandContext(ctx, opts.Osm2pgsql, args...) // #nosec G204 -- fixed arguments, validated values
 	cmd.Env = []string{"PGPASSFILE=" + pgpass, "PGSSLMODE=" + opts.DB.SSLMode, "PGAPPNAME=karta-osm2pgsql", "PGCONNECT_TIMEOUT=10", "HOME=" + dir}
 	cmd.Dir = dir

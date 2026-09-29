@@ -27,13 +27,17 @@ GOSEC       := github.com/securego/gosec/v2/cmd/gosec@v2.29.0
 
 TEHRAN_PBF := data/local/tehran-chitgar.osm.pbf
 TEHRAN_SHA := 7d0e69a2d5e1ad184ee48637626882bb8bcb7acd8e95123e05d0697ce216191e
+# Host directory mounted read-only as the publisher's inbox (compose.yaml).
+INBOX      ?= data/inbox
+# Extra flags for `make import-*`, e.g. IMPORT_FLAGS=--allow-region-change.
+IMPORT_FLAGS ?=
 
 .PHONY: help
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
 
 .PHONY: secrets
-secrets: ## Create random database passwords in ./secrets (never overwrites)
+secrets: ## Create database passwords and operator tokens in ./secrets (never overwrites)
 	@./scripts/gen-secrets.sh
 
 .PHONY: build
@@ -42,9 +46,10 @@ build: ## Build the api and importer images
 	docker build $(BUILD_SECRET) --build-arg VERSION=$(VERSION) -f deploy/Dockerfile --target importer -t karta-importer:local .
 
 .PHONY: up
-up: secrets ## Start PostgreSQL and the API (the API reports not-ready until a release is imported)
+up: secrets ## Start PostgreSQL, the API and the publisher (the API reports not-ready until a release is published)
+	@mkdir -p $(INBOX) && chmod 755 $(INBOX)
 	$(COMPOSE) up -d --wait db
-	$(COMPOSE) up -d api
+	$(COMPOSE) up -d api publisher
 
 .PHONY: wait-ready
 wait-ready: ## Wait until /health/ready returns 200
@@ -53,8 +58,8 @@ wait-ready: ## Wait until /health/ready returns 200
 	done; curl -sS $(BASE_URL)/health/ready; echo; exit 1
 
 .PHONY: import-fixture
-import-fixture: ## Import the committed synthetic fixture (prints the JSON import report)
-	@$(COMPOSE) run --rm -T importer --snapshot /data/testdata/fixture/karta-fixture.osm --region /config/regions/fixture.json
+import-fixture: ## Publish the committed synthetic fixture with the command-line importer (prints the JSON result)
+	@$(COMPOSE) run --rm -T importer --snapshot /data/testdata/fixture/karta-fixture.osm --region /config/regions/fixture.json $(IMPORT_FLAGS)
 
 .PHONY: verify-tehran
 verify-tehran: ## Check the Chitgar extract and sidecar are present and match the documented SHA-256
@@ -66,9 +71,34 @@ verify-tehran: ## Check the Chitgar extract and sidecar are present and match th
 	done
 
 .PHONY: import-tehran
-import-tehran: verify-tehran ## Import the real Chitgar extract (Stage 1 serves one release: `make reset` first if another is active)
+import-tehran: verify-tehran ## Publish the real Chitgar extract with the command-line importer (IMPORT_FLAGS=--allow-region-change replaces another region)
 	@mkdir -p $(ARTIFACTS)
-	@$(COMPOSE) run --rm -T importer --snapshot /data/local/tehran-chitgar.osm.pbf --region /config/regions/tehran-chitgar.json | tee $(ARTIFACTS)/tehran-import.json
+	@$(COMPOSE) run --rm -T importer --snapshot /data/local/tehran-chitgar.osm.pbf --region /config/regions/tehran-chitgar.json $(IMPORT_FLAGS) | tee $(ARTIFACTS)/tehran-import.json
+
+.PHONY: publish
+publish: ## Submit SNAPSHOT=file.osm.pbf (and its .provenance.json, if any) to the inbox with the completion protocol [NAME=...]
+	@test -n "$(SNAPSHOT)" || { echo "usage: make publish SNAPSHOT=path/to/file.osm.pbf [NAME=name]" >&2; exit 2; }
+	@mkdir -p $(INBOX) && chmod 755 $(INBOX)
+	@./scripts/submit.sh $(SNAPSHOT) $(INBOX) $(NAME)
+
+.PHONY: publish-tehran
+publish-tehran: verify-tehran ## Submit the Chitgar extract and sidecar to the inbox (publisher region tehran-chitgar, the default)
+	@mkdir -p $(INBOX) && chmod 755 $(INBOX)
+	@EXPECTED_SHA256=$(TEHRAN_SHA) ./scripts/submit.sh $(TEHRAN_PBF) $(INBOX) tehran-chitgar-$$(date -u +%Y%m%dT%H%M%SZ)
+
+.PHONY: op
+op: ## Run an operator API command, e.g. make op CMD='rollback --reason "bad data"' (see docs/runbook.md)
+	@$(COMPOSE) run --rm -T operator-cli $(CMD)
+
+.PHONY: op-status
+op-status: ## Publication status: active and retained releases, submissions, authorizations, storage
+	@$(COMPOSE) run --rm -T operator-cli status
+
+.PHONY: rotate-operator-tokens
+rotate-operator-tokens: ## Replace both operator tokens and restart the publisher with the new credentials
+	rm -f secrets/operator_token secrets/operator_monitor_token
+	./scripts/gen-secrets.sh
+	$(COMPOSE) up -d --no-deps --force-recreate publisher
 
 .PHONY: smoke
 smoke: ## Query the manifest, a Persian search and a tile
@@ -102,9 +132,14 @@ web: ## Build the demo assets into web/dist for running `karta serve` outside Do
 fmt: ## Format Go code
 	gofmt -w cmd internal openapi tests
 
+.PHONY: fixtures
+fixtures: ## Regenerate the committed PBF fixture snapshots from their XML sources
+	go run ./cmd/karta-fixture
+
 .PHONY: lint
-lint: ## gofmt, go vet, staticcheck, govulncheck, gosec
+lint: ## gofmt, go vet, staticcheck, govulncheck, gosec, committed fixture check
 	@out=$$(gofmt -l cmd internal openapi tests); if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+	go run ./cmd/karta-fixture -check > /dev/null
 	go vet ./...
 	go vet -tags integration ./tests/integration/
 	go vet -tags browser ./tests/browser/
@@ -118,14 +153,16 @@ test: ## Unit tests (no Docker needed)
 	go test -race -count=1 ./...
 
 .PHONY: test-integration
-test-integration: secrets ## Full-stack integration tests on an isolated compose project (fixture only)
+test-integration: secrets ## Full-stack integration tests on an isolated compose project (committed fixtures only)
 	@mkdir -p $(ARTIFACTS)
-	$(TEST_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true
-	$(TEST_COMPOSE) up -d --wait db
-	$(TEST_COMPOSE) up -d api
-	KARTA_TEST_COMPOSE="$(TEST_COMPOSE)" go test -tags integration -count=1 -v ./tests/integration/ ; \
+	@inbox=$$(mktemp -d) && chmod 755 $$inbox && export KARTA_INBOX_HOST_DIR=$$inbox && \
+	  { $(TEST_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true; } && \
+	  $(TEST_COMPOSE) up -d --wait db && $(TEST_COMPOSE) up -d api publisher && \
+	  KARTA_TEST_COMPOSE="$(TEST_COMPOSE)" KARTA_TEST_ARTIFACTS=$(CURDIR)/$(ARTIFACTS) \
+	    go test -tags integration -count=1 -timeout 30m -v $(if $(RUN),-run '$(RUN)') ./tests/integration/ ; \
 	  status=$$?; $(TEST_COMPOSE) logs --no-color api > $(CURDIR)/$(ARTIFACTS)/integration-api.log 2>&1 || true; \
-	  $(TEST_COMPOSE) down -v --remove-orphans; exit $$status
+	  $(TEST_COMPOSE) logs --no-color publisher > $(CURDIR)/$(ARTIFACTS)/integration-publisher.log 2>&1 || true; \
+	  $(TEST_COMPOSE) down -v --remove-orphans; rm -rf -- "$$inbox"; exit $$status
 
 .PHONY: test-browser
 test-browser: ## Render the demo in headless Chromium against the running stack (BASE_URL)

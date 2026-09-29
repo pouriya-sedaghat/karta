@@ -1,9 +1,13 @@
-# Karta Stage 1 stack: PostgreSQL/PostGIS, the API (tiles, search, style,
-# glyphs, demo) and an on-demand importer. See docs/runbook.md.
+# Karta stack: PostgreSQL/PostGIS, the public API (tiles, search, style,
+# glyphs, demo), the publisher (inbox watcher, release builds, operator API)
+# and an on-demand command-line importer. See docs/runbook.md.
 #
 # Networks: `backend` is internal (no route outside Docker); PostgreSQL is only
 # reachable there and publishes no port. The API is additionally on `frontend`
-# to publish its HTTP port, bound to 127.0.0.1 by default.
+# to publish its HTTP port, bound to 127.0.0.1 by default. The publisher is
+# additionally on `operator`, only to publish the operator API port (bound to
+# 127.0.0.1 by default); that network does not masquerade, so the publisher,
+# which reads untrusted snapshots, has no NAT route to outside hosts.
 name: karta
 
 x-logging: &logging
@@ -83,6 +87,73 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  publisher:
+    image: karta-importer:${KARTA_IMAGE_TAG:-local}
+    entrypoint: ["/usr/local/bin/karta", "publisher"]
+    environment: &publication-env
+      KARTA_DB_HOST: db
+      KARTA_DB_USER: karta_importer
+      KARTA_DB_PASSWORD_FILE: /run/secrets/db_importer_password
+      KARTA_REGION_FILE: /config/regions/${KARTA_PUBLISH_REGION:-tehran-chitgar}.json
+      KARTA_INBOX_DIR: /data/inbox
+      KARTA_STAGING_DIR: /var/lib/karta/staging
+      KARTA_OPERATOR_TOKENS_FILE: /run/secrets/operator_tokens
+      KARTA_PUBLISH_AUTO_ACTIVATE: ${KARTA_PUBLISH_AUTO_ACTIVATE:-true}
+      KARTA_INBOX_POLL_INTERVAL: ${KARTA_INBOX_POLL_INTERVAL:-10s}
+      KARTA_INBOX_SETTLE: ${KARTA_INBOX_SETTLE:-5s}
+      KARTA_RELEASE_PIN_GRACE: ${KARTA_RELEASE_PIN_GRACE:-24h}
+      KARTA_RETAIN_RELEASES: ${KARTA_RETAIN_RELEASES:-2}
+      KARTA_RELEASE_STORAGE_BUDGET_MB: ${KARTA_RELEASE_STORAGE_BUDGET_MB:-10240}
+      KARTA_MIN_FREE_MB: ${KARTA_MIN_FREE_MB:-512}
+      KARTA_STAGING_RESERVE_MB: ${KARTA_STAGING_RESERVE_MB:-64}
+      KARTA_RELEASE_TABLESPACE: ${KARTA_RELEASE_TABLESPACE:-}
+      KARTA_OSM2PGSQL_CACHE_MB: ${KARTA_OSM2PGSQL_CACHE_MB:-800}
+      KARTA_OSM2PGSQL_PROCESSES: ${KARTA_OSM2PGSQL_PROCESSES:-2}
+      KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+    secrets: [db_importer_password, operator_tokens]
+    volumes:
+      - ${KARTA_INBOX_HOST_DIR:-./data/inbox}:/data/inbox:ro
+      - staging:/var/lib/karta/staging
+      - ./config/regions:/config/regions:ro
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    read_only: true
+    ports:
+      - "${KARTA_OPERATOR_BIND:-127.0.0.1}:${KARTA_OPERATOR_PORT:-8081}:8081"
+    networks: [backend, operator]
+    depends_on:
+      db:
+        condition: service_healthy
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KARTA_PUBLISHER_MEM_LIMIT:-4g}
+    cpus: ${KARTA_PUBLISHER_CPUS:-2}
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/karta", "healthcheck", "--live", "--url", "http://127.0.0.1:8081"]
+      interval: 10s
+      timeout: 4s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    logging: *logging
+
+  # One-off operator API client: `docker compose run --rm operator-cli status`.
+  # It alone holds the raw operator token; the publisher only has its hash.
+  operator-cli:
+    image: karta-api:${KARTA_IMAGE_TAG:-local}
+    profiles: [tools]
+    entrypoint: ["/usr/local/bin/karta", "operator"]
+    environment:
+      KARTA_OPERATOR_URL: http://publisher:8081
+      KARTA_OPERATOR_TOKEN_FILE: /run/secrets/operator_token
+    secrets: [operator_token]
+    networks: [operator]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+
   importer:
     build:
       context: .
@@ -91,12 +162,8 @@ services:
     image: karta-importer:${KARTA_IMAGE_TAG:-local}
     profiles: [tools]
     environment:
-      KARTA_DB_HOST: db
-      KARTA_DB_USER: karta_importer
-      KARTA_DB_PASSWORD_FILE: /run/secrets/db_importer_password
-      KARTA_OSM2PGSQL_CACHE_MB: ${KARTA_OSM2PGSQL_CACHE_MB:-800}
-      KARTA_OSM2PGSQL_PROCESSES: ${KARTA_OSM2PGSQL_PROCESSES:-2}
-      KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+      <<: *publication-env
+      KARTA_STAGING_DIR: /tmp
     secrets: [db_importer_password]
     volumes:
       - ./data/local:/data/local:ro
@@ -119,9 +186,13 @@ networks:
   backend:
     internal: true
   frontend: {}
+  operator:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
 
 volumes:
   pgdata: {}
+  staging: {}
 
 secrets:
   db_superuser_password:
@@ -130,3 +201,7 @@ secrets:
     file: ./secrets/db_importer_password
   db_api_password:
     file: ./secrets/db_api_password
+  operator_tokens:
+    file: ./secrets/operator_tokens
+  operator_token:
+    file: ./secrets/operator_token

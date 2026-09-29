@@ -23,20 +23,23 @@ async function getJSON(url, cache = 'default') {
   const res = await fetch(url, { headers: { Accept: 'application/json' }, cache });
   const body = await res.json();
   if (!res.ok) {
-    throw new Error(body?.error?.message || `${res.status} ${res.statusText}`);
+    const err = new Error(body?.error?.message || `${res.status} ${res.statusText}`);
+    err.code = body?.error?.code;
+    throw err;
   }
   return body;
 }
 
 // Style URLs are content-addressed and change when the API is upgraded or
 // reconfigured, so a manifest fetched just before such a change can name a
-// style URL the server no longer serves (404 unknown_style, or unknown_release
-// after a release switch). Then the page refetches the manifest, bypassing the
-// HTTP cache, and loads the style it names: at most STYLE_ATTEMPTS times, so a
-// persistent error ends with a message instead of a loop.
+// style URL the server no longer serves (404 unknown_style, 404 unknown_release,
+// or 410 release_expired once a replaced release's pin grace period ended).
+// Then the page refetches the manifest, bypassing the HTTP cache, and loads the
+// style it names: at most STYLE_ATTEMPTS times, so a persistent error ends with
+// a message instead of a loop.
 const STYLE_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 250;
-const STALE_STYLE_CODES = new Set(['unknown_style', 'unknown_release']);
+const STALE_STYLE_CODES = new Set(['unknown_style', 'unknown_release', 'release_expired']);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -50,7 +53,7 @@ async function loadManifestAndStyle() {
       return { manifest, style: body };
     }
     lastError = new Error(body?.error?.message || `style: ${res.status} ${res.statusText}`);
-    if (res.status !== 404 || !STALE_STYLE_CODES.has(body?.error?.code)) {
+    if ((res.status !== 404 && res.status !== 410) || !STALE_STYLE_CODES.has(body?.error?.code)) {
       break;
     }
     if (attempt < STYLE_ATTEMPTS) {
@@ -123,6 +126,13 @@ form.addEventListener('submit', async (event) => {
       results.append(li);
     }
   } catch (err) {
+    if (err.code === 'release_expired') {
+      // The release this page shows was replaced and its pin grace period
+      // ended: reload onto the current release (the URL hash keeps the view).
+      setStatus('The map data was updated; reloading…');
+      setTimeout(() => window.location.reload(), 1000);
+      return;
+    }
     setStatus(`Search failed: ${err.message}`);
   }
 });

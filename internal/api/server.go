@@ -70,7 +70,7 @@ type Config struct {
 // Releases resolves releases; implemented by release.Manager.
 type Releases interface {
 	Active() *release.Release
-	Get(id string) (*release.Release, bool)
+	Lookup(id string) (*release.Release, release.Lookup)
 	Status() release.Status
 }
 
@@ -262,8 +262,9 @@ type manifestAttrib struct {
 }
 
 type manifestFreshness struct {
-	UpdateMode    string `json:"update_mode"`
-	DataTimestamp string `json:"osm_data_timestamp"`
+	UpdateMode    string  `json:"update_mode"`
+	DataTimestamp string  `json:"osm_data_timestamp"`
+	ActivatedAt   *string `json:"activated_at"`
 }
 
 func (s *Server) noRelease(w http.ResponseWriter, r *http.Request) {
@@ -318,10 +319,18 @@ func (s *Server) manifest(w http.ResponseWriter, r *http.Request) {
 		Capabilities: map[string]bool{
 			"vector_tiles": true, "place_search": true,
 			"address_geocoding": false, "reverse_geocoding": false, "routing": false,
-			"manual_updates": false, "online_updates": false,
+			"manual_updates": true, "online_updates": false, "release_pinning": true,
 		},
-		Freshness: manifestFreshness{UpdateMode: "static", DataTimestamp: ts},
+		Freshness: manifestFreshness{UpdateMode: "manual", DataTimestamp: ts, ActivatedAt: activatedAt(rel)},
 	}, true)
+}
+
+func activatedAt(rel *release.Release) *string {
+	if rel.ActivatedAt.IsZero() {
+		return nil
+	}
+	s := rel.ActivatedAt.UTC().Format(time.RFC3339)
+	return &s
 }
 
 // noParams rejects query parameters on endpoints that take none.
@@ -474,12 +483,20 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request, id string, expl
 			writeError(w, r, http.StatusBadRequest, CodeInvalidParameter, "release_id must match "+releaseid.Pattern.String(), "release_id")
 			return nil, false, false
 		}
-		rel, ok := s.releases.Get(id)
-		if !ok {
+		rel, found := s.releases.Lookup(id)
+		switch found {
+		case release.Served:
+			return rel, true, true
+		case release.Expired:
+			writeError(w, r, http.StatusGone, CodeReleaseExpired,
+				"release "+id+" is no longer served (its pin grace period ended or it was removed); fetch /v1/manifest for the current release", "release_id")
+		case release.Unavailable:
+			w.Header().Set("Retry-After", "5")
+			writeError(w, r, http.StatusServiceUnavailable, CodeUnavailable, "release "+id+" is temporarily unavailable", "release_id")
+		default:
 			writeError(w, r, http.StatusNotFound, CodeUnknownRelease, "release "+id+" is not served", "release_id")
-			return nil, false, false
 		}
-		return rel, true, true
+		return nil, false, false
 	}
 	rel := s.releases.Active()
 	if rel == nil {

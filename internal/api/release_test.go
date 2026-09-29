@@ -23,11 +23,11 @@ import (
 type oneRelease struct{ rel *release.Release }
 
 func (o oneRelease) Active() *release.Release { return o.rel }
-func (o oneRelease) Get(id string) (*release.Release, bool) {
+func (o oneRelease) Lookup(id string) (*release.Release, release.Lookup) {
 	if id != o.rel.Info.ReleaseID {
-		return nil, false
+		return nil, release.Unknown
 	}
-	return o.rel, true
+	return o.rel, release.Served
 }
 func (o oneRelease) Status() release.Status {
 	return release.Status{Ready: true, Reason: release.ReasonReady, ReleaseID: o.rel.Info.ReleaseID}

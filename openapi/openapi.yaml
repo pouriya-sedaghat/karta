@@ -16,9 +16,23 @@ info:
     and the toolchain versions (osm2pgsql, PostgreSQL, PostGIS, GEOS, PROJ,
     ICU). Changing any of them yields a new id and therefore new URLs. `GET /v1/manifest` names the active
     release; clients that need a consistent map and search session pin that
-    `release_id` in tile/style URLs (always) and in search (optional). Stage 1
-    serves one active release; requests for any other id return
-    `404 unknown_release`.
+    `release_id` in tile/style URLs (always) and in search (optional).
+
+    **Release pinning.** An operator publishes new releases, and can roll
+    back, without stopping the service. When the active release is replaced,
+    the replaced one stays servable to clients that pinned it for the pin
+    grace period (`KARTA_RELEASE_PIN_GRACE`, 24 hours by default); requests
+    already in progress always finish on the release they started with.
+    After the grace period, and once a release is removed by cleanup, its
+    release-pinned URLs answer `410 release_expired`: fetch the manifest
+    again and switch to the release it names. A well-formed id that was never
+    published is `404 unknown_release`. A pinned release that cannot be
+    loaded right now is `503 service_unavailable` with `Retry-After`. The API
+    only serves a release when the serving database's PostgreSQL, PostGIS,
+    GEOS, PROJ, pg_trgm and ICU versions equal the ones it was built with, so
+    an immutable URL never serves bytes computed by other software; after a
+    database image upgrade, releases are rebuilt (new ids) before they are
+    served.
 
     **Styles are content-addressed.** The style URL the manifest issues,
     `/v1/releases/{release_id}/styles/{style_id}.json`, names one exact byte
@@ -30,16 +44,20 @@ info:
     different bytes. Clients take the style URL from the manifest (or follow
     `/v1/releases/{release_id}/style.json`) and, on `unknown_style` (or
     `unknown_release` after a release switch), refetch the manifest and load
-    the style it names, a bounded number of times.
+    the style it names, a bounded number of times; the same applies to
+    `410 release_expired`.
 
     **Compatibility.** `/v1` is not frozen until its first release; while
     Stage 1 is a draft the contract can still change incompatibly (it did once:
     `/v1/releases/{release_id}/style.json` changed from returning the style to
     a `307`, see docs/api.md). From the first release on, changes within `/v1`
-    are additive: new endpoints, optional parameters, response fields and error
-    codes may be added; existing fields, parameters and codes are not removed
-    or redefined. Clients must ignore unknown fields. Breaking changes use a new
-    path prefix.
+    are additive: new endpoints, optional parameters, response fields, enum
+    values and error codes may be added; existing fields, parameters and codes
+    are not removed or redefined. Clients must ignore unknown fields and enum
+    values. Breaking changes use a new path prefix. Stage 2 added
+    `410 release_expired`, `freshness.update_mode: manual`,
+    `freshness.activated_at` and the `release_pinning` capability, and
+    `manual_updates` became true (docs/adr/0003-stage2-publication.md).
 
     **CORS.** Read-only `GET`/`HEAD` from origins listed in
     `KARTA_CORS_ALLOWED_ORIGINS` (exact origins or `*`); no credentials. Exposed
@@ -166,7 +184,7 @@ paths:
           schema: { type: string, example: "51.20,35.73,51.23,35.76" }
         - name: release_id
           in: query
-          description: Search this release instead of the active one.
+          description: Search this release instead of the active one (the active release, or a replaced release inside its pin grace period).
           schema: { $ref: "#/components/schemas/ReleaseID" }
       responses:
         "200":
@@ -178,6 +196,7 @@ paths:
               schema: { $ref: "#/components/schemas/SearchResponse" }
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+        "410": { $ref: "#/components/responses/Expired" }
         "503": { $ref: "#/components/responses/Unavailable" }
         "405": { $ref: "#/components/responses/Error" }
         "413": { $ref: "#/components/responses/Error" }
@@ -206,6 +225,8 @@ paths:
             Cache-Control: { $ref: "#/components/headers/CacheControl" }
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+        "410": { $ref: "#/components/responses/Expired" }
+        "503": { $ref: "#/components/responses/Unavailable" }
         "405": { $ref: "#/components/responses/Error" }
         "413": { $ref: "#/components/responses/Error" }
   /v1/releases/{release_id}/styles/{style_id}.json:
@@ -239,6 +260,8 @@ paths:
         "304": { description: Not modified. }
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+        "410": { $ref: "#/components/responses/Expired" }
+        "503": { $ref: "#/components/responses/Unavailable" }
         "405": { $ref: "#/components/responses/Error" }
         "413": { $ref: "#/components/responses/Error" }
   /v1/releases/{release_id}/tiles/{z}/{x}/{y}.pbf:
@@ -270,6 +293,7 @@ paths:
         "304": { description: Not modified. }
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+        "410": { $ref: "#/components/responses/Expired" }
         "503": { $ref: "#/components/responses/Unavailable" }
         "405": { $ref: "#/components/responses/Error" }
         "413": { $ref: "#/components/responses/Error" }
@@ -327,8 +351,16 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+    Expired:
+      description: |
+        `release_expired`: the release was published but is no longer served
+        (its pin grace period ended, or cleanup removed it). Fetch
+        `/v1/manifest` and use the release it names. Not cacheable.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     Unavailable:
-      description: No release served, or the data store is unavailable or too slow.
+      description: No release served, the requested pinned release cannot be loaded right now, or the data store is unavailable or too slow.
       headers:
         Retry-After: { $ref: "#/components/headers/RetryAfter" }
       content:
@@ -355,7 +387,7 @@ components:
           properties:
             code:
               type: string
-              enum: [invalid_parameter, unknown_parameter, invalid_query, unknown_release, unknown_style, no_active_release,
+              enum: [invalid_parameter, unknown_parameter, invalid_query, unknown_release, release_expired, unknown_style, no_active_release,
                      invalid_tile_coordinates, tile_zoom_out_of_range, unknown_fontstack, not_found,
                      method_not_allowed, request_body_not_allowed, timeout, service_unavailable, internal_error]
             message: { type: string }
@@ -444,8 +476,16 @@ components:
           type: object
           required: [update_mode, osm_data_timestamp]
           properties:
-            update_mode: { type: string, enum: [static], description: Stage 1 serves a fixed snapshot; no update mechanism is available. }
+            update_mode:
+              type: string
+              enum: [static, manual]
+              description: "`manual`: an operator publishes snapshots through the local inbox or the command line (Stage 2); online updates are not available. `static` was Stage 1's value."
             osm_data_timestamp: { type: string, format: date-time }
+            activated_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: When the active release last became active (null when unknown, e.g. a Stage 1 registry).
     SearchResponse:
       type: object
       required: [release_id, query, normalized_query, limit, lang, bbox, results]

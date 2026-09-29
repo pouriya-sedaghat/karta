@@ -2,7 +2,7 @@
   "id": "fixture",
   "name": "Karta synthetic test fixture",
   "bbox": [0.0, 0.0, 0.02000001, 0.015],
-  "source": { "require_provenance": false },
+  "source": { "allowed_sha256": ["0dbba74d86e68fc4cc8c13849ad23ccae5a82d1cf332077288039a8b8dfc5ed8", "6a0672e252f62b03971106770d539e2ea506b85db535dfa28354c1bc66a0a94f", "493f7292f7f6bebaef9e8af21d3c3da053ad18938381764a61fad2b4a980bc38"], "require_provenance": false },
   "view": { "center": [0.01000001, 0.0075], "zoom": 15.00000001 },
   "validation": { "min_counts": { "features": 15 }, "search": [], "tiles": [] }
 }

@@ -28,7 +28,7 @@ type Serve struct {
 	LogLevel            string
 }
 
-// Import configures `karta import`.
+// Import configures `karta import` (and is the build part of Publisher).
 type Import struct {
 	DB            dbconn.Params
 	RegistryDB    string
@@ -40,6 +40,50 @@ type Import struct {
 	Slim          bool
 	LockTimeout   time.Duration
 	LogLevel      string
+	// Tablespace holds new release databases ("" = the database default).
+	Tablespace string
+	// StagingDir receives the private copy of every snapshot imported.
+	StagingDir string
+	Publication
+}
+
+// Publication is the release lifecycle policy shared by the publisher and
+// the command-line import.
+type Publication struct {
+	PinGrace            time.Duration
+	RetainReleases      int
+	CleanupMargin       time.Duration
+	CleanupInterval     time.Duration
+	MaxAttempts         int
+	PointerLockTimeout  time.Duration
+	MaxFutureSkew       time.Duration
+	StagingReserveBytes int64
+	StorageBudgetBytes  int64
+	DBVolumePath        string
+	MinFreeBytes        int64
+	CandidateSizeFactor float64
+}
+
+// Publisher configures `karta publisher`: the inbox watcher and the
+// operator API.
+type Publisher struct {
+	Import
+	RegionFile             string
+	InboxDir               string
+	InboxPoll              time.Duration
+	InboxSettle            time.Duration
+	InboxMaxEntries        int
+	AutoActivate           bool
+	OperatorListenAddr     string
+	OperatorTokensFile     string
+	OperatorRequestTimeout time.Duration
+}
+
+// OperatorClient configures `karta operator`.
+type OperatorClient struct {
+	URL       string
+	TokenFile string
+	Timeout   time.Duration
 }
 
 type reader struct {
@@ -172,6 +216,11 @@ func LoadServe(getenv func(string) string) (Serve, error) {
 // LoadImport reads the importer configuration.
 func LoadImport(getenv func(string) string) (Import, error) {
 	r := &reader{getenv: getenv}
+	c := loadImport(r)
+	return c, errors.Join(r.errs...)
+}
+
+func loadImport(r *reader) Import {
 	c := Import{
 		DB:          r.db("karta_importer", "/run/secrets/db_importer_password", "karta-importer"),
 		RegistryDB:  r.ident("KARTA_REGISTRY_DB", "karta_registry"),
@@ -184,7 +233,79 @@ func LoadImport(getenv func(string) string) (Import, error) {
 		LogLevel:    r.logLevel(),
 	}
 	c.MaxInputBytes = int64(r.int("KARTA_MAX_INPUT_MB", 4096, 1, 1<<22)) << 20
+	if ts := r.str("KARTA_RELEASE_TABLESPACE", ""); ts != "" {
+		c.Tablespace = r.ident("KARTA_RELEASE_TABLESPACE", "")
+	}
+	c.StagingDir = r.dir("KARTA_STAGING_DIR", os.TempDir())
+	c.Publication = Publication{
+		PinGrace:            r.dur("KARTA_RELEASE_PIN_GRACE", 24*time.Hour, 0, 30*24*time.Hour),
+		RetainReleases:      r.int("KARTA_RETAIN_RELEASES", 2, 0, 50),
+		CleanupMargin:       r.dur("KARTA_CLEANUP_MARGIN", 5*time.Minute, 30*time.Second, 24*time.Hour),
+		CleanupInterval:     r.dur("KARTA_CLEANUP_INTERVAL", 15*time.Minute, 10*time.Second, 24*time.Hour),
+		MaxAttempts:         r.int("KARTA_PUBLISH_MAX_ATTEMPTS", 3, 1, 20),
+		PointerLockTimeout:  r.dur("KARTA_POINTER_LOCK_TIMEOUT", 5*time.Second, 100*time.Millisecond, time.Minute),
+		MaxFutureSkew:       r.dur("KARTA_MAX_FUTURE_SKEW", 10*time.Minute, 0, 24*time.Hour),
+		StagingReserveBytes: int64(r.int("KARTA_STAGING_RESERVE_MB", 64, 0, 1<<22)) << 20,
+		StorageBudgetBytes:  int64(r.int("KARTA_RELEASE_STORAGE_BUDGET_MB", 10240, 0, 1<<30)) << 20,
+		DBVolumePath:        r.str("KARTA_DB_VOLUME_PATH", ""),
+		MinFreeBytes:        int64(r.int("KARTA_MIN_FREE_MB", 512, 0, 1<<22)) << 20,
+		CandidateSizeFactor: float64(r.int("KARTA_CANDIDATE_SIZE_FACTOR", 40, 1, 1000)),
+	}
+	if p := c.DBVolumePath; p != "" {
+		if st, err := os.Stat(p); err != nil || !st.IsDir() {
+			r.errs = append(r.errs, fmt.Errorf("KARTA_DB_VOLUME_PATH=%q is not a directory", p))
+		}
+	}
+	return c
+}
+
+// LoadPublisher reads the publisher configuration.
+func LoadPublisher(getenv func(string) string) (Publisher, error) {
+	r := &reader{getenv: getenv}
+	c := Publisher{
+		Import:                 loadImport(r),
+		RegionFile:             r.str("KARTA_REGION_FILE", ""),
+		InboxDir:               r.dir("KARTA_INBOX_DIR", ""),
+		InboxPoll:              r.dur("KARTA_INBOX_POLL_INTERVAL", 10*time.Second, time.Second, 10*time.Minute),
+		InboxSettle:            r.dur("KARTA_INBOX_SETTLE", 5*time.Second, 0, 10*time.Minute),
+		InboxMaxEntries:        r.int("KARTA_INBOX_MAX_ENTRIES", 1000, 10, 100000),
+		AutoActivate:           r.boolean("KARTA_PUBLISH_AUTO_ACTIVATE", true),
+		OperatorListenAddr:     r.str("KARTA_OPERATOR_LISTEN_ADDR", ":8081"),
+		OperatorTokensFile:     r.str("KARTA_OPERATOR_TOKENS_FILE", "/run/secrets/operator_tokens"),
+		OperatorRequestTimeout: r.dur("KARTA_OPERATOR_REQUEST_TIMEOUT", time.Minute, time.Second, 10*time.Minute),
+	}
+	if c.RegionFile == "" {
+		r.errs = append(r.errs, errors.New("KARTA_REGION_FILE is required (the region configuration this deployment publishes)"))
+	} else if st, err := os.Stat(c.RegionFile); err != nil || !st.Mode().IsRegular() {
+		r.errs = append(r.errs, fmt.Errorf("KARTA_REGION_FILE=%q is not a readable file", c.RegionFile))
+	}
+	if c.InboxDir == "" {
+		r.errs = append(r.errs, errors.New("KARTA_INBOX_DIR is required"))
+	}
 	return c, errors.Join(r.errs...)
+}
+
+// LoadOperatorClient reads the operator client configuration.
+func LoadOperatorClient(getenv func(string) string) (OperatorClient, error) {
+	r := &reader{getenv: getenv}
+	c := OperatorClient{
+		URL:       r.str("KARTA_OPERATOR_URL", "http://127.0.0.1:8081"),
+		TokenFile: r.str("KARTA_OPERATOR_TOKEN_FILE", ""),
+		Timeout:   r.dur("KARTA_OPERATOR_CLIENT_TIMEOUT", 2*time.Minute, time.Second, 10*time.Minute),
+	}
+	return c, errors.Join(r.errs...)
+}
+
+// dir reads a directory path that must exist ("" allowed when def is "").
+func (r *reader) dir(key, def string) string {
+	v := r.str(key, def)
+	if v == "" {
+		return v
+	}
+	if st, err := os.Stat(v); err != nil || !st.IsDir() {
+		r.errs = append(r.errs, fmt.Errorf("%s=%q is not a directory", key, v))
+	}
+	return v
 }
 
 func validBaseURL(s string) error {

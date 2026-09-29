@@ -1,5 +1,9 @@
 /data/local/
+# Default local publication inbox (KARTA_INBOX_HOST_DIR)
+/data/inbox/
 *.osm.pbf
+# Committed, deterministic test snapshots (go run ./cmd/karta-fixture)
+!/testdata/fixture/snapshots/*.osm.pbf
 *.osm.pbf.provenance.json
 __pycache__/
 # Generated database passwords (scripts/gen-secrets.sh)

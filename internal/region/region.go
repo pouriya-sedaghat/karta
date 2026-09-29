@@ -34,12 +34,40 @@ type Config struct {
 }
 
 // Source constrains which snapshot may be imported for the region.
+//
+// Digest authorization is always on: a snapshot is accepted only if its
+// SHA-256 is pinned here (ExpectedSHA256 or AllowedSHA256) or an operator
+// has authorized it for this region in the registry (an authenticated,
+// audited action; see docs/runbook.md). A region with no pins accepts
+// nothing until an operator authorizes a digest; there is no setting that
+// accepts arbitrary files.
 type Source struct {
-	// ExpectedSHA256 pins one exact snapshot. Empty accepts any snapshot.
+	// ExpectedSHA256 pins one exact snapshot (the Stage 1 field).
 	ExpectedSHA256 string `json:"expected_sha256,omitempty"`
+	// AllowedSHA256 pins further exact snapshots.
+	AllowedSHA256 []string `json:"allowed_sha256,omitempty"`
 	// RequireProvenance demands a <file>.provenance.json sidecar whose digest
 	// and box match the file and this region.
 	RequireProvenance bool `json:"require_provenance"`
+}
+
+// PinnedDigests returns every digest the configuration itself authorizes.
+func (s Source) PinnedDigests() []string {
+	var out []string
+	if s.ExpectedSHA256 != "" {
+		out = append(out, s.ExpectedSHA256)
+	}
+	return append(out, s.AllowedSHA256...)
+}
+
+// Pinned reports whether the configuration authorizes digest.
+func (s Source) Pinned(digest string) bool {
+	for _, d := range s.PinnedDigests() {
+		if d == digest {
+			return true
+		}
+	}
+	return false
 }
 
 // View is the default map position for clients.
@@ -52,8 +80,14 @@ type View struct {
 type Validation struct {
 	// MinCounts are lower bounds on imported rows per table (sanity gates).
 	MinCounts map[string]int64 `json:"min_counts"`
-	Search    []SearchCheck    `json:"search"`
-	Tiles     []TileCheck      `json:"tiles"`
+	// MaxDropFraction, when set, bounds how much smaller a new release of the
+	// region may be than the active one: every counted table must keep at
+	// least (1 - MaxDropFraction) of the active release's rows. It catches a
+	// damaged or mostly empty snapshot that still passes MinCounts, while
+	// leaving room for legitimate edits. Nil disables the relative check.
+	MaxDropFraction *float64      `json:"max_drop_fraction,omitempty"`
+	Search          []SearchCheck `json:"search"`
+	Tiles           []TileCheck   `json:"tiles"`
 }
 
 // SearchCheck requires a query to return an element within the first
@@ -113,6 +147,19 @@ func (c Config) Validate() error {
 	}
 	if s := c.Source.ExpectedSHA256; s != "" && !sha256Pattern.MatchString(s) {
 		errs = append(errs, errors.New("source.expected_sha256 must be 64 lowercase hex characters"))
+	}
+	seen := map[string]bool{c.Source.ExpectedSHA256: c.Source.ExpectedSHA256 != ""}
+	for i, s := range c.Source.AllowedSHA256 {
+		if !sha256Pattern.MatchString(s) {
+			errs = append(errs, fmt.Errorf("source.allowed_sha256[%d] must be 64 lowercase hex characters", i))
+		}
+		if seen[s] {
+			errs = append(errs, fmt.Errorf("source.allowed_sha256[%d] repeats a pinned digest", i))
+		}
+		seen[s] = true
+	}
+	if f := c.Validation.MaxDropFraction; f != nil && !(*f >= 0 && *f < 1) {
+		errs = append(errs, errors.New("validation.max_drop_fraction must be at least 0 and below 1"))
 	}
 	// Range checks are written so that NaN fails them.
 	lon, lat := c.View.Center[0], c.View.Center[1]
