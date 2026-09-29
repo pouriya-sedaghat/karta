@@ -28,13 +28,18 @@ info:
     differently, or a base URL change, the same release gets a new style URL
     and the old one returns `404 unknown_style`; a style URL never serves
     different bytes. Clients take the style URL from the manifest (or follow
-    `/v1/releases/{release_id}/style.json`) and refetch the manifest on
-    `unknown_style`.
+    `/v1/releases/{release_id}/style.json`) and, on `unknown_style` (or
+    `unknown_release` after a release switch), refetch the manifest and load
+    the style it names, a bounded number of times.
 
-    **Compatibility.** Within `/v1`, changes are additive: new endpoints,
-    optional parameters, response fields and error codes may be added; existing
-    fields, parameters and codes are not removed or redefined. Clients must
-    ignore unknown fields. Breaking changes use a new path prefix.
+    **Compatibility.** `/v1` is not frozen until its first release; while
+    Stage 1 is a draft the contract can still change incompatibly (it did once:
+    `/v1/releases/{release_id}/style.json` changed from returning the style to
+    a `307`, see docs/api.md). From the first release on, changes within `/v1`
+    are additive: new endpoints, optional parameters, response fields and error
+    codes may be added; existing fields, parameters and codes are not removed
+    or redefined. Clients must ignore unknown fields. Breaking changes use a new
+    path prefix.
 
     **CORS.** Read-only `GET`/`HEAD` from origins listed in
     `KARTA_CORS_ALLOWED_ORIGINS` (exact origins or `*`); no credentials. Exposed
@@ -55,7 +60,10 @@ info:
     `public, max-age=300` when `release_id` is given. Errors: `no-store`.
     Cache keys are the full URL: the release id keys tiles, the style id keys
     the style bytes, so nothing needs purging when the release, the renderer or
-    `KARTA_PUBLIC_BASE_URL` changes.
+    `KARTA_PUBLIC_BASE_URL` changes. Exception: a `style.json` `200`
+    (`max-age=86400`) that a cache stored from a build before content-addressed
+    styles may be reused until it expires (docs/api.md, "Transition from builds
+    before content-addressed styles").
 
     OpenStreetMap data © OpenStreetMap contributors, available under the Open
     Database License (ODbL 1.0), https://www.openstreetmap.org/copyright.
@@ -182,6 +190,10 @@ paths:
         manifest's `style_url` for the active release). It never returns style
         bytes itself and is not cached without revalidation, so the style a
         client receives is always named by the URL it was redirected to.
+        Builds before content-addressed styles returned the style itself here
+        with `max-age=86400`; caches may reuse such a response until it
+        expires. Revalidating it (`If-None-Match`) is answered with `307`,
+        never `304`.
       parameters:
         - $ref: "#/components/parameters/ReleaseIDPath"
       responses:

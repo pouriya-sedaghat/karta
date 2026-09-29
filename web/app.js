@@ -1,5 +1,5 @@
-// Karta demo: loads the active release from the manifest, shows the
-// release-pinned style and searches the same release. Every request goes to
+// Karta demo: loads the active release from the manifest, shows its
+// content-addressed style and searches the same release. Every request goes to
 // this page's origin; the page's CSP forbids any other destination.
 import * as maplibregl from './vendor/maplibre-gl/maplibre-gl.mjs';
 
@@ -12,8 +12,8 @@ function setStatus(text) {
   status.textContent = text;
 }
 
-async function getJSON(url) {
-  const res = await fetch(url, { headers: { Accept: 'application/json' } });
+async function getJSON(url, cache = 'default') {
+  const res = await fetch(url, { headers: { Accept: 'application/json' }, cache });
   const body = await res.json();
   if (!res.ok) {
     throw new Error(body?.error?.message || `${res.status} ${res.statusText}`);
@@ -21,17 +21,50 @@ async function getJSON(url) {
   return body;
 }
 
+// Style URLs are content-addressed and change when the API is upgraded or
+// reconfigured, so a manifest fetched just before such a change can name a
+// style URL the server no longer serves (404 unknown_style, or unknown_release
+// after a release switch). Then the page refetches the manifest, bypassing the
+// HTTP cache, and loads the style it names: at most STYLE_ATTEMPTS times, so a
+// persistent error ends with a message instead of a loop.
+const STYLE_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 250;
+const STALE_STYLE_CODES = new Set(['unknown_style', 'unknown_release']);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function loadManifestAndStyle() {
+  let lastError;
+  for (let attempt = 1; attempt <= STYLE_ATTEMPTS; attempt++) {
+    const manifest = await getJSON('/v1/manifest', attempt === 1 ? 'no-cache' : 'reload');
+    const res = await fetch(manifest.style_url, { headers: { Accept: 'application/json' } });
+    const body = await res.json().catch(() => null);
+    if (res.ok && body) {
+      return { manifest, style: body };
+    }
+    lastError = new Error(body?.error?.message || `style: ${res.status} ${res.statusText}`);
+    if (res.status !== 404 || !STALE_STYLE_CODES.has(body?.error?.code)) {
+      break;
+    }
+    if (attempt < STYLE_ATTEMPTS) {
+      await sleep(RETRY_DELAY_MS * attempt);
+    }
+  }
+  throw lastError;
+}
+
 let map;
 let marker;
 let releaseId;
 
 async function start() {
-  const manifest = await getJSON('/v1/manifest');
+  const { manifest, style } = await loadManifestAndStyle();
+  // Search uses the release of the manifest whose style is shown.
   releaseId = manifest.release.release_id;
   setStatus(`Release ${releaseId} · OSM data ${manifest.release.osm_data_timestamp}`);
   map = new maplibregl.Map({
     container: 'map',
-    style: manifest.style_url,
+    style,
     center: manifest.default_view.center,
     zoom: manifest.default_view.zoom,
     hash: true,

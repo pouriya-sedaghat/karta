@@ -67,7 +67,9 @@ Every error is JSON with `Cache-Control: no-store`:
 | errors | `no-store` | — |
 
 URLs are the cache keys, and an immutable URL never names different bytes,
-so no cache ever needs purging:
+so a new release, API build or `KARTA_PUBLIC_BASE_URL` needs no cache purge.
+The one exception is the transition from builds before content-addressed
+styles ([below](#transition-from-builds-before-content-addressed-styles)).
 
 * **Tiles** are keyed by the release id, which covers every input that
   shapes the release's data (snapshot and provenance digests, data
@@ -82,9 +84,12 @@ so no cache ever needs purging:
   its id and tile URLs but gets a new style URL, the manifest (always
   revalidated) issues it, and the old style URL returns `404 unknown_style`
   instead of different bytes. Existing release databases need no migration:
-  the running API renders them and names its own output. On
-  `unknown_style`, refetch the manifest (or follow
-  `/v1/releases/{release_id}/style.json`).
+  the running API renders them and names its own output. A client that
+  fetched the manifest just before such a change can get `404
+  unknown_style` (or `404 unknown_release` after a release switch) for the
+  style URL it holds: refetch the manifest and load the style it names, a
+  bounded number of times. The demo does this (three attempts,
+  `web/app.js`).
 * Glyph ranges, `openapi.yaml` and the vendored demo files are not
   immutable: after an API upgrade that changes them, a client may keep the
   previous bytes for up to 24 hours before revalidating against the new
@@ -96,6 +101,34 @@ API does not yet check that the serving PostgreSQL/PostGIS/GEOS/PROJ match
 it, so upgrade the database image only together with a reset and re-import
 (see `docs/runbook.md`).
 
+### Transition from builds before content-addressed styles
+
+Builds before `eab072b` answered `GET /v1/releases/{release_id}/style.json`
+with the style itself, `Cache-Control: public, max-age=86400` and a content
+ETag. A browser, proxy or CDN that stored such a response may keep using it,
+without contacting the server, until 24 hours after it fetched it. The
+server cannot clear those copies: the `no-cache` `307` only applies to
+requests that reach it. When a copy expires, the cache revalidates, gets the
+`307` (never a `304`, which would renew the old bytes) and loads the
+content-addressed URL. Manifest-issued style URLs are not affected.
+
+While old copies may still be in use:
+
+* They name the tile and glyph URLs of the style as rendered then. The tile
+  URLs keep working as long as the same release is served, so keep the
+  release active (no reset or re-import) for 24 hours after upgrading from
+  such a build. Otherwise clients that use `style.json` directly get
+  `404 unknown_release` for tiles until their copy expires.
+* Purge `/v1/releases/*/style.json` in any reverse proxy or CDN you operate.
+  That shortens the window only for clients behind it, never for browser
+  caches.
+
+Deployed consumers: none are known. As of 2026-09-29 the Stage 1 code is not
+on `main` and has no tags, releases or published images (CI builds images
+only for its own test run), so builds before `eab072b` have run only in CI
+and development sandboxes. An operator who ran such a build elsewhere should
+follow the steps above.
+
 ## CORS
 
 Off by default. `KARTA_CORS_ALLOWED_ORIGINS=https://app.example,https://ops.example`
@@ -105,8 +138,13 @@ credentials. Responses carry `Vary: Origin`.
 
 ## Compatibility
 
-Within `/v1` changes are additive only: new endpoints, optional parameters,
-response fields and error codes may appear; nothing existing is removed or
-redefined. Clients must ignore unknown fields. Tile layers and fields follow
+`/v1` is not frozen until its first release: while Stage 1 is a draft its
+contract can still change incompatibly. It did once: `eab072b` turned
+`GET /v1/releases/{release_id}/style.json` from a `200` style (cacheable for a
+day) into a `307` to the content-addressed style URL (see
+[the transition](#transition-from-builds-before-content-addressed-styles)).
+From the first release on, changes within `/v1` are additive only: new
+endpoints, optional parameters, response fields and error codes may appear;
+nothing existing is removed or redefined. Clients must ignore unknown fields. Tile layers and fields follow
 the schema major version (`schema_revision` in the manifest); removing or
 renaming a layer or field requires a new major version and an ADR.

@@ -36,7 +36,7 @@ These observations validate the **raw development input**, not the Stage 1 impor
 * Geometry: no polygon needed repair; osm2pgsql could not build 34 relations (incomplete boundaries) and 12 relations are route/stop-area types; all 46 are listed in `karta.import_skipped`. Clipping cut 280 roads, 107 landcover areas, 69 buildings, 48 features, 5 waterways and 3 water areas at the box edge, and dropped 3 features outside it.
 * Search: `دریاچه چیتگر` and `Chitgar Lake` (with and without `lang=en`) both return way `1259635603` first (exact match on `name` / `name:en`) and relation `8128152` (“دریاچه شهدای خلیج فارس”, which carries the same strings as `alt_name`/`alt_name:en`) second. The lake's water polygon is relation `8128152`.
 * Tiles: z14 `14/10522/6448` over the lake is 15,978 bytes with water 3, landcover 13, buildings 29, roads 166, places 2, pois 5; z15 `15/21044/12898` (freeway and Chitgar forest park) 9,561 bytes; z12 overview 45,834 bytes. The browser test renders the lake, park/road, overview and Iran Mall views with Persian labels placed and saves screenshots.
-* Cost: import 3.4–4.1 s end to end (5.3 s including container start) (osm2pgsql 0.6–0.8 s, post-import SQL 2.3–2.6 s); osm2pgsql peak RSS 36 MB; PostgreSQL container peak about 139 MiB during import; release database 34 MB (PostgreSQL data directory 132 MB including template and registry).
+* Cost: import 3.1–4.1 s end to end (5.3 s including container start) (osm2pgsql 0.5–0.8 s, post-import SQL 2.1–2.6 s); osm2pgsql peak RSS 36 MB; PostgreSQL container peak about 139 MiB during import; release database 34 MB (PostgreSQL data directory 132 MB including template and registry).
 
 ## Obtain and extract
 

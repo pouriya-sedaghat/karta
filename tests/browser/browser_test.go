@@ -88,29 +88,15 @@ type recorder struct {
 	exception []string
 }
 
-func TestDemoRendersOffline(t *testing.T) {
+// startBrowser launches headless Chromium whose only network is the Karta
+// host and returns a tab context, the Karta base URL and its parsed form.
+func startBrowser(t *testing.T) (context.Context, string, *url.URL) {
+	t.Helper()
 	base := strings.TrimRight(env("KARTA_TEST_BASE_URL", "http://localhost:8080"), "/")
 	bu, err := url.Parse(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	views := defaultViews
-	if v := os.Getenv("KARTA_TEST_VIEWS"); v != "" {
-		if err := json.Unmarshal([]byte(v), &views); err != nil {
-			t.Fatalf("KARTA_TEST_VIEWS: %v", err)
-		}
-	}
-	sc := defaultSearch
-	if v := os.Getenv("KARTA_TEST_SEARCH"); v != "" {
-		if err := json.Unmarshal([]byte(v), &sc); err != nil {
-			t.Fatalf("KARTA_TEST_SEARCH: %v", err)
-		}
-	}
-	artifacts := env("KARTA_TEST_ARTIFACTS", "artifacts/browser")
-	if err := os.MkdirAll(artifacts, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", "new"),
 		chromedp.Flag("use-angle", "swiftshader"),
@@ -139,12 +125,39 @@ func TestDemoRendersOffline(t *testing.T) {
 		opts = append(opts, chromedp.ExecPath(chrome))
 	}
 	waitForQuietHostNetwork(t, 2*time.Second, 30*time.Second)
-	actx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancel()
-	ctx, cancel := chromedp.NewContext(actx)
-	defer cancel()
-	ctx, cancel = context.WithTimeout(ctx, 4*time.Minute)
-	defer cancel()
+	actx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
+	ctx, cancelTab := chromedp.NewContext(actx)
+	ctx, cancelTimeout := context.WithTimeout(ctx, 4*time.Minute)
+	t.Cleanup(func() { cancelTimeout(); cancelTab(); cancelAlloc() })
+	return ctx, base, bu
+}
+
+// testSearch is the demo search to run (KARTA_TEST_SEARCH or the fixture's).
+func testSearch(t *testing.T) searchCheck {
+	t.Helper()
+	sc := defaultSearch
+	if v := os.Getenv("KARTA_TEST_SEARCH"); v != "" {
+		if err := json.Unmarshal([]byte(v), &sc); err != nil {
+			t.Fatalf("KARTA_TEST_SEARCH: %v", err)
+		}
+	}
+	return sc
+}
+
+func TestDemoRendersOffline(t *testing.T) {
+	views := defaultViews
+	if v := os.Getenv("KARTA_TEST_VIEWS"); v != "" {
+		if err := json.Unmarshal([]byte(v), &views); err != nil {
+			t.Fatalf("KARTA_TEST_VIEWS: %v", err)
+		}
+	}
+	sc := testSearch(t)
+	artifacts := env("KARTA_TEST_ARTIFACTS", "artifacts/browser")
+	if err := os.MkdirAll(artifacts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, base, bu := startBrowser(t)
 
 	rec := &recorder{statuses: map[string]int64{}}
 	chromedp.ListenTarget(ctx, func(ev any) {

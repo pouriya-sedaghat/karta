@@ -97,6 +97,12 @@ gives a new release id; changing only its acceptance thresholds does not.
   purge and no re-import: existing releases keep their ids and tile URLs, the
   style gets a new content-addressed URL (the manifest issues it), and style
   URLs issued before return `404 unknown_style` rather than different bytes.
+  One exception applies only when upgrading from a build before `eab072b`
+  (none is known to be deployed): caches may keep that build's `style.json`
+  responses for up to 24 hours. Purge `/v1/releases/*/style.json` in proxies
+  or CDNs you operate, and keep the same release active for 24 hours before a
+  reset or re-import (`docs/api.md`, "Transition from builds before
+  content-addressed styles").
 * Upgrading the database image (PostgreSQL/PostGIS) is different: tiles are
   generated on the serving database, and the API does not yet compare its
   versions with the toolchain a release was built with. Upgrade it only

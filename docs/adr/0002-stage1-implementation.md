@@ -80,7 +80,13 @@ always-revalidated manifest issues the current one.
 0001, remains as a `no-cache` redirect to it and never returns style bytes.
 This holds for every cause of a byte change, needs no migration of existing
 (read-only) release databases, and removes the earlier "purge cached styles
-after changing `KARTA_PUBLIC_BASE_URL`" exception. Rejected alternatives:
+after changing `KARTA_PUBLIC_BASE_URL`" exception. It cannot reach responses
+already cached from earlier builds, which served `style.json` itself as a
+`200` with `max-age=86400`: after upgrading from such a build (none is known
+to be deployed), those may be reused for up to a day, so the runbook keeps the
+release unchanged for that day. A client holding a manifest from before an
+upgrade can get `404 unknown_style` for its style URL and refetches the
+manifest; the demo does so a bounded number of times. Rejected alternatives:
 storing rendered output in the release (it embeds the base URL, and existing
 databases would need migrating or re-importing), and a renderer version in the
 release id with incompatible releases refused (every renderer change would
