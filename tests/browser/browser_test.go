@@ -39,6 +39,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
@@ -111,6 +112,12 @@ func startBrowser(t *testing.T) (context.Context, string, *url.URL) {
 		chromedp.ProxyServer("http://127.0.0.1:9"),
 		chromedp.Flag("proxy-bypass-list", "<-loopback>;"+bu.Hostname()),
 		chromedp.WindowSize(1280, 900),
+		// chromedp gives Chromium 20 s to print its DevTools address by
+		// default. On shared CI runners the first start has taken about that
+		// long (run 36536186101: "websocket url timeout reached", and the next
+		// start took ~20 s too), which is the runner, not the map. A browser
+		// that never starts still fails the test.
+		chromedp.WSURLReadTimeout(2*time.Minute),
 	)
 	if resolve := os.Getenv("KARTA_TEST_RESOLVE"); resolve != "" {
 		host, ip, ok := strings.Cut(resolve, "=")
@@ -133,6 +140,18 @@ func startBrowser(t *testing.T) (context.Context, string, *url.URL) {
 	ctx, cancelTab := chromedp.NewContext(actx)
 	ctx, cancelTimeout := context.WithTimeout(ctx, 4*time.Minute)
 	t.Cleanup(func() { cancelTimeout(); cancelTab(); cancelAlloc() })
+	// Start the browser now, so its start-up time is reported on its own
+	// rather than hidden in the first page load.
+	started := time.Now()
+	var product string
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(c context.Context) error {
+		_, p, _, _, _, err := browser.GetVersion().Do(c)
+		product = p
+		return err
+	})); err != nil {
+		t.Fatalf("start Chromium: %v", err)
+	}
+	t.Logf("%s started in %.1fs", product, time.Since(started).Seconds())
 	return ctx, base, bu
 }
 
