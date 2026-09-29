@@ -102,6 +102,13 @@ func (p *pathProxy) logged() int {
 
 var prefixProxy *pathProxy
 
+// withoutFragment drops the #zoom/lat/lon the demo keeps in its URL (the
+// map's hash option), which may already be set when the location is read.
+func withoutFragment(u string) string {
+	u, _, _ = strings.Cut(u, "#")
+	return u
+}
+
 func TestMain(m *testing.M) {
 	upstream := os.Getenv("KARTA_TEST_PREFIX_UPSTREAM")
 	if upstream == "" {
@@ -195,7 +202,7 @@ func TestDemoBehindPathPrefix(t *testing.T) {
 		_ = chromedp.Run(ctx, chromedp.Text("#status", &status, chromedp.ByID))
 		t.Fatalf("demo at %s/ did not load: %v; location %s; status %q", base, err, loc, status)
 	}
-	if loc != demo {
+	if withoutFragment(loc) != demo {
 		t.Errorf("%s/ led to %s, want %s", base, loc, demo)
 	}
 
@@ -219,7 +226,7 @@ func TestDemoBehindPathPrefix(t *testing.T) {
 	if err := chromedp.Run(bctx, chromedp.Navigate(base+"/demo"), chromedp.Location(&loc)); err != nil {
 		t.Fatal(err)
 	}
-	if loc != demo {
+	if withoutFragment(loc) != demo {
 		t.Errorf("%s/demo led to %s, want %s", base, loc, demo)
 	}
 
