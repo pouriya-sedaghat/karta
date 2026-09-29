@@ -140,19 +140,28 @@ func startBrowser(t *testing.T) (context.Context, string, *url.URL) {
 	ctx, cancelTab := chromedp.NewContext(actx)
 	ctx, cancelTimeout := context.WithTimeout(ctx, 4*time.Minute)
 	t.Cleanup(func() { cancelTimeout(); cancelTab(); cancelAlloc() })
-	// Start the browser now, so its start-up time is reported on its own
-	// rather than hidden in the first page load.
-	started := time.Now()
-	var product string
-	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(c context.Context) error {
-		_, p, _, _, _, err := browser.GetVersion().Do(c)
-		product = p
-		return err
-	})); err != nil {
-		t.Fatalf("start Chromium: %v", err)
-	}
-	t.Logf("%s started in %.1fs", product, time.Since(started).Seconds())
+	// The browser starts lazily, on the first chromedp.Run of ctx or of a
+	// child context, so each test's page is the browser's only tab. Starting
+	// it here kept an extra tab in front, and on the CI runner's Chrome 153 the
+	// recovery test's maps in tabs behind it never became idle (run
+	// 36536765536).
 	return ctx, base, bu
+}
+
+// logStarted logs the browser version and how long the first chromedp.Run,
+// which starts the browser, took.
+func logStarted(t *testing.T, ctx context.Context, since time.Time) {
+	t.Helper()
+	elapsed := time.Since(since)
+	product := "Chromium"
+	_ = chromedp.Run(ctx, chromedp.ActionFunc(func(c context.Context) error {
+		_, p, _, _, _, err := browser.GetVersion().Do(c)
+		if err == nil {
+			product = p
+		}
+		return err
+	}))
+	t.Logf("%s started and attached in %.1fs", product, elapsed.Seconds())
 }
 
 // testSearch is the demo search to run (KARTA_TEST_SEARCH or the fixture's).
@@ -205,9 +214,11 @@ func TestDemoRendersOffline(t *testing.T) {
 			rec.exception = append(rec.exception, e.ExceptionDetails.Error())
 		}
 	})
+	started := time.Now()
 	if err := chromedp.Run(ctx, network.Enable(), runtime.Enable()); err != nil {
 		t.Fatal(err)
 	}
+	logStarted(t, ctx, started)
 
 	for i, v := range views {
 		t.Run(v.Name, func(t *testing.T) {

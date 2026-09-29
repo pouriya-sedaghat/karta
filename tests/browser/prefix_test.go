@@ -179,9 +179,11 @@ func TestDemoBehindPathPrefix(t *testing.T) {
 			}
 		}
 	})
+	started := time.Now()
 	if err := chromedp.Run(ctx, network.Enable()); err != nil {
 		t.Fatal(err)
 	}
+	logStarted(t, ctx, started)
 
 	start := prefixProxy.logged()
 	demo := base + "/demo/"

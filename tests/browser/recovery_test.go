@@ -103,7 +103,12 @@ func openDemo(t *testing.T, browser context.Context, base string, swap *manifest
 			go swap.answer(tab, e)
 		}
 	})
-	err := chromedp.Run(tab, network.Enable(), runtime.Enable(), network.SetCacheDisabled(true),
+	started := time.Now()
+	if err := chromedp.Run(tab, network.Enable()); err != nil {
+		t.Fatal(err)
+	}
+	logStarted(t, tab, started)
+	err := chromedp.Run(tab, runtime.Enable(), network.SetCacheDisabled(true),
 		fetch.Enable().WithPatterns([]*fetch.RequestPattern{{URLPattern: "*/v1/manifest*", RequestStage: fetch.RequestStageResponse}}),
 		chromedp.Navigate(base+"/demo/"))
 	if err != nil {
