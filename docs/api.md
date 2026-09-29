@@ -138,10 +138,10 @@ While old copies may still be in use:
 
 Deployed consumers: no external deployment is known. As of 2026-09-29 the
 Stage 1 code is not on `main`, and GitHub has no tags, releases or published
-images; CI builds images only for its own test run. That can't rule out a
-build from this branch running elsewhere, and the repository owner has been
-asked to confirm there is none. Until that is confirmed, anyone upgrading such
-a build should follow the steps above.
+images; CI builds images only for its own test run. The owner confirms they
+did not deploy a build before `eab072b` outside CI. This does not rule out a
+deployment by someone else; anyone upgrading such a build should follow the
+steps above.
 
 ## CORS
 
