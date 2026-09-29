@@ -82,9 +82,11 @@ This holds for every cause of a byte change, needs no migration of existing
 (read-only) release databases, and removes the earlier "purge cached styles
 after changing `KARTA_PUBLIC_BASE_URL`" exception. It cannot reach responses
 already cached from earlier builds, which served `style.json` itself as a
-`200` with `max-age=86400`: after upgrading from such a build (none is known
-to be deployed), those may be reused for up to a day, so the runbook keeps the
-release unchanged for that day. A client holding a manifest from before an
+`200` with `max-age=86400`. After upgrading from such a build (no external
+deployment is known, but none can be ruled out), those may be reused for up to
+a day. They embed absolute tile and glyph URLs under the old
+`KARTA_PUBLIC_BASE_URL`, so the runbook keeps the release unchanged and the
+old base URL serving for that day. A client holding a manifest from before an
 upgrade can get `404 unknown_style` for its style URL and refetches the
 manifest; the demo does so a bounded number of times. Rejected alternatives:
 storing rendered output in the release (it embeds the base URL, and existing

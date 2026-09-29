@@ -98,11 +98,18 @@ gives a new release id; changing only its acceptance thresholds does not.
   style gets a new content-addressed URL (the manifest issues it), and style
   URLs issued before return `404 unknown_style` rather than different bytes.
   One exception applies only when upgrading from a build before `eab072b`
-  (none is known to be deployed): caches may keep that build's `style.json`
-  responses for up to 24 hours. Purge `/v1/releases/*/style.json` in proxies
-  or CDNs you operate, and keep the same release active for 24 hours before a
-  reset or re-import (`docs/api.md`, "Transition from builds before
-  content-addressed styles").
+  (no external deployment is known, but none can be ruled out). Caches may
+  keep that build's `style.json` responses for up to 24 hours, and those
+  responses embed absolute tile and glyph URLs under the old
+  `KARTA_PUBLIC_BASE_URL`. For those 24 hours:
+  * keep the same release active, with no reset or re-import;
+  * if the base URL changes, keep the old one reachable and serving tiles and
+    glyphs as before, for example by routing it to the upgraded API;
+  * purge `/v1/releases/*/style.json` in proxies or CDNs you operate.
+
+  If the old base URL can't be kept, browser-cached copies fail to load tiles
+  and glyphs until they expire. Purging a CDN does not clear browser caches.
+  See `docs/api.md`, "Transition from builds before content-addressed styles".
 * Upgrading the database image (PostgreSQL/PostGIS) is different: tiles are
   generated on the serving database, and the API does not yet compare its
   versions with the toolchain a release was built with. Upgrade it only

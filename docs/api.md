@@ -114,20 +114,34 @@ content-addressed URL. Manifest-issued style URLs are not affected.
 
 While old copies may still be in use:
 
-* They name the tile and glyph URLs of the style as rendered then. The tile
-  URLs keep working as long as the same release is served, so keep the
-  release active (no reset or re-import) for 24 hours after upgrading from
-  such a build. Otherwise clients that use `style.json` directly get
-  `404 unknown_release` for tiles until their copy expires.
-* Purge `/v1/releases/*/style.json` in any reverse proxy or CDN you operate.
-  That shortens the window only for clients behind it, never for browser
-  caches.
+* They embed absolute tile and glyph URLs under the `KARTA_PUBLIC_BASE_URL`
+  the old build ran with. For 24 hours after the upgrade, both must keep
+  serving what those URLs named:
+  * **The same release.** Keep it active (no reset or re-import). Otherwise
+    clients that use `style.json` directly get `404 unknown_release` for tiles
+    until their copy expires.
+  * **The old base URL.** If the upgrade also changes `KARTA_PUBLIC_BASE_URL`
+    (scheme, host, port or path prefix), keep the old one reachable and
+    serving `/v1/releases/{release_id}/tiles/…` and `/v1/fonts/…` as before,
+    including its CORS origins. Routing it to the upgraded API (stripping any
+    path prefix, as before) is enough, because the API matches requests by
+    path, not by host.
 
-Deployed consumers: none are known. As of 2026-09-29 the Stage 1 code is not
-on `main` and has no tags, releases or published images (CI builds images
-only for its own test run), so builds before `eab072b` have run only in CI
-and development sandboxes. An operator who ran such a build elsewhere should
-follow the steps above.
+  If the old base URL can't be kept available, copies that browsers cached
+  still request tiles and glyphs there. Those requests fail, and the map
+  stays blank or unlabelled, until the copy expires, up to 24 hours after it
+  was fetched.
+* Purge `/v1/releases/*/style.json` in any reverse proxy or CDN you operate.
+  That shortens the window only for clients behind it. It does not clear
+  browser caches, and it doesn't help clients whose copy names an old base
+  URL that is gone.
+
+Deployed consumers: no external deployment is known. As of 2026-09-29 the
+Stage 1 code is not on `main`, and GitHub has no tags, releases or published
+images; CI builds images only for its own test run. That can't rule out a
+build from this branch running elsewhere, and the repository owner has been
+asked to confirm there is none. Until that is confirmed, anyone upgrading such
+a build should follow the steps above.
 
 ## CORS
 
