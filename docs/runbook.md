@@ -104,10 +104,10 @@ them when their outcome is recorded.
 | Submission state | Meaning |
 | --- | --- |
 | `published` | built, validated and activated |
-| `ready` | built and validated, not activated: `manual_activation`, or `active_changed` (an operator switched releases during the build) |
+| `ready` | built and validated, not activated: `manual_activation`, `active_changed` (an operator switched releases during the build), or `excessive_data_loss` (a resubmitted ready release would lose too much data relative to the release active now) |
 | `duplicate` | `duplicate_active` (already active: nothing to do) or `duplicate_retained` (exists as a retained release: roll back or activate it instead) |
 | `rejected` | the input failed a check; nothing was built |
-| `failed` | the build or validation failed; the candidate was dropped |
+| `failed` | the build or validation failed (the candidate was dropped), or the active release's row counts could not be read (`counts_unavailable`: nothing was built) |
 | `interrupted` | the process or database stopped during it; retried automatically up to `KARTA_PUBLISH_MAX_ATTEMPTS` (3) times |
 
 | Reason code | Cause |
@@ -123,6 +123,8 @@ them when their outcome is recorded.
 | `older_than_active`, `not_newer`, `region_changed` | the rules below |
 | `insufficient_storage` | not enough space for staging, the storage budget or the database volume, or the disk filled during the build |
 | `validation_failed`, `build_failed` | the candidate failed a region check (counts, relative drop, tiles, searches) or osm2pgsql/SQL failed |
+| `counts_unavailable` | `validation.max_drop_fraction` is set and the active release of the region has no readable row counts (not in the registry, and not decodable from the import report in its database, as for a damaged Stage 1 release); the relative gate is never skipped, so nothing is built. Check the active release's database, or roll back to a release with counts, then touch the marker |
+| `excessive_data_loss` | activating the release would drop more rows than `validation.max_drop_fraction` allows relative to the release active at the switch |
 
 ### Rules
 
@@ -135,6 +137,17 @@ them when their outcome is recorded.
   build; going back is a rollback.
 * **Duplicates never switch.** A snapshot whose release is active is a no-op;
   one whose release is retired is refused (roll back to it explicitly).
+* **No silent data loss.** With `validation.max_drop_fraction`, a new
+  release must keep at least `1 - fraction` of every counted table's rows of
+  the active release of the same region. It is checked when the candidate
+  is validated and again, inside the pointer transaction, against the
+  release active at the moment of every forward switch (publication or
+  `activate`): a release kept `ready` while someone rolled back to a
+  release with more data is refused (`excessive_data_loss`). If the active
+  release's counts cannot be read, the publication or activation is refused
+  (`counts_unavailable`), never let through. Rollback has its own policy and
+  no count gate. If a large drop is intended, raise `max_drop_fraction` in
+  the region file through a reviewed change.
 * **One at a time, in name order.** Builds are serialized; with several
   ready submissions the newest valid one ends up active regardless of order.
 * **Region changes are explicit**: `make import-tehran IMPORT_FLAGS=--allow-region-change`,
@@ -182,7 +195,7 @@ make op-status                                           # status (monitor or op
 make op CMD='audit --limit 50'                           # newest audit records
 make op CMD='rollback --reason "B has broken labels"'    # to the most recently replaced release
 make op CMD='rollback --release rXXXX --reason "..."'    # to a specific retained release
-make op CMD='activate --release rXXXX --reason "..."'    # a ready release (forward only)
+make op CMD='activate --release rXXXX --reason "..."'    # a ready release (forward only, row counts re-checked)
 make op CMD='cleanup --dry-run --reason "check"'         # what cleanup would remove
 make op CMD='cleanup --reason "free space"'
 # the same over HTTP from the host:
@@ -245,6 +258,12 @@ drain). It never removes a release while any database session uses it. It
 runs after every publication, every `KARTA_CLEANUP_INTERVAL` (15 min) and on
 request (`make op CMD='cleanup --reason ...'`, with `--dry-run` to preview).
 Removed releases keep their registry row (`removed`) and their audit trail.
+An operator's cleanup is audited with its actual result: `succeeded` (it
+removed releases), `noop` (a dry run, whose record lists `would_remove`, or
+nothing to remove) or `failed` (it ended with an error: `503`, the record's
+`error` and the releases it had already `removed`). Rerun it after fixing
+the cause; a release left `removing` is finished by the next cleanup or at
+start.
 
 ## Recovery after interruption
 

@@ -96,7 +96,19 @@ snapshot ends up active whatever the order.
 A relative gate complements the absolute `min_counts`: with
 `validation.max_drop_fraction`, every counted table must keep at least
 `1 - fraction` of the active release's rows (0.5 for the fixture, 0.3 for
-Chitgar). Like other thresholds it is not part of the release id.
+Chitgar). Like other thresholds it is not part of the release id. The gate
+fails closed: the active release's counts come from the registry or, for a
+Stage 1 release, from the import report in its database; if neither can be
+read or decoded the publication fails (`counts_unavailable`) before any
+build. A release validated against one active release may be activated
+later, after the pointer moved (an import that finished after a rollback, a
+manual-activation build, a resubmitted ready release). So every forward
+switch, publication or operator `activate`, applies the gate again inside
+the pointer transaction against the release active there, after the
+compare-and-swap check: a switch that would lose too much data relative to
+that release is refused (`excessive_data_loss`), and counts that cannot be
+read refuse it too. Rollback stays an explicit operation with its own
+policy (region and compatibility, no count gate).
 
 ### One pointer transaction, compare-and-swap, no import lock
 
@@ -135,7 +147,10 @@ lock (so no rollback can pick it), drops the database without `FORCE` (the
 drop fails if a session appears), then marks it `removed`. It runs after each
 publication, every `KARTA_CLEANUP_INTERVAL`, and on operator request (with a
 dry run). Every removal is audited; an operator's cleanup request is also
-audited as a whole, including a dry run or one that removes nothing.
+audited as a whole with its actual result: `failed` when it ends with an
+error (with the error and what it removed before), `noop` for a dry run
+(with what it would remove) or when nothing was removed, `succeeded`
+otherwise.
 
 ### Recovery
 

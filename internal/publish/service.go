@@ -29,7 +29,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -115,6 +114,8 @@ type Service struct {
 	job     *JobStatus
 	scan    ScanStatus
 	now     func() time.Time
+	// readCounts reads a release database's stored counts (a test seam).
+	readCounts reportCountsReader
 }
 
 // JobStatus describes the publication in progress.
@@ -158,7 +159,9 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 		pool.Close()
 		return nil, fmt.Errorf("migrate registry: %w", err)
 	}
-	return &Service{cfg: cfg, log: log, reg: pool, settler: inbox.NewSettler(), now: time.Now}, nil
+	s := &Service{cfg: cfg, log: log, reg: pool, settler: inbox.NewSettler(), now: time.Now}
+	s.readCounts = s.readReportCounts
+	return s, nil
 }
 
 // Close releases the registry pool.
@@ -288,9 +291,18 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 	}
 	if active != nil {
 		expected = active.ID
-		if active.RegionID == cfg.ID {
-			opts.ActiveID = active.ID
-			opts.ActiveCounts = s.activeCounts(ctx, active)
+		// The relative row-count gate needs the active release's counts;
+		// if they cannot be read the publication fails before any build.
+		if active.RegionID == cfg.ID && cfg.Validation.MaxDropFraction != nil {
+			counts, err := releaseCounts(ctx, active, s.readCounts)
+			if err != nil {
+				if transient(err) {
+					return fail(registry.SubInterrupted, CodeInterrupted, err)
+				}
+				return fail(registry.SubFailed, CodeCountsUnavailable,
+					fmt.Errorf("the relative row-count check (validation.max_drop_fraction) needs the active release's counts: %w", err))
+			}
+			opts.ActiveID, opts.ActiveCounts = active.ID, counts
 		}
 	}
 	s.phase("building", "")
@@ -338,7 +350,12 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		Actor: req.principal.Name, Source: req.principal.Source, Reason: req.reason, RequestID: req.principal.RequestID,
 		PinGrace: s.cfg.PinGrace,
 		Allow: func(a, t *registry.Release) error {
-			return Forward(a, Candidate{RegionID: t.RegionID, SHA256: t.SourceSHA256, DataTimestamp: ts}, req.allowRegionChange)
+			if err := Forward(a, Candidate{RegionID: t.RegionID, SHA256: t.SourceSHA256, DataTimestamp: ts}, req.allowRegionChange); err != nil {
+				return err
+			}
+			// A resumed ready release was validated against the release
+			// active at its build, which may not be this one.
+			return s.countGate(ctx, cfg, nil, a, t)
 		},
 		BeforeCommit: func() { failpoint.Hit("activate.before_commit") },
 	}, s.cfg.PointerLockTimeout)
@@ -381,28 +398,6 @@ func transient(err error) bool {
 		}
 	}
 	return false
-}
-
-// activeCounts are the active release's row counts: from the registry, or
-// for a Stage 1 release from the report stored in its database.
-func (s *Service) activeCounts(ctx context.Context, active *registry.Release) map[string]int64 {
-	if len(active.Counts) > 0 {
-		return active.Counts
-	}
-	conn, err := s.cfg.Build.DB.Connect(ctx, active.Database)
-	if err != nil {
-		s.log.Warn("could not read the active release's counts; relative checks skipped", "err", err)
-		return nil
-	}
-	defer conn.Close(context.Background())
-	var b []byte
-	if err := conn.QueryRow(ctx, `SELECT report->'counts' FROM karta.release_info`).Scan(&b); err != nil {
-		s.log.Warn("could not read the active release's counts; relative checks skipped", "err", err)
-		return nil
-	}
-	var counts map[string]int64
-	_ = json.Unmarshal(b, &counts)
-	return counts
 }
 
 // candidateOverhead is added to the size estimate for the PostGIS template
@@ -813,14 +808,19 @@ func (s *Service) checkCompatible(ctx context.Context, r *registry.Release) erro
 }
 
 // Activate makes a ready or retired release active on an operator's
-// request, subject to the forward rule (use Rollback to go back).
+// request, subject to the forward rule (use Rollback to go back) and to the
+// relative row-count gate against the release active at the switch.
 func (s *Service) Activate(ctx context.Context, p Principal, a ActionRequest) (registry.ActivateResult, error) {
+	cfg, cfgErr := region.Load(s.cfg.RegionPath)
 	return s.switchTo(ctx, p, "activate", a, func(active, target *registry.Release) error {
 		ts := time.Time{}
 		if target.DataTimestamp != nil {
 			ts = *target.DataTimestamp
 		}
-		return Forward(active, Candidate{RegionID: target.RegionID, SHA256: target.SourceSHA256, DataTimestamp: ts}, a.AllowRegionChange)
+		if err := Forward(active, Candidate{RegionID: target.RegionID, SHA256: target.SourceSHA256, DataTimestamp: ts}, a.AllowRegionChange); err != nil {
+			return err
+		}
+		return s.countGate(ctx, cfg, cfgErr, active, target)
 	})
 }
 
@@ -926,8 +926,14 @@ type Skipped struct {
 // Cleanup removes releases beyond the retention policy. A release is never
 // removed while it is active, inside its pin grace (plus margin), or while
 // any session is connected to its database (the drop itself fails then).
-func (s *Service) Cleanup(ctx context.Context, p Principal, reason string, dryRun bool) (CleanupResult, error) {
-	res := CleanupResult{DryRun: dryRun, Removed: []string{}, Skipped: []Skipped{}}
+func (s *Service) Cleanup(ctx context.Context, p Principal, reason string, dryRun bool) (res CleanupResult, err error) {
+	res = CleanupResult{DryRun: dryRun, Removed: []string{}, Skipped: []Skipped{}}
+	// An operator's cleanup request is audited as a whole with its actual
+	// result, including a failure at any point (each removal is audited
+	// too); automatic cleanups only audit what they remove.
+	if p.Source == "operator_api" {
+		defer func() { s.auditCleanup(ctx, p, reason, res, err) }()
+	}
 	rels, err := registry.List(ctx, s.reg, 1000)
 	if err != nil {
 		return res, err
@@ -941,20 +947,6 @@ func (s *Service) Cleanup(ctx context.Context, p Principal, reason string, dryRu
 		activeID = active.ID
 	}
 	res.Decisions = Retention{Keep: s.cfg.RetainReleases, Margin: s.cfg.CleanupMargin}.Select(rels, activeID, s.now())
-	// An operator's cleanup request is audited as a whole (each removal is
-	// audited too); automatic cleanups only audit what they remove.
-	if p.Source == "operator_api" {
-		defer func() {
-			outcome := registry.OutcomeSucceeded
-			if dryRun || len(res.Removed) == 0 {
-				outcome = registry.OutcomeNoop
-			}
-			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-			defer cancel()
-			_ = registry.Audit(cctx, s.reg, registry.AuditEntry{Actor: p.Name, Source: p.Source, Action: "cleanup", Outcome: outcome,
-				Reason: reason, RequestID: p.RequestID, Detail: map[string]any{"dry_run": dryRun, "removed": res.Removed, "skipped": res.Skipped}})
-		}()
-	}
 	if dryRun {
 		return res, nil
 	}
@@ -1005,6 +997,43 @@ func (s *Service) Cleanup(ctx context.Context, p Principal, reason string, dryRu
 		s.log.Info("release removed", "release_id", r.ID, "database", r.Database, "reason", reason)
 	}
 	return res, nil
+}
+
+// cleanupOutcome is the audit outcome of an operator cleanup: failed when it
+// returned an error, whatever it removed before; noop for a dry run or when
+// nothing was removed; succeeded otherwise.
+func cleanupOutcome(dryRun bool, removed int, err error) string {
+	switch {
+	case err != nil:
+		return registry.OutcomeFailed
+	case dryRun || removed == 0:
+		return registry.OutcomeNoop
+	}
+	return registry.OutcomeSucceeded
+}
+
+// auditCleanup records an operator cleanup and its result: what it removed
+// and skipped, what a dry run would remove, and the error that ended it.
+func (s *Service) auditCleanup(ctx context.Context, p Principal, reason string, res CleanupResult, err error) {
+	detail := map[string]any{"dry_run": res.DryRun, "removed": res.Removed, "skipped": res.Skipped}
+	if res.DryRun {
+		would := []string{}
+		for _, d := range res.Decisions {
+			if d.Action == "remove" {
+				would = append(would, d.ReleaseID)
+			}
+		}
+		detail["would_remove"] = would
+	}
+	if err != nil {
+		detail["error"] = err.Error()
+	}
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if aerr := registry.Audit(cctx, s.reg, registry.AuditEntry{Actor: p.Name, Source: p.Source, Action: "cleanup",
+		Outcome: cleanupOutcome(res.DryRun, len(res.Removed), err), Reason: reason, RequestID: p.RequestID, Detail: detail}); aerr != nil {
+		s.log.Error("could not write audit record", "err", aerr)
+	}
 }
 
 var releaseDBPattern = regexp.MustCompile(`^karta_r[0-9a-f]{24}$`)

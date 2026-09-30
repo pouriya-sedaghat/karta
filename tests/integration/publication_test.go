@@ -1183,6 +1183,18 @@ func TestPublication(t *testing.T) {
 		if len(dry.Removed) != 0 || len(databases(t)) != len(dbsBefore) {
 			t.Fatal("dry run removed releases")
 		}
+		// It is audited as what it did: nothing (noop), listing what a real
+		// cleanup would remove, with no error.
+		var wouldRemove []any
+		for _, d := range dry.Decisions {
+			if d.Action == "remove" {
+				wouldRemove = append(wouldRemove, d.ReleaseID)
+			}
+		}
+		if e := lastAudit(t, "cleanup", "dry run"); e.Outcome != "noop" || e.Detail["dry_run"] != true || e.Detail["error"] != nil ||
+			fmt.Sprint(e.Detail["would_remove"]) != fmt.Sprint(wouldRemove) || fmt.Sprint(e.Detail["removed"]) != "[]" {
+			t.Errorf("dry run audit record %+v, want noop would_remove %v", e, wouldRemove)
+		}
 		// A session on the oldest retired release blocks its removal.
 		st := status(t)
 		var retired []opRelease
@@ -1210,6 +1222,10 @@ func TestPublication(t *testing.T) {
 		}
 		r.json(t, &res)
 		held.Close(context.Background())
+		if e := lastAudit(t, "cleanup", "integration cleanup"); e.Outcome != "succeeded" || e.Detail["error"] != nil ||
+			fmt.Sprint(e.Detail["removed"]) != fmt.Sprint(res.Removed) {
+			t.Errorf("cleanup audit record %+v, removed %v", e, res.Removed)
+		}
 		after := status(t)
 		if after.activeID() != active {
 			t.Fatalf("cleanup changed the active release to %s", after.activeID())
@@ -1288,6 +1304,71 @@ func TestPublication(t *testing.T) {
 		restartPublisher(t, nil)
 	})
 
+	t.Run("a cleanup that fails after it started is audited as failed, with what it removed", func(t *testing.T) {
+		t.Cleanup(func() { restartPublisher(t, nil) })
+		restartPublisher(t, map[string]string{"KARTA_TEST_RETAIN": "0", "KARTA_TEST_PIN_GRACE": "5s"})
+		// Two releases published back to back retire the active one and the
+		// first of them; after the pin grace and drain margin both are
+		// removable, the more recently replaced first.
+		older := active
+		var names []string
+		for i := range 2 {
+			name := fmt.Sprintf("cleanup-failure-%d", i)
+			data := variant(t, at(fmt.Sprintf("2026-05-%02dT00:00:00Z", 10+i)), nil, nil)
+			authorize(t, data, "integration test: "+name)
+			submit(t, name, data, nil, "")
+			names = append(names, name)
+		}
+		var newer string
+		for i, name := range names {
+			s := waitSubmission(t, name, 90*time.Second)
+			if s.State != "published" {
+				t.Fatalf("%s: %+v", name, s)
+			}
+			if i == 0 {
+				newer = s.release()
+			}
+			active = s.release()
+		}
+		waitManifest(t, active)
+		time.Sleep(40 * time.Second) // grace + drain margin
+
+		// Hold the registry row of the release cleanup removes second:
+		// marking it removing waits for the lock and times out (5 s) after
+		// the first release was already removed.
+		ctx := context.Background()
+		reg := superuser(t, "karta_registry")
+		defer reg.Close(ctx)
+		lock, err := reg.Begin(ctx)
+		must(t, err)
+		if _, err := lock.Exec(ctx, `SELECT 1 FROM registry.releases WHERE release_id = $1 FOR UPDATE`, older); err != nil {
+			t.Fatal(err)
+		}
+		r := op(t, http.MethodPost, "/v1/operator/cleanup", admin, map[string]any{"reason": "cleanup failing after it started"})
+		must(t, lock.Rollback(ctx))
+		if c, _ := r.errorCode(t); r.status != http.StatusServiceUnavailable || c != "service_unavailable" {
+			t.Fatalf("cleanup with a locked release: %d %s", r.status, r.body)
+		}
+		e := lastAudit(t, "cleanup", "cleanup failing after it started")
+		if e.Outcome != "failed" || fmt.Sprint(e.Detail["removed"]) != "["+newer+"]" || !strings.Contains(fmt.Sprint(e.Detail["error"]), "lock timeout") {
+			t.Errorf("failed cleanup audit record %+v, want failed with %s removed", e, newer)
+		}
+		st := status(t)
+		if rel := st.release(newer); rel == nil || rel.State != "removed" || databases(t)["karta_"+newer] {
+			t.Errorf("%s: %+v", newer, rel)
+		}
+		if rel := st.release(older); rel == nil || rel.State != "retired" || !databases(t)["karta_"+older] {
+			t.Errorf("%s was changed by the failed cleanup: %+v", older, rel)
+		}
+		// Without the lock the next cleanup finishes the job.
+		r = op(t, http.MethodPost, "/v1/operator/cleanup", admin, map[string]any{"reason": "cleanup after the lock was released"})
+		expectStatus(t, r, http.StatusOK)
+		if e := lastAudit(t, "cleanup", "cleanup after the lock was released"); e.Outcome != "succeeded" || fmt.Sprint(e.Detail["removed"]) != "["+older+"]" {
+			t.Errorf("second cleanup audit record %+v", e)
+		}
+		assertRegistryConsistent(t)
+	})
+
 	t.Run("disk exhaustion fails safely", func(t *testing.T) {
 		t.Cleanup(func() {
 			restartPublisher(t, nil)
@@ -1332,6 +1413,147 @@ func TestPublication(t *testing.T) {
 		}
 		recordMeasurement(t, "tight_tablespace_bytes_free_before_import", tightAvail)
 		waitManifest(t, activeFromRegistry(t))
+	})
+
+	t.Run("forward activation checks row counts against the release active at the switch", func(t *testing.T) {
+		t.Cleanup(func() {
+			restartPublisher(t, nil)
+			active = activeFromRegistry(t)
+		})
+		base := activeFromRegistry(t)
+		// H: snapshot B with 40 more named POIs, published over base (more
+		// rows pass the relative gate), then replaced again by a rollback.
+		more := variant(t, at("2026-06-10T00:00:00Z"), nil, func(d *pbfwrite.Data) {
+			for i := range int64(40) {
+				d.Nodes = append(d.Nodes, pbfwrite.Node{ID: 900000 + i, Lat: 80000 + 1000*(i%8), Lon: 20000 + 1000*(i/8),
+					Tags: []pbfwrite.Tag{{K: "amenity", V: "cafe"}, {K: "name", V: fmt.Sprintf("Extra Cafe %d", i)}}})
+			}
+		})
+		authorize(t, more, "integration test: a release with more data")
+		submit(t, "more-data", more, nil, "")
+		s := waitSubmission(t, "more-data", 90*time.Second)
+		if s.State != "published" {
+			t.Fatalf("more data: %+v (%s)", s, strOr(s.Reason))
+		}
+		relH := s.release()
+		waitManifest(t, relH)
+		r := op(t, http.MethodPost, "/v1/operator/rollback", admin, map[string]any{"release_id": base, "reason": "back to the base release"})
+		expectStatus(t, r, http.StatusOK)
+		waitManifest(t, base)
+
+		// X: newer than H, with base's counts. Built and validated while base
+		// is active (the relative gate passes against base), kept ready.
+		restartPublisher(t, map[string]string{"KARTA_TEST_AUTO_ACTIVATE": "false"})
+		fewer := variant(t, at("2026-06-20T00:00:00Z"), nil, nil)
+		authorize(t, fewer, "integration test: validated against the base release")
+		submit(t, "fewer-data", fewer, nil, "")
+		s = waitSubmission(t, "fewer-data", 90*time.Second)
+		if s.State != "ready" || s.code() != "manual_activation" {
+			t.Fatalf("candidate: %+v (%s)", s, strOr(s.Reason))
+		}
+		relX := s.release()
+		restartPublisher(t, nil)
+
+		// A rollback (its own policy: no count gate) makes H active.
+		r = op(t, http.MethodPost, "/v1/operator/rollback", admin, map[string]any{"release_id": relH, "reason": "roll back to the release with more data"})
+		expectStatus(t, r, http.StatusOK)
+		waitManifest(t, relH)
+
+		// Activating X is judged against H, the release active at the
+		// switch, not against base: far fewer POIs, refused.
+		r = op(t, http.MethodPost, "/v1/operator/releases/"+relX+"/activate", admin, map[string]any{"reason": "activate the candidate after the rollback"})
+		code, _ := r.errorCode(t)
+		if r.status != http.StatusConflict || code != "policy_refused" || r.reasonCode(t) != "excessive_data_loss" ||
+			!strings.Contains(string(r.body), relH) || !strings.Contains(string(r.body), "pois") {
+			t.Fatalf("activate X over H: %d %s", r.status, r.body)
+		}
+		if got := activeFromRegistry(t); got != relH {
+			t.Fatalf("active %s after the refused activation, want %s", got, relH)
+		}
+		expectStatus(t, get(t, "/v1/releases/"+relH+lakeTile), http.StatusOK)
+		if e := lastAudit(t, "activate", "activate the candidate after the rollback"); e.Outcome != "rejected" || e.Target != relX ||
+			!strings.Contains(fmt.Sprint(e.Detail["error"]), "would lose too much data") {
+			t.Errorf("refused activation audit record %+v", e)
+		}
+		// Submitting X's snapshot again resumes the never-activated release;
+		// its activation is refused by the same gate and it stays ready.
+		submit(t, "fewer-data-again", fewer, nil, "")
+		if s := waitSubmission(t, "fewer-data-again", 90*time.Second); s.State != "ready" || s.code() != "excessive_data_loss" || s.release() != relX {
+			t.Errorf("resubmitted candidate: %+v (%s)", s, strOr(s.Reason))
+		}
+		if got := activeFromRegistry(t); got != relH {
+			t.Fatalf("active %s after the resubmission, want %s", got, relH)
+		}
+
+		// With base active again, the same activation passes.
+		r = op(t, http.MethodPost, "/v1/operator/rollback", admin, map[string]any{"release_id": base, "reason": "back to the base release again"})
+		expectStatus(t, r, http.StatusOK)
+		r = op(t, http.MethodPost, "/v1/operator/releases/"+relX+"/activate", admin, map[string]any{"reason": "activate the candidate over the base release"})
+		expectStatus(t, r, http.StatusOK)
+		waitManifest(t, relX)
+	})
+
+	t.Run("a publication fails safely when the active release's counts cannot be read", func(t *testing.T) {
+		cur := activeFromRegistry(t)
+		ctx := context.Background()
+		// Make the active release look like a Stage 1 release (no counts in
+		// the registry) whose stored import report cannot be decoded.
+		reg := superuser(t, "karta_registry")
+		defer reg.Close(ctx)
+		var saved string
+		must(t, reg.QueryRow(ctx, `SELECT counts::text FROM registry.releases WHERE release_id = $1`, cur).Scan(&saved))
+		rel := superuser(t, "karta_"+cur)
+		defer rel.Close(ctx)
+		for _, sql := range []string{`SET default_transaction_read_only = off`,
+			`CREATE TEMP TABLE saved_report AS SELECT report FROM karta.release_info`,
+			`UPDATE karta.release_info SET report = jsonb_set(report, '{counts}', '"unreadable"')`} {
+			if _, err := rel.Exec(ctx, sql); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := reg.Exec(ctx, `UPDATE registry.releases SET counts = NULL WHERE release_id = $1`, cur); err != nil {
+			t.Fatal(err)
+		}
+		restored := false
+		restore := func() {
+			if restored {
+				return
+			}
+			restored = true
+			if _, err := reg.Exec(ctx, `UPDATE registry.releases SET counts = $2::jsonb WHERE release_id = $1`, cur, saved); err != nil {
+				t.Error(err)
+			}
+			if _, err := rel.Exec(ctx, `UPDATE karta.release_info SET report = (SELECT report FROM saved_report)`); err != nil {
+				t.Error(err)
+			}
+		}
+		defer restore()
+
+		data := variant(t, at("2026-06-25T00:00:00Z"), nil, nil)
+		authorize(t, data, "integration test: active counts unavailable")
+		dbsBefore := databases(t)
+		submit(t, "counts-unavailable", data, nil, "")
+		s := waitSubmission(t, "counts-unavailable", 60*time.Second)
+		if s.State != "failed" || s.code() != "counts_unavailable" || s.release() != "" || !strings.Contains(strOr(s.Reason), cur) {
+			t.Fatalf("with unreadable active counts: %+v (%s)", s, strOr(s.Reason))
+		}
+		// Failed before any build: no candidate or new database, no switch.
+		if got := activeFromRegistry(t); got != cur || candidates(t) != 0 || len(databases(t)) != len(dbsBefore) {
+			t.Fatalf("after the failure: active %s, %d candidates, %d databases (was %d)", got, candidates(t), len(databases(t)), len(dbsBefore))
+		}
+		waitReady(t, true, "ready")
+
+		// Counts restored: the same snapshot, submitted again, is checked
+		// against them and published.
+		restore()
+		writeAtomic(t, "counts-unavailable.osm.pbf.ready", []byte(digestOf(data)+"\n"), 0o644)
+		s = waitNewSubmission(t, "counts-unavailable", s.ID, 90*time.Second)
+		if s.State != "published" {
+			t.Fatalf("after restoring the counts: %+v (%s)", s, strOr(s.Reason))
+		}
+		active = s.release()
+		waitManifest(t, active)
+		assertRegistryConsistent(t)
 	})
 
 	t.Run("an incompatible release is not rolled back to", func(t *testing.T) {
@@ -1439,6 +1661,7 @@ func TestPublication(t *testing.T) {
 		for _, want := range []string{
 			"operator_api/status/denied", "operator_api/rollback/denied", "operator_api/rollback/succeeded", "operator_api/rollback/rejected",
 			"operator_api/activate/succeeded", "operator_api/authorize_digest/succeeded", "operator_api/cleanup/succeeded", "operator_api/cleanup/noop",
+			"operator_api/cleanup/failed", "operator_api/activate/rejected",
 			"inbox/publish/succeeded", "inbox/submission/succeeded", "inbox/submission/rejected", "inbox/submission/failed",
 			"inbox/import_started/succeeded", "inbox/import_failed/failed", "system/recover/succeeded", "operator_api/remove_release/succeeded",
 		} {
@@ -1475,6 +1698,48 @@ func TestPublication(t *testing.T) {
 			}
 		}
 	})
+}
+
+// reasonCode returns the reason_code of an operator API error.
+func (r response) reasonCode(t *testing.T) string {
+	t.Helper()
+	var e struct {
+		Error struct {
+			ReasonCode string `json:"reason_code"`
+		} `json:"error"`
+	}
+	r.json(t, &e)
+	return e.Error.ReasonCode
+}
+
+// auditRecord is an operator audit entry.
+type auditRecord struct {
+	Actor   string         `json:"actor"`
+	Source  string         `json:"source"`
+	Action  string         `json:"action"`
+	Target  string         `json:"target"`
+	Outcome string         `json:"outcome"`
+	Reason  string         `json:"reason"`
+	Detail  map[string]any `json:"detail"`
+}
+
+// lastAudit returns the newest audit record of an operator action with
+// that reason.
+func lastAudit(t *testing.T, action, reason string) auditRecord {
+	t.Helper()
+	r := op(t, http.MethodGet, "/v1/operator/audit?limit=200", secret(t, "operator_monitor_token"), nil)
+	expectStatus(t, r, http.StatusOK)
+	var a struct {
+		Entries []auditRecord `json:"entries"`
+	}
+	r.json(t, &a)
+	for _, e := range a.Entries {
+		if e.Source == "operator_api" && e.Action == action && e.Reason == reason {
+			return e
+		}
+	}
+	t.Fatalf("no audit record for %s %q", action, reason)
+	return auditRecord{}
 }
 
 // startPinned requests a release's tile and pinned search continuously and

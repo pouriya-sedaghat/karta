@@ -267,8 +267,10 @@ type BuildOptions struct {
 	Actor        string
 	Source       string
 	SubmissionID *int64
-	// ActiveCounts are the active release's row counts, for the relative
-	// drop check (nil when there is no active release of this region).
+	// ActiveID and ActiveCounts are the active release of the same region
+	// and its row counts, for the relative drop check (validation.
+	// max_drop_fraction). ActiveID "" means there is nothing to compare
+	// with; with an ActiveID, empty ActiveCounts fail validation.
 	ActiveCounts map[string]int64
 	ActiveID     string
 }
@@ -550,7 +552,7 @@ func Build(ctx context.Context, reg *pgx.Conn, v *Verified, opts BuildOptions, l
 	}
 	report.Checks = append(report.Checks, Check{Name: "style_matches_layer_catalog", Passed: true, Detail: "all style layers, fields and fontstacks are provided"})
 	validate(ctx, rel, cfg, catalog, report)
-	relativeChecks(cfg, opts.ActiveID, opts.ActiveCounts, report)
+	report.Checks = append(report.Checks, RelativeChecks(cfg.Validation.MaxDropFraction, opts.ActiveID, opts.ActiveCounts, report.Counts)...)
 	lap("validate", t)
 	var failed []string
 	for _, c := range report.Checks {
@@ -617,27 +619,36 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, n
 	return &Built{ReleaseID: id, Report: report}, nil
 }
 
-// relativeChecks bounds the drop of every counted table relative to the
-// active release of the same region (validation.max_drop_fraction).
-func relativeChecks(cfg region.Config, activeID string, active map[string]int64, r *Report) {
-	f := cfg.Validation.MaxDropFraction
-	if f == nil || len(active) == 0 {
-		return
+// RelativeChecks bounds the drop of every counted table relative to the
+// active release of the same region (validation.max_drop_fraction): each
+// table the active release counts must keep at least 1 - fraction of its
+// rows. It returns nothing when the gate is off (no fraction) or there is no
+// active release to compare with (activeID ""); when there is one, its
+// counts must be known: missing counts fail the gate instead of skipping it.
+func RelativeChecks(maxDrop *float64, activeID string, active, candidate map[string]int64) []Check {
+	if maxDrop == nil || activeID == "" {
+		return nil
+	}
+	if len(active) == 0 {
+		return []Check{{Name: "relative_counts_available", Passed: false,
+			Detail: "the row counts of the active release " + activeID + " are unknown, so the relative drop cannot be checked"}}
 	}
 	tables := make([]string, 0, len(active))
 	for k := range active {
 		tables = append(tables, k)
 	}
 	sort.Strings(tables)
+	var checks []Check
 	for _, table := range tables {
 		prev := active[table]
 		if prev <= 0 {
 			continue
 		}
-		minimum := int64(math.Ceil(float64(prev) * (1 - *f)))
-		r.Checks = append(r.Checks, Check{Name: "relative_count_" + table, Passed: r.Counts[table] >= minimum,
-			Detail: fmt.Sprintf("%d rows; active release %s has %d, minimum %d (max drop %.0f%%)", r.Counts[table], activeID, prev, minimum, *f*100)})
+		minimum := int64(math.Ceil(float64(prev) * (1 - *maxDrop)))
+		checks = append(checks, Check{Name: "relative_count_" + table, Passed: candidate[table] >= minimum,
+			Detail: fmt.Sprintf("%d rows; active release %s has %d, minimum %d (max drop %.0f%%)", candidate[table], activeID, prev, minimum, *maxDrop*100)})
 	}
+	return checks
 }
 
 // candidateName returns a fresh name for an import's working database.

@@ -188,8 +188,14 @@ paths:
         or `retired`), pass the same compatibility checks as serving (schema
         major, style, serving toolchain), and satisfy the forward rule: a
         newer data timestamp than the active release, or the same snapshot
-        rebuilt. Going back is a rollback. The previous release stays servable
-        to pinned clients for the pin grace period.
+        rebuilt. Going back is a rollback. With the region's
+        `validation.max_drop_fraction`, the target must also keep enough of
+        every table's rows of the release active at the moment of the switch
+        (checked in the pointer transaction), whatever it was validated
+        against: otherwise `409 policy_refused` with reason code
+        `excessive_data_loss`, or `counts_unavailable` if either release's
+        row counts cannot be read. The previous release stays servable to
+        pinned clients for the pin grace period.
       parameters:
         - { name: release_id, in: path, required: true, schema: { $ref: "#/components/schemas/ReleaseID" } }
       requestBody:
@@ -221,7 +227,8 @@ paths:
         `ready` or `retired` (never `removing`, `removed` or `failed`) and
         pass the serving compatibility checks. Only the active pointer
         changes; release contents are immutable. A region change must be
-        explicit (`allow_region_change`).
+        explicit (`allow_region_change`). Rollback is the explicit way back
+        and has no row-count gate.
       requestBody:
         required: true
         content:
@@ -251,7 +258,10 @@ paths:
         every release still inside its pin grace (plus the drain margin).
         A release whose database has any session is skipped. `dry_run` only
         reports the decisions. Cleanup also runs after each publication and
-        every `KARTA_CLEANUP_INTERVAL`.
+        every `KARTA_CLEANUP_INTERVAL`. The request is audited (action
+        `cleanup`) with its actual result: `succeeded`, `noop` (dry run, with
+        `would_remove`, or nothing removed) or `failed` (answered `503`; the
+        record has the `error` and what was `removed` before it).
       requestBody:
         required: true
         content:
@@ -313,7 +323,7 @@ components:
             message: { type: string }
             reason_code:
               type: string
-              description: For `policy_refused`, the rule that refused (older_than_active, not_newer, region_changed).
+              description: For `policy_refused`, the rule that refused (older_than_active, not_newer, region_changed, excessive_data_loss, counts_unavailable, region_config).
             request_id: { type: string }
     SwitchBody:
       type: object

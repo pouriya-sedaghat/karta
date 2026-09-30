@@ -28,6 +28,12 @@ const (
 	CodeTooManyAttempts   = "too_many_attempts"
 	CodeBuildFailed       = "build_failed"
 	CodeValidationFailed  = "validation_failed"
+	// CodeCountsUnavailable: the relative row-count gate is configured but
+	// the row counts of a release it compares could not be read.
+	CodeCountsUnavailable = "counts_unavailable"
+	// CodeExcessiveDataLoss: a forward switch would drop more rows than
+	// validation.max_drop_fraction allows relative to the active release.
+	CodeExcessiveDataLoss = "excessive_data_loss"
 )
 
 // PolicyError is a refusal with a stable code.
