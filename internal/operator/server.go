@@ -36,6 +36,7 @@ type Service interface {
 	Rollback(ctx context.Context, p publish.Principal, a publish.ActionRequest) (registry.ActivateResult, error)
 	Cleanup(ctx context.Context, p publish.Principal, reason string, dryRun bool) (publish.CleanupResult, error)
 	AuditDenied(ctx context.Context, p publish.Principal, action, reason string)
+	OnlinePolicy(ctx context.Context, p publish.Principal, paused bool, reason string) error
 	Ping(ctx context.Context) error
 }
 
@@ -91,6 +92,7 @@ func New(creds []Credential, svc Service, log *slog.Logger, timeout time.Duratio
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.Handle("GET /v1/operator/status", s.auth(ScopeStatus, "status", s.status))
+	mux.Handle("GET /v1/operator/metrics", s.auth(ScopeStatus, "metrics", s.metrics))
 	mux.Handle("GET /v1/operator/audit", s.auth(ScopeStatus, "audit", s.audit))
 	mux.Handle("GET /v1/operator/openapi.yaml", s.auth(ScopeStatus, "openapi", func(w http.ResponseWriter, _ *http.Request, _ *Credential) {
 		w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
@@ -101,6 +103,8 @@ func New(creds []Credential, svc Service, log *slog.Logger, timeout time.Duratio
 	mux.Handle("POST /v1/operator/releases/{release_id}/activate", s.auth(ScopePublish, "activate", s.activate))
 	mux.Handle("POST /v1/operator/rollback", s.auth(ScopeRollback, "rollback", s.rollback))
 	mux.Handle("POST /v1/operator/cleanup", s.auth(ScopeCleanup, "cleanup", s.cleanup))
+	mux.Handle("POST /v1/operator/online/pause", s.auth(ScopePublish, "pause_online", s.onlinePolicy(true)))
+	mux.Handle("POST /v1/operator/online/resume", s.auth(ScopePublish, "resume_online", s.onlinePolicy(false)))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, CodeNotFound, "no such operator resource")
 	})
@@ -363,6 +367,41 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, _ *Credential) {
 	writeJSON(w, http.StatusOK, st)
 }
 
+func (s *Server) metrics(w http.ResponseWriter, r *http.Request, _ *Credential) {
+	if r.URL.RawQuery != "" {
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "this endpoint takes no query parameters")
+		return
+	}
+	st, err := s.svc.Status(r.Context())
+	if err != nil {
+		s.serviceError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	f := func(name string, value float64) { _, _ = fmt.Fprintf(w, "karta_%s %g\n", name, value) }
+	boolValue := func(v bool) float64 {
+		if v {
+			return 1
+		}
+		return 0
+	}
+	f("online_enabled", boolValue(st.Online.Enabled))
+	f("online_paused", boolValue(st.Online.Paused))
+	f("online_consecutive_failures", float64(st.Online.Failures))
+	if st.Online.ActiveAgeSeconds != nil {
+		f("active_data_age_seconds", *st.Online.ActiveAgeSeconds)
+	}
+	if st.Online.ActiveStale != nil {
+		f("active_data_stale", boolValue(*st.Online.ActiveStale))
+	}
+	if st.Online.LastCheck != nil {
+		f("online_last_successful_check_timestamp_seconds", float64(st.Online.LastCheck.Unix()))
+	}
+	if st.Online.NextAttempt != nil {
+		f("online_next_attempt_timestamp_seconds", float64(st.Online.NextAttempt.Unix()))
+	}
+}
+
 func (s *Server) audit(w http.ResponseWriter, r *http.Request, _ *Credential) {
 	q := r.URL.Query()
 	limit, before := 100, int64(0)
@@ -450,6 +489,24 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, c *Credential
 
 type reasonBody struct {
 	Reason string `json:"reason"`
+}
+
+func (s *Server) onlinePolicy(paused bool) handler {
+	return func(w http.ResponseWriter, r *http.Request, c *Credential) {
+		var b reasonBody
+		if !decode(w, r, &b) {
+			return
+		}
+		reason, ok := validReason(w, r, b.Reason)
+		if !ok {
+			return
+		}
+		if err := s.svc.OnlinePolicy(r.Context(), principal(r, c), paused, reason); err != nil {
+			s.serviceError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"paused": paused})
+	}
 }
 
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request, c *Credential) {

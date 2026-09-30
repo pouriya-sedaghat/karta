@@ -72,6 +72,10 @@ func (f *fakeService) AuditDenied(_ context.Context, p publish.Principal, action
 	f.denied = append(f.denied, p.Name+" "+action)
 }
 func (f *fakeService) Ping(context.Context) error { return nil }
+func (f *fakeService) OnlinePolicy(_ context.Context, _ publish.Principal, paused bool, _ string) error {
+	f.record("online policy")
+	return f.err
+}
 
 func setup(t *testing.T) (http.Handler, *fakeService, *bytes.Buffer) {
 	t.Helper()
@@ -83,6 +87,26 @@ func setup(t *testing.T) (http.Handler, *fakeService, *bytes.Buffer) {
 	svc := &fakeService{}
 	logs := &bytes.Buffer{}
 	return New(creds, svc, slog.New(slog.NewJSONHandler(logs, nil)), 5*time.Second), svc, logs
+}
+
+func TestOnlinePolicyRequiresPublishScopeAndReason(t *testing.T) {
+	h, svc, _ := setup(t)
+	path := "/v1/operator/online/pause"
+	if got := do(t, h, "POST", path, monitorToken, `{"reason":"rollback"}`, nil); got.Code != http.StatusForbidden {
+		t.Fatalf("monitor may pause: %d", got.Code)
+	}
+	if got := do(t, h, "POST", path, adminToken, `{"reason":""}`, nil); got.Code != http.StatusBadRequest {
+		t.Fatalf("missing reason accepted: %d", got.Code)
+	}
+	if got := do(t, h, "POST", path, adminToken, `{"reason":"review"}`, nil); got.Code != http.StatusOK {
+		t.Fatalf("pause failed: %d %s", got.Code, got.Body.String())
+	}
+	if got := do(t, h, "POST", "/v1/operator/online/resume", adminToken, `{"reason":"review complete"}`, nil); got.Code != http.StatusOK {
+		t.Fatalf("resume failed: %d %s", got.Code, got.Body.String())
+	}
+	if len(svc.calls) != 2 {
+		t.Fatalf("expected two policy actions, got %v", svc.calls)
+	}
 }
 
 func do(t *testing.T, h http.Handler, method, path, token, body string, hdr map[string]string) *httptest.ResponseRecorder {

@@ -10,6 +10,8 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -21,6 +23,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,6 +32,7 @@ import (
 	"github.com/pouriya-sedaghat/karta/internal/failpoint"
 	"github.com/pouriya-sedaghat/karta/internal/glyphs"
 	"github.com/pouriya-sedaghat/karta/internal/importer"
+	"github.com/pouriya-sedaghat/karta/internal/online"
 	"github.com/pouriya-sedaghat/karta/internal/operator"
 	"github.com/pouriya-sedaghat/karta/internal/publish"
 	"github.com/pouriya-sedaghat/karta/internal/registry"
@@ -228,6 +232,21 @@ func publisher() int {
 
 	pc := publicationConfig(cfg.Import, cfg.RegionFile, cfg.InboxDir)
 	pc.InboxPoll, pc.InboxSettle, pc.InboxMaxEntries, pc.AutoActivate = cfg.InboxPoll, cfg.InboxSettle, cfg.InboxMaxEntries, cfg.AutoActivate
+	if cfg.OnlineManifestURL != "" {
+		b, err := os.ReadFile(cfg.OnlinePublicKeyFile) // #nosec G304 -- configured public key file
+		if err != nil {
+			log.Error("online public key", "err", err)
+			return exitUsage
+		}
+		key, err := hex.DecodeString(strings.TrimSpace(string(b)))
+		if err != nil || len(key) != ed25519.PublicKeySize {
+			log.Error("online public key must contain 64 hex characters")
+			return exitUsage
+		}
+		pc.Online = online.Config{ManifestURL: cfg.OnlineManifestURL, PublicKey: ed25519.PublicKey(key),
+			MaxBytes: cfg.OnlineMaxBytes, Timeout: cfg.OnlineTimeout, ReserveBytes: cfg.StagingReserveBytes}
+		pc.OnlineInterval, pc.OnlineStaleAfter = cfg.OnlineInterval, cfg.OnlineStaleAfter
+	}
 	pc.Fontstacks = g.Fontstacks()
 	var svc *publish.Service
 	if err := retry(ctx, log, "connect and migrate the registry", func() (err error) {
@@ -263,9 +282,10 @@ func publisher() int {
 	go func() { errc <- srv.Serve(ln) }()
 	log.Info("publisher ready", "operator_addr", ln.Addr().String(), "inbox", cfg.InboxDir, "region_file", cfg.RegionFile,
 		"auto_activate", cfg.AutoActivate, "pin_grace", cfg.PinGrace.String(), "retain", cfg.RetainReleases, "credentials", names)
-	done := make(chan struct{}, 2)
+	done := make(chan struct{}, 3)
 	go func() { svc.RunInbox(ctx); done <- struct{}{} }()
 	go func() { svc.RunMaintenance(ctx); done <- struct{}{} }()
+	go func() { svc.RunOnline(ctx); done <- struct{}{} }()
 	select {
 	case err := <-errc:
 		log.Error("operator server stopped", "err", err)
@@ -276,6 +296,7 @@ func publisher() int {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+	<-done
 	<-done
 	<-done
 	return exitOK
@@ -389,7 +410,7 @@ func runOperator(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: karta operator status | audit [--limit N] [--before-id N] | authorize --sha256 HEX [--size N] [--expires RFC3339] --reason TEXT |\n"+
 			"  revoke --sha256 HEX --reason TEXT | activate --release ID --reason TEXT [--expected ID|none] |\n"+
-			"  rollback [--release ID] --reason TEXT [--expected ID|none] | cleanup --reason TEXT [--dry-run]")
+			"  rollback [--release ID] --reason TEXT [--expected ID|none] | cleanup --reason TEXT [--dry-run] | pause-online --reason TEXT | resume-online --reason TEXT")
 		return exitUsage
 	}
 	cmd := args[0]
@@ -472,6 +493,12 @@ func runOperator(args []string) int {
 		method, path, body = http.MethodPost, "/v1/operator/rollback", b
 	case "cleanup":
 		method, path, body = http.MethodPost, "/v1/operator/cleanup", map[string]any{"reason": *reason, "dry_run": *dryRun}
+	case "pause-online", "resume-online":
+		path = "/v1/operator/online/pause"
+		if cmd == "resume-online" {
+			path = "/v1/operator/online/resume"
+		}
+		method, body = http.MethodPost, map[string]any{"reason": *reason}
 	default:
 		fmt.Fprintf(os.Stderr, "karta operator: unknown command %q\n", cmd)
 		return exitUsage

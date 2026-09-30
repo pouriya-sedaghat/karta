@@ -72,6 +72,21 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/metrics:
+    get:
+      summary: Publisher freshness gauges
+      operationId: operatorMetrics
+      description: Scope `status`. Prometheus text metrics; no upstream URLs or credentials.
+      responses:
+        "200":
+          description: Freshness and scheduling gauges.
+          content:
+            text/plain:
+              schema: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
   /v1/operator/audit:
     get:
       summary: Audit log, newest first
@@ -91,6 +106,34 @@ paths:
                 required: [entries]
                 properties:
                   entries: { type: array, items: { $ref: "#/components/schemas/AuditEntry" } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/online/pause:
+    post:
+      summary: Pause automatic online activation
+      operationId: pauseOnline
+      description: Scope `publish`. Signed checks continue, but an online candidate cannot move the active pointer. An explicit operator switch pauses activation in the same pointer transaction.
+      requestBody: { $ref: "#/components/requestBodies/OnlineReason" }
+      responses:
+        "200":
+          description: Automatic activation is paused.
+          content: { application/json: { schema: { type: object, required: [paused], properties: { paused: { type: boolean, enum: [true] } } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/online/resume:
+    post:
+      summary: Resume automatic online activation
+      operationId: resumeOnline
+      description: Scope `publish`. Requires an audit reason; the next poll still follows the configured schedule.
+      requestBody: { $ref: "#/components/requestBodies/OnlineReason" }
+      responses:
+        "200":
+          description: Automatic activation is resumed.
+          content: { application/json: { schema: { type: object, required: [paused], properties: { paused: { type: boolean, enum: [false] } } } } }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
@@ -286,6 +329,12 @@ paths:
         "415": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/Error" }
 components:
+  requestBodies:
+    OnlineReason:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ReasonBody" }
   securitySchemes:
     bearer:
       type: http
@@ -390,7 +439,7 @@ components:
                  reason, release_id, attempts, created_at, updated_at, finished_at]
       properties:
         id: { type: integer, format: int64 }
-        source: { type: string, enum: [inbox, cli] }
+        source: { type: string, enum: [inbox, cli, online] }
         name: { type: string }
         fingerprint: { type: string }
         region_id: { type: string }
@@ -434,7 +483,7 @@ components:
         id: { type: integer, format: int64 }
         at: { $ref: "#/components/schemas/Timestamp" }
         actor: { type: string, description: "Credential name, `inbox`, `cli`, `system` or `anonymous`." }
-        source: { type: string, enum: [operator_api, inbox, cli, system] }
+        source: { type: string, enum: [operator_api, inbox, cli, system, online] }
         action: { type: string }
         target: { type: string }
         outcome: { type: string, enum: [succeeded, rejected, failed, denied, noop] }
@@ -467,7 +516,7 @@ components:
               why: { type: string }
     Status:
       type: object
-      required: [region, policy, active, releases, submissions, authorizations, inbox, job, storage]
+      required: [region, policy, active, releases, submissions, authorizations, inbox, online, job, online_job, storage]
       properties:
         region:
           type: object
@@ -511,6 +560,23 @@ components:
                       name: { type: string }
                       waiting: { type: string, enum: [waiting_for_ready_marker, waiting_for_snapshot, settling] }
                       problem: { type: string }
+        online:
+          type: object
+          required: [enabled, paused, last_attempt, last_successful_check, verified_digest, verified_timestamp,
+                     last_error, next_attempt, consecutive_failures, stale_after_seconds, active_age_seconds, active_stale]
+          properties:
+            enabled: { type: boolean }
+            paused: { type: boolean }
+            last_attempt: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+            last_successful_check: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+            verified_digest: { type: string, nullable: true }
+            verified_timestamp: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+            last_error: { type: string, nullable: true }
+            next_attempt: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+            consecutive_failures: { type: integer }
+            stale_after_seconds: { type: number }
+            active_age_seconds: { type: number, nullable: true }
+            active_stale: { type: boolean, nullable: true }
         job:
           type: object
           nullable: true
@@ -519,6 +585,18 @@ components:
             submission_id: { type: integer, format: int64 }
             name: { type: string }
             source: { type: string }
+            phase: { type: string }
+            started_at: { $ref: "#/components/schemas/Timestamp" }
+            phase_started_at: { $ref: "#/components/schemas/Timestamp" }
+            release_id: { type: string }
+        online_job:
+          type: object
+          nullable: true
+          required: [submission_id, name, source, phase, started_at, phase_started_at]
+          properties:
+            submission_id: { type: integer, format: int64 }
+            name: { type: string }
+            source: { type: string, enum: [online] }
             phase: { type: string }
             started_at: { $ref: "#/components/schemas/Timestamp" }
             phase_started_at: { $ref: "#/components/schemas/Timestamp" }

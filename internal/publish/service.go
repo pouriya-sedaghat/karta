@@ -52,6 +52,7 @@ import (
 	"github.com/pouriya-sedaghat/karta/internal/failpoint"
 	"github.com/pouriya-sedaghat/karta/internal/importer"
 	"github.com/pouriya-sedaghat/karta/internal/inbox"
+	"github.com/pouriya-sedaghat/karta/internal/online"
 	"github.com/pouriya-sedaghat/karta/internal/region"
 	"github.com/pouriya-sedaghat/karta/internal/registry"
 	"github.com/pouriya-sedaghat/karta/internal/release"
@@ -93,6 +94,9 @@ type Config struct {
 	Build               importer.BuildOptions
 	RegistryDB          string
 	Fontstacks          []string
+	Online              online.Config
+	OnlineInterval      time.Duration
+	OnlineStaleAfter    time.Duration
 }
 
 // Principal is who asks for an action.
@@ -109,11 +113,12 @@ type Service struct {
 	log *slog.Logger
 	reg *pgxpool.Pool
 
-	settler *inbox.Settler
-	mu      sync.Mutex
-	job     *JobStatus
-	scan    ScanStatus
-	now     func() time.Time
+	settler   *inbox.Settler
+	mu        sync.Mutex
+	job       *JobStatus
+	onlineJob *JobStatus
+	scan      ScanStatus
+	now       func() time.Time
 	// readCounts reads a release database's stored counts (a test seam).
 	readCounts reportCountsReader
 }
@@ -170,16 +175,34 @@ func (s *Service) Close() { s.reg.Close() }
 func (s *Service) setJob(j *JobStatus) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.job = j
+	if j.Source == "online" {
+		s.onlineJob = j
+	} else {
+		s.job = j
+	}
 }
 
-func (s *Service) phase(name, releaseID string) {
+func (s *Service) clearJob(source string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.job != nil {
-		s.job.Phase, s.job.PhaseAt = name, s.now()
+	if source == "online" {
+		s.onlineJob = nil
+	} else {
+		s.job = nil
+	}
+}
+
+func (s *Service) phase(source, name, releaseID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j := s.job
+	if source == "online" {
+		j = s.onlineJob
+	}
+	if j != nil {
+		j.Phase, j.PhaseAt = name, s.now()
 		if releaseID != "" {
-			s.job.ReleaseID = releaseID
+			j.ReleaseID = releaseID
 		}
 	}
 }
@@ -210,6 +233,7 @@ type request struct {
 	activate          bool
 	allowRegionChange bool
 	reason            string
+	onlineManifest    *online.Manifest
 }
 
 // authorizer looks up operator authorizations for digests not pinned in
@@ -234,10 +258,20 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 	if err != nil {
 		return fail(registry.SubRejected, importer.CodeRegionConfig, fmt.Errorf("%w: region: %v", importer.ErrInput, err))
 	}
-	s.phase("verifying", "")
+	s.phase(req.source, "verifying", "")
+	authorize := s.authorizer
+	if req.onlineManifest != nil {
+		m := req.onlineManifest
+		authorize = func(_ context.Context, regionID, digest string, size int64) (string, error) {
+			if regionID == m.RegionID && digest == m.SHA256 && size == m.SizeBytes {
+				return "verified signed online manifest", nil
+			}
+			return "", nil
+		}
+	}
 	v, err := importer.Verify(ctx, importer.VerifyOptions{
 		SnapshotPath: req.staged.SnapshotPath, ProvenancePath: req.staged.SidecarPath, Region: cfg,
-		MaxInputBytes: s.cfg.MaxInputBytes, MaxFutureSkew: s.cfg.MaxFutureSkew, Now: s.now, Authorize: s.authorizer,
+		MaxInputBytes: s.cfg.MaxInputBytes, MaxFutureSkew: s.cfg.MaxFutureSkew, Now: s.now, Authorize: authorize,
 	})
 	if err != nil {
 		if code := importer.InputCode(err); code != "" {
@@ -246,6 +280,9 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		return fail(registry.SubFailed, CodeBuildFailed, err)
 	}
 	ts := v.Source.DataTimestamp
+	if req.onlineManifest != nil && !ts.Equal(req.onlineManifest.DataTimestamp) {
+		return fail(registry.SubRejected, importer.CodeTimestampUntrusted, errors.New("signed source timestamp differs from verified snapshot timestamp"))
+	}
 	s.updateSubmission(ctx, req.subID, registry.SubmissionUpdate{State: registry.SubProcessing, SHA256: v.Info.SHA256, SizeBytes: v.Info.Size, DataTimestamp: &ts})
 	cand := Candidate{RegionID: cfg.ID, SHA256: v.Info.SHA256, DataTimestamp: ts}
 
@@ -256,12 +293,12 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 	if err := Forward(active, cand, req.allowRegionChange); err != nil {
 		return fail(registry.SubRejected, PolicyCode(err), err)
 	}
-	s.phase("capacity", "")
+	s.phase(req.source, "capacity", "")
 	if err := s.checkCapacity(ctx, v.Info.Size, cfg.ID); err != nil {
 		return fail(registry.SubRejected, CodeInsufficient, err)
 	}
 
-	s.phase("waiting_for_build_lock", "")
+	s.phase(req.source, "waiting_for_build_lock", "")
 	conn, err := s.cfg.Build.DB.Connect(ctx, s.cfg.RegistryDB)
 	if err != nil {
 		return fail(registry.SubInterrupted, CodeInterrupted, fmt.Errorf("connect registry: %w", err))
@@ -305,7 +342,7 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 			opts.ActiveID, opts.ActiveCounts = active.ID, counts
 		}
 	}
-	s.phase("building", "")
+	s.phase(req.source, "building", "")
 	built, err := importer.Build(ctx, conn, v, opts, s.log)
 	if built != nil {
 		out.ReleaseID, out.Report = built.ReleaseID, built.Report
@@ -323,7 +360,7 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		}
 		return fail(registry.SubFailed, CodeBuildFailed, err)
 	}
-	s.phase("built", built.ReleaseID)
+	s.phase(req.source, "built", built.ReleaseID)
 	if e := built.Existing; e != nil {
 		resumable := e.State == registry.StateReady && e.ActivatedAt == nil
 		switch {
@@ -344,7 +381,7 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		out.State, out.Code, out.Reason = registry.SubReady, CodeManualActivation, "validated and ready; an operator activates it"
 		return out
 	}
-	s.phase("activating", built.ReleaseID)
+	s.phase(req.source, "activating", built.ReleaseID)
 	res, err := registry.Activate(ctx, s.reg, registry.ActivateRequest{
 		Target: built.ReleaseID, Expected: expected, CheckExpected: true, Action: "publish",
 		Actor: req.principal.Name, Source: req.principal.Source, Reason: req.reason, RequestID: req.principal.RequestID,
@@ -364,6 +401,9 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		case errors.Is(err, registry.ErrActiveChanged):
 			out.State, out.Code, out.Reason = registry.SubReady, CodeActiveChanged,
 				"validated, but the active release changed during the build ("+err.Error()+"); kept ready for an operator to activate"
+			return out
+		case errors.Is(err, registry.ErrOnlinePaused):
+			out.State, out.Code, out.Reason = registry.SubReady, "online_paused", "validated; automatic activation was paused by an operator"
 			return out
 		case PolicyCode(err) != "":
 			out.State, out.Code, out.Reason = registry.SubReady, PolicyCode(err), err.Error()
@@ -584,7 +624,7 @@ func (s *Service) ImportFile(ctx context.Context, o ImportOptions) Outcome {
 	}
 	req.subID = sub.ID
 	s.setJob(&JobStatus{SubmissionID: sub.ID, Name: req.name, Source: "cli", Phase: "staging", StartedAt: s.now(), PhaseAt: s.now()})
-	defer s.setJob(nil)
+	defer s.clearJob("cli")
 	staged, err := inbox.StageFile(o.SnapshotPath, prov, s.cfg.StagingDir, newJobID("cli-"),
 		inbox.Options{MaxSnapshotBytes: s.cfg.MaxInputBytes, ReserveBytes: s.cfg.StagingReserveBytes})
 	var out Outcome
@@ -729,7 +769,7 @@ func (s *Service) processEntry(ctx context.Context, e inbox.Entry) {
 		reason: "inbox submission " + e.Name}
 	s.log.Info("processing inbox submission", "name", e.Name, "submission_id", sub.ID, "attempt", sub.Attempts)
 	s.setJob(&JobStatus{SubmissionID: sub.ID, Name: e.Name, Source: "inbox", Phase: "staging", StartedAt: s.now(), PhaseAt: s.now()})
-	defer s.setJob(nil)
+	defer s.clearJob("inbox")
 	staged, err := inbox.Stage(s.cfg.InboxDir, e, s.cfg.StagingDir, "sub-"+strconv.FormatInt(sub.ID, 10)+"-"+strconv.Itoa(sub.Attempts),
 		inbox.Options{MaxSnapshotBytes: s.cfg.MaxInputBytes, ReserveBytes: s.cfg.StagingReserveBytes})
 	var out Outcome
@@ -1212,7 +1252,9 @@ type Status struct {
 	Submissions    []registry.Submission    `json:"submissions"`
 	Authorizations []registry.Authorization `json:"authorizations"`
 	Inbox          InboxStatus              `json:"inbox"`
+	Online         OnlineStatus             `json:"online"`
 	Job            *JobStatus               `json:"job"`
+	OnlineJob      *JobStatus               `json:"online_job"`
 	Storage        Capacity                 `json:"storage"`
 	Failpoints     []string                 `json:"failpoints,omitempty"`
 }
@@ -1241,6 +1283,15 @@ type InboxStatus struct {
 	LastScan ScanStatus `json:"last_scan"`
 }
 
+// OnlineStatus reports signed checks separately from publication success.
+type OnlineStatus struct {
+	Enabled bool `json:"enabled"`
+	registry.OnlineState
+	StaleAfterSeconds float64  `json:"stale_after_seconds"`
+	ActiveAgeSeconds  *float64 `json:"active_age_seconds"`
+	ActiveStale       *bool    `json:"active_stale"`
+}
+
 // Status gathers the operator status.
 func (s *Service) Status(ctx context.Context) (Status, error) {
 	st := Status{Policy: PolicyStatus{AutoActivate: s.cfg.AutoActivate, PinGraceSeconds: s.cfg.PinGrace.Seconds(),
@@ -1263,6 +1314,19 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	}
 	if st.Active, err = registry.Active(ctx, s.reg); err != nil {
 		return st, err
+	}
+	st.Online.Enabled = s.cfg.Online.ManifestURL != ""
+	st.Online.StaleAfterSeconds = s.cfg.OnlineStaleAfter.Seconds()
+	if st.Online.OnlineState, err = registry.GetOnlineState(ctx, s.reg); err != nil {
+		return st, err
+	}
+	if st.Active != nil && st.Active.DataTimestamp != nil {
+		age := max(0, s.now().Sub(*st.Active.DataTimestamp).Seconds())
+		st.Online.ActiveAgeSeconds = &age
+		if s.cfg.OnlineStaleAfter > 0 {
+			stale := age > s.cfg.OnlineStaleAfter.Seconds()
+			st.Online.ActiveStale = &stale
+		}
 	}
 	rels, err := registry.List(ctx, s.reg, 100)
 	if err != nil {
@@ -1290,6 +1354,10 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	if s.job != nil {
 		j := *s.job
 		st.Job = &j
+	}
+	if s.onlineJob != nil {
+		j := *s.onlineJob
+		st.OnlineJob = &j
 	}
 	s.mu.Unlock()
 	if st.Inbox.LastScan.Pending == nil {

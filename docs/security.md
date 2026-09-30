@@ -39,6 +39,7 @@ flowchart LR
 | Operator → operator API | holders of a token, by scope | separate process and port from the public API (no operator routes there); 127.0.0.1 only by default; bearer tokens of 256 random bits compared by SHA-256 in constant time; per-credential scopes `status`, `publish`, `rollback`, `cleanup`; `POST` bodies `application/json`, ≤ 16 KiB, strict (unknown fields rejected), reasons bounded; per-request timeout; `no-store`; every action and every refusal audited with the credential name (refusals rate-limited); tokens and bodies never logged |
 | Publisher/importer → database | importer role | not a superuser: `CREATEDB` only; it owns the registry and the release databases it creates; PostGIS comes from a template created at initialisation; the audit table rejects updates, deletes and truncation by trigger (the owner could drop the trigger: this protects against mistakes and application bugs, not against a compromised publisher) |
 | API → database | nobody: API input is untrusted | `karta_api` is a member of `karta_reader` with `CONNECT` + `SELECT`/`EXECUTE` only (registry: releases, active pointer and schema version; not submissions, authorizations or audit); sessions default read-only at the role, the release database and the connection; `statement_timeout` 3 s (connection) and 5 s (role); only parameterized SQL; release databases are frozen `default_transaction_read_only = on` after import; a release is served only while the serving toolchain equals the recorded one (checked on every new connection) |
+| Optional online HTTPS origin → publisher | pinned Ed25519 signing key and TLS trust | only with the opt-in Compose overlay; one origin, no redirects/proxies/URL secrets, public-address DNS check on every connection, signed region/timestamp/digest/size, bounded complete staging, Stage 2 verification and pointer CAS; a compromised publisher still has outbound access, so restrict egress at the host firewall. See ADR 0004. |
 | Client → API | untrusted | `GET`/`HEAD`/`OPTIONS` only, bodies rejected, 16 KiB header limit, 5 s header / 10 s read / request deadline, strict parameter validation (unknown or repeated parameters rejected, UTF-8 and control characters checked, bounded lengths and numbers), LIKE metacharacters removed by normalization and escaped again, errors without internal details, access logs without query strings |
 | Browser → demo | untrusted page context | CSP `default-src 'none'` with `script-src`/`connect-src` `'self'`, `frame-ancestors 'none'`; MapLibre and fonts served locally; no CDN, OSM tile or Nominatim access |
 
@@ -52,8 +53,10 @@ flowchart LR
 * The publisher's extra network (`operator`) exists only to publish the
   operator port; it is a bridge with IP masquerading disabled, so the
   publisher (which parses untrusted snapshots) has no NAT route to outside
-  hosts. This relies on Docker's bridge driver option; verify it on other
-  runtimes.
+  hosts in the base stack. The opt-in Stage 3 overlay attaches an outbound
+  network to the publisher; apply an egress firewall for its approved source.
+  The base isolation relies on Docker's bridge driver option; verify it on
+  other runtimes.
 * The running API makes no outbound connections: it needs the database and
   nothing else, and keeps answering during an internet outage. `make
   test-offline` runs it with no external route. It checks the container's

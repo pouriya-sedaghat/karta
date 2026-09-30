@@ -181,10 +181,28 @@ FROM registry.events ORDER BY id;
 
 GRANT SELECT ON registry.schema_migrations TO karta_reader;
 `,
+	3: `
+ALTER TABLE registry.submissions DROP CONSTRAINT submissions_source_check;
+ALTER TABLE registry.submissions ADD CONSTRAINT submissions_source_check CHECK (source IN ('inbox', 'cli', 'online'));
+ALTER TABLE registry.audit DROP CONSTRAINT audit_source_check;
+ALTER TABLE registry.audit ADD CONSTRAINT audit_source_check CHECK (source IN ('operator_api', 'inbox', 'cli', 'system', 'online'));
+CREATE TABLE registry.online_state (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    paused boolean NOT NULL DEFAULT false,
+    last_attempt timestamptz,
+    last_check timestamptz,
+    verified_digest text,
+    verified_timestamp timestamptz,
+    last_error text,
+    next_attempt timestamptz,
+    failures integer NOT NULL DEFAULT 0
+);
+INSERT INTO registry.online_state (singleton) VALUES (true);
+`,
 }
 
 // SchemaVersion is the registry schema this build writes.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 // Migrate brings the registry schema to SchemaVersion (idempotent; safe to
 // run concurrently from several processes).
@@ -534,7 +552,21 @@ func Activate(ctx context.Context, db TxBeginner, req ActivateRequest, lockTimeo
 	if req.CheckExpected && cur != req.Expected {
 		return res, fmt.Errorf("%w: expected %s, found %s", ErrActiveChanged, orNone(req.Expected), orNone(cur))
 	}
+	if req.Source == "online" {
+		var paused bool
+		if err := tx.QueryRow(ctx, `SELECT paused FROM registry.online_state WHERE singleton`).Scan(&paused); err != nil {
+			return res, err
+		}
+		if paused {
+			return res, ErrOnlinePaused
+		}
+	}
 	if cur == req.Target {
+		if req.Source == "operator_api" {
+			if _, err := tx.Exec(ctx, `UPDATE registry.online_state SET paused = true WHERE singleton`); err != nil {
+				return res, err
+			}
+		}
 		if err := Audit(ctx, tx, AuditEntry{Actor: req.Actor, Source: req.Source, Action: req.Action, Target: req.Target,
 			Outcome: OutcomeNoop, Reason: req.Reason, RequestID: req.RequestID, Detail: map[string]any{"note": "already active"}}); err != nil {
 			return res, err
@@ -587,6 +619,11 @@ ON CONFLICT (singleton) DO UPDATE SET release_id = EXCLUDED.release_id, activate
 	if err := Audit(ctx, tx, AuditEntry{Actor: req.Actor, Source: req.Source, Action: req.Action, Target: target.ID,
 		Outcome: OutcomeSucceeded, Reason: req.Reason, RequestID: req.RequestID, Detail: detail}); err != nil {
 		return res, err
+	}
+	if req.Source == "operator_api" {
+		if _, err := tx.Exec(ctx, `UPDATE registry.online_state SET paused = true WHERE singleton`); err != nil {
+			return res, err
+		}
 	}
 	if req.BeforeCommit != nil {
 		req.BeforeCommit()

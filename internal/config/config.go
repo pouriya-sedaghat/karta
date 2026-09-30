@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pouriya-sedaghat/karta/internal/dbconn"
+	"github.com/pouriya-sedaghat/karta/internal/online"
 )
 
 // Serve configures `karta serve`.
@@ -77,6 +78,12 @@ type Publisher struct {
 	OperatorListenAddr     string
 	OperatorTokensFile     string
 	OperatorRequestTimeout time.Duration
+	OnlineManifestURL      string
+	OnlinePublicKeyFile    string
+	OnlineInterval         time.Duration
+	OnlineTimeout          time.Duration
+	OnlineMaxBytes         int64
+	OnlineStaleAfter       time.Duration
 }
 
 // OperatorClient configures `karta operator`.
@@ -273,6 +280,28 @@ func LoadPublisher(getenv func(string) string) (Publisher, error) {
 		OperatorListenAddr:     r.str("KARTA_OPERATOR_LISTEN_ADDR", ":8081"),
 		OperatorTokensFile:     r.str("KARTA_OPERATOR_TOKENS_FILE", "/run/secrets/operator_tokens"),
 		OperatorRequestTimeout: r.dur("KARTA_OPERATOR_REQUEST_TIMEOUT", time.Minute, time.Second, 10*time.Minute),
+		OnlineManifestURL:      r.str("KARTA_ONLINE_MANIFEST_URL", ""),
+		OnlinePublicKeyFile:    r.str("KARTA_ONLINE_PUBLIC_KEY_FILE", ""),
+		OnlineInterval:         r.dur("KARTA_ONLINE_INTERVAL", time.Hour, time.Minute, 7*24*time.Hour),
+		OnlineTimeout:          r.dur("KARTA_ONLINE_TIMEOUT", 10*time.Minute, time.Second, 30*time.Minute),
+		OnlineStaleAfter:       r.dur("KARTA_ONLINE_STALE_AFTER", 0, 0, 30*24*time.Hour),
+	}
+	c.OnlineMaxBytes = int64(r.int("KARTA_ONLINE_MAX_MB", 1024, 1, 1<<20)) << 20
+	if c.OnlineManifestURL != "" {
+		if c.OnlineMaxBytes > c.MaxInputBytes {
+			r.errs = append(r.errs, errors.New("KARTA_ONLINE_MAX_MB must not exceed KARTA_MAX_INPUT_MB"))
+		}
+		if _, err := online.ValidateURL(c.OnlineManifestURL); err != nil {
+			r.errs = append(r.errs, fmt.Errorf("KARTA_ONLINE_MANIFEST_URL: %w", err))
+		}
+		if c.OnlinePublicKeyFile == "" {
+			r.errs = append(r.errs, errors.New("KARTA_ONLINE_PUBLIC_KEY_FILE is required for online updates"))
+		}
+		if st, err := os.Stat(c.OnlinePublicKeyFile); err != nil || !st.Mode().IsRegular() {
+			r.errs = append(r.errs, errors.New("KARTA_ONLINE_PUBLIC_KEY_FILE must be a regular file"))
+		}
+	} else if c.OnlinePublicKeyFile != "" {
+		r.errs = append(r.errs, errors.New("KARTA_ONLINE_PUBLIC_KEY_FILE requires KARTA_ONLINE_MANIFEST_URL"))
 	}
 	if c.RegionFile == "" {
 		r.errs = append(r.errs, errors.New("KARTA_REGION_FILE is required (the region configuration this deployment publishes)"))

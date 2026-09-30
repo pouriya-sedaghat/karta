@@ -1,0 +1,17 @@
+# Opt-in online publisher: docker compose -f compose.yaml -f compose.online.yaml up -d
+# The base deployment remains isolated. Only this overlay adds outbound access
+# to the publisher. No public API container uses this network.
+services:
+  publisher:
+    environment:
+      KARTA_ONLINE_MANIFEST_URL: ${KARTA_ONLINE_MANIFEST_URL:?set a trusted signed-manifest HTTPS URL}
+      KARTA_ONLINE_PUBLIC_KEY_FILE: /config/online-public-key.hex
+      KARTA_ONLINE_INTERVAL: ${KARTA_ONLINE_INTERVAL:-1h}
+      KARTA_ONLINE_TIMEOUT: ${KARTA_ONLINE_TIMEOUT:-10m}
+      KARTA_ONLINE_MAX_MB: ${KARTA_ONLINE_MAX_MB:-1024}
+      KARTA_ONLINE_STALE_AFTER: ${KARTA_ONLINE_STALE_AFTER:-0}
+    volumes:
+      - ${KARTA_ONLINE_PUBLIC_KEY_HOST_FILE:?set the trusted Ed25519 public key file}:/config/online-public-key.hex:ro
+    networks: [backend, operator, online]
+networks:
+  online: {}

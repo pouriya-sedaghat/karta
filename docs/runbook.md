@@ -44,8 +44,35 @@ roles `karta_reader` (NOLOGIN), `karta_api` (read-only sessions, 5 s statement
 timeout), `karta_importer` (CREATEDB, not superuser), the PostGIS/pg_trgm
 template `karta_template` and the registry database `karta_registry`. The
 publisher (or the first command-line import) creates and migrates the
-registry schema (version 2, docs/adr/0003-stage2-publication.md), including an
+registry schema (version 3; docs/adr/0003-stage2-publication.md and
+docs/adr/0004-stage3-online.md), including an
 existing Stage 1 registry, in place.
+
+## Draft Stage 3 online source (not yet accepted for deployment)
+
+The default `compose.yaml` keeps publisher egress disabled. A future online
+deployment explicitly adds `-f compose.online.yaml`, one HTTPS manifest URL
+and a read-only Ed25519 public key file. The URL, key, allowed update lag and
+resource budget are deployment decisions; no production values ship here.
+Set `KARTA_ONLINE_MANIFEST_URL`, `KARTA_ONLINE_PUBLIC_KEY_HOST_FILE`,
+`KARTA_ONLINE_INTERVAL`, `KARTA_ONLINE_TIMEOUT`, `KARTA_ONLINE_MAX_MB`, and
+`KARTA_ONLINE_STALE_AFTER` in `.env`. The key file contains 64 lowercase hex
+characters representing 32 public-key bytes. Restrict egress to the chosen
+provider at the host firewall. Do not enable the overlay until the Stage 3
+end-to-end acceptance gate passes.
+
+The provider signs canonical JSON payload bytes with Ed25519 and publishes
+an envelope containing base64 `payload` and `signature`. Payload fields are
+`region_id`, RFC 3339 `issued_at`, `expires_at`, `data_timestamp`, `sha256`,
+`size_bytes`, and `snapshot_url`. For provenance include `provenance_url`,
+`provenance_sha256`, and `provenance_size_bytes`. Both file URLs must be on
+the manifest's origin. The operator's `/v1/operator/status` and
+`/v1/operator/metrics` report signed checks, active data age and next attempt
+separately. An explicit activation or rollback pauses automatic online
+activation; `karta operator pause-online --reason '...'` and
+`karta operator resume-online --reason '...'` change that audited policy.
+Manual publication remains available offline. See ADR 0004 for recovery and
+key rotation.
 
 The publisher serves the region in `KARTA_PUBLISH_REGION` (a file name in
 `config/regions/`, default `tehran-chitgar`); set it in `.env` (for example
