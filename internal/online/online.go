@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/netip"
@@ -284,7 +285,15 @@ func Download(ctx context.Context, c Config, m Manifest, stagingDir string) (_ *
 	if err := syscall.Statfs(stagingDir, &fs); err != nil {
 		return nil, err
 	}
-	if fs.Bavail*uint64(fs.Bsize) < uint64(m.SizeBytes+c.ReserveBytes+max(m.ProvenanceSizeBytes, 0)) {
+	if c.ReserveBytes < 0 || fs.Bsize <= 0 {
+		return nil, errors.New("invalid staging reserve or filesystem block size")
+	}
+	needed := new(big.Int).SetInt64(m.SizeBytes)
+	needed.Add(needed, big.NewInt(c.ReserveBytes))
+	needed.Add(needed, big.NewInt(max(m.ProvenanceSizeBytes, 0)))
+	available := new(big.Int).SetUint64(fs.Bavail)
+	available.Mul(available, big.NewInt(fs.Bsize))
+	if available.Cmp(needed) < 0 {
 		return nil, errors.New("insufficient private staging space")
 	}
 	dir, err := os.MkdirTemp(stagingDir, "online-")
@@ -333,7 +342,12 @@ func downloadFile(ctx context.Context, client *http.Client, raw, path string, si
 		resp.Header.Get("Content-Encoding") != "" && resp.Header.Get("Content-Encoding") != "identity" {
 		return errors.New("source response status, size or encoding invalid")
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	f, err := root.OpenFile(filepath.Base(path), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

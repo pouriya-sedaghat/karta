@@ -2,8 +2,9 @@ package publish
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
-	"math/rand/v2"
+	"math/big"
 	"os"
 	"time"
 
@@ -36,7 +37,12 @@ func (s *Service) RunOnline(ctx context.Context) {
 			delay = min(time.Minute*time.Duration(1<<failures), 6*time.Hour)
 		}
 		// Jitter spreads retries across deployments without unbounded delay.
-		jitter := time.Duration(rand.Int64N(int64(delay/5 + 1)))
+		jitter := time.Duration(0)
+		if n, err := rand.Int(rand.Reader, big.NewInt(int64(delay/5+1))); err == nil {
+			jitter = time.Duration(n.Int64())
+		} else {
+			s.log.Warn("online retry jitter unavailable", "err", err)
+		}
 		next := s.now().Add(delay - delay/10 + jitter)
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		if err := registry.RecordOnlineAttempt(persistCtx, s.reg, code, next); err != nil {
