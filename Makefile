@@ -40,14 +40,20 @@ help: ## List targets
 secrets: ## Create database passwords and operator tokens in ./secrets (never overwrites)
 	@./scripts/gen-secrets.sh
 
+# Host directories that compose.yaml bind-mounts, created as the invoking user
+# before any compose command: Docker would create a missing bind-mount source
+# as root, and the inbox would then not be writable by `make publish`.
+.PHONY: data-dirs
+data-dirs:
+	@mkdir -p data/local $(INBOX) && chmod 755 $(INBOX)
+
 .PHONY: build
 build: ## Build the api and importer images
 	docker build $(BUILD_SECRET) --build-arg VERSION=$(VERSION) -f deploy/Dockerfile --target api -t karta-api:local .
 	docker build $(BUILD_SECRET) --build-arg VERSION=$(VERSION) -f deploy/Dockerfile --target importer -t karta-importer:local .
 
 .PHONY: up
-up: secrets ## Start PostgreSQL, the API and the publisher (the API reports not-ready until a release is published)
-	@mkdir -p $(INBOX) && chmod 755 $(INBOX)
+up: secrets data-dirs ## Start PostgreSQL, the API and the publisher (the API reports not-ready until a release is published)
 	$(COMPOSE) up -d --wait db
 	$(COMPOSE) up -d api publisher
 
@@ -58,7 +64,7 @@ wait-ready: ## Wait until /health/ready returns 200
 	done; curl -sS $(BASE_URL)/health/ready; echo; exit 1
 
 .PHONY: import-fixture
-import-fixture: ## Publish the committed synthetic fixture with the command-line importer (prints the JSON result)
+import-fixture: data-dirs ## Publish the committed synthetic fixture with the command-line importer (prints the JSON result)
 	@$(COMPOSE) run --rm -T importer --snapshot /data/testdata/fixture/karta-fixture.osm --region /config/regions/fixture.json $(IMPORT_FLAGS)
 
 .PHONY: verify-tehran
@@ -71,19 +77,17 @@ verify-tehran: ## Check the Chitgar extract and sidecar are present and match th
 	done
 
 .PHONY: import-tehran
-import-tehran: verify-tehran ## Publish the real Chitgar extract with the command-line importer (IMPORT_FLAGS=--allow-region-change replaces another region)
+import-tehran: data-dirs verify-tehran ## Publish the real Chitgar extract with the command-line importer (IMPORT_FLAGS=--allow-region-change replaces another region)
 	@mkdir -p $(ARTIFACTS)
 	@$(COMPOSE) run --rm -T importer --snapshot /data/local/tehran-chitgar.osm.pbf --region /config/regions/tehran-chitgar.json $(IMPORT_FLAGS) | tee $(ARTIFACTS)/tehran-import.json
 
 .PHONY: publish
-publish: ## Submit SNAPSHOT=file.osm.pbf (and its .provenance.json, if any) to the inbox with the completion protocol [NAME=...]
+publish: data-dirs ## Submit SNAPSHOT=file.osm.pbf (and its .provenance.json, if any) to the inbox with the completion protocol [NAME=...]
 	@test -n "$(SNAPSHOT)" || { echo "usage: make publish SNAPSHOT=path/to/file.osm.pbf [NAME=name]" >&2; exit 2; }
-	@mkdir -p $(INBOX) && chmod 755 $(INBOX)
 	@./scripts/submit.sh $(SNAPSHOT) $(INBOX) $(NAME)
 
 .PHONY: publish-tehran
-publish-tehran: verify-tehran ## Submit the Chitgar extract and sidecar to the inbox (publisher region tehran-chitgar, the default)
-	@mkdir -p $(INBOX) && chmod 755 $(INBOX)
+publish-tehran: data-dirs verify-tehran ## Submit the Chitgar extract and sidecar to the inbox (publisher region tehran-chitgar, the default)
 	@EXPECTED_SHA256=$(TEHRAN_SHA) ./scripts/submit.sh $(TEHRAN_PBF) $(INBOX) tehran-chitgar-$$(date -u +%Y%m%dT%H%M%SZ)
 
 .PHONY: op
@@ -95,7 +99,7 @@ op-status: ## Publication status: active and retained releases, submissions, aut
 	@$(COMPOSE) run --rm -T operator-cli status
 
 .PHONY: rotate-operator-tokens
-rotate-operator-tokens: ## Replace both operator tokens and restart the publisher with the new credentials
+rotate-operator-tokens: data-dirs ## Replace both operator tokens and restart the publisher with the new credentials
 	rm -f secrets/operator_token secrets/operator_monitor_token
 	./scripts/gen-secrets.sh
 	$(COMPOSE) up -d --no-deps --force-recreate publisher
@@ -153,7 +157,7 @@ test: ## Unit tests (no Docker needed)
 	go test -race -count=1 ./...
 
 .PHONY: test-integration
-test-integration: secrets ## Full-stack integration tests on an isolated compose project (committed fixtures only)
+test-integration: secrets data-dirs ## Full-stack integration tests on an isolated compose project (committed fixtures only)
 	@mkdir -p $(ARTIFACTS)
 	@inbox=$$(mktemp -d) && chmod 755 $$inbox && export KARTA_INBOX_HOST_DIR=$$inbox && \
 	  { $(TEST_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true; } && \
@@ -187,7 +191,7 @@ test-browser-prefix: ## Browser tests through a proxy serving Karta under /maps 
 	  status=$$?; $(COMPOSE) up -d --no-deps api; $(MAKE) -s wait-ready || status=1; exit $$status
 
 .PHONY: test-offline
-test-offline: secrets ## Disconnected run: API and DB on an internal-only network (checked), fixture imported, browser via container IP
+test-offline: secrets data-dirs ## Disconnected run: API and DB on an internal-only network (checked), fixture imported, browser via container IP
 	$(OFFLINE_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true
 	-@docker network rm $(OFFLINE_PROBE_NET) >/dev/null 2>&1
 	$(OFFLINE_COMPOSE) up -d --wait db
