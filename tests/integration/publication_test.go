@@ -211,11 +211,39 @@ var terminal = map[string]bool{"published": true, "ready": true, "duplicate": tr
 
 // waitSubmission waits for the submission of that name to reach a final state.
 func waitSubmission(t *testing.T, name string, timeout time.Duration) submission {
+	return waitSubmissionPolling(t, name, timeout, false)
+}
+
+// The operator status endpoint may briefly return 503 while PostgreSQL
+// reconnects after the deliberate restart. Only that scenario retries it;
+// other publication tests still fail on an unexpected 503.
+func waitSubmissionAfterDBRestart(t *testing.T, name string, timeout time.Duration) submission {
+	return waitSubmissionPolling(t, name, timeout, true)
+}
+
+func waitSubmissionPolling(t *testing.T, name string, timeout time.Duration, retryUnavailable bool) submission {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var last *submission
+	var lastUnavailable string
 	for time.Now().Before(deadline) {
-		for _, s := range status(t).Submissions {
+		var st opStatus
+		if retryUnavailable {
+			r := op(t, http.MethodGet, "/v1/operator/status", secret(t, "operator_monitor_token"), nil)
+			if r.status == http.StatusServiceUnavailable {
+				if code, _ := r.errorCode(t); code != "service_unavailable" {
+					t.Fatalf("unexpected operator status error: %d %s", r.status, r.body)
+				}
+				lastUnavailable = string(r.body)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			expectStatus(t, r, http.StatusOK)
+			r.json(t, &st)
+		} else {
+			st = status(t)
+		}
+		for _, s := range st.Submissions {
 			if s.Name == name {
 				c := s
 				last = &c
@@ -227,7 +255,7 @@ func waitSubmission(t *testing.T, name string, timeout time.Duration) submission
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	t.Fatalf("submission %s did not finish within %s; last %+v", name, timeout, last)
+	t.Fatalf("submission %s did not finish within %s; last %+v; last transient status error: %s", name, timeout, last, lastUnavailable)
 	return submission{}
 }
 
@@ -1604,7 +1632,7 @@ func TestPublication(t *testing.T) {
 			t.Fatalf("restart db: %s", stderr)
 		}
 		waitReady(t, true, "ready")
-		s := waitSubmission(t, "db-restart", 180*time.Second)
+		s := waitSubmissionAfterDBRestart(t, "db-restart", 180*time.Second)
 		if s.State != "published" || s.Attempts < 2 {
 			t.Fatalf("after the database restart: %+v", s)
 		}
