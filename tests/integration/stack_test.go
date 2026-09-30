@@ -213,9 +213,10 @@ type importResult struct {
 	} `json:"report"`
 }
 
-func runImport(t *testing.T, snapshot, region string) (importResult, int, string) {
+func runImport(t *testing.T, snapshot, region string, flags ...string) (importResult, int, string) {
 	t.Helper()
-	out, errOut, code := compose(t, "run", "--rm", "-T", "importer", "--snapshot", snapshot, "--region", region)
+	args := append([]string{"run", "--rm", "-T", "importer", "--snapshot", snapshot, "--region", region}, flags...)
+	out, errOut, code := compose(t, args...)
 	var res importResult
 	if strings.TrimSpace(out) != "" {
 		if err := json.Unmarshal([]byte(out), &res); err != nil {
@@ -336,8 +337,9 @@ func recreateAPI(t *testing.T, env ...string) {
 	waitReady(t, true, "ready")
 }
 
-// dropRelease is `make reset` for one release, done as the superuser: the
-// registry forgets every release and the release database is dropped.
+// dropRelease is `make reset` without restarting the stack, done as the
+// superuser: the registry forgets every release and every release database
+// (the active one, id, and any built without activation) is dropped.
 func dropRelease(t *testing.T, id string) {
 	t.Helper()
 	ctx := context.Background()
@@ -349,10 +351,15 @@ func dropRelease(t *testing.T, id string) {
 	}
 	reg.Close(ctx)
 	pg := superuser(t, "postgres")
+	defer pg.Close(ctx)
 	if _, err := pg.Exec(ctx, "DROP DATABASE karta_"+id+" WITH (FORCE)"); err != nil {
 		t.Fatal(err)
 	}
-	pg.Close(ctx)
+	for db := range databases(t) {
+		if _, err := pg.Exec(ctx, "DROP DATABASE "+db+" WITH (FORCE)"); err != nil {
+			t.Fatal(err)
+		}
+	}
 	waitReady(t, false, "no_active_release")
 }
 
@@ -384,6 +391,7 @@ func TestStack(t *testing.T) {
 	var releaseID, otherViewID, styleURL string
 	// fixtureStyle is the style served at the fixture release's pinned URL.
 	var fixtureStyle []byte
+	resetAll(t)
 
 	t.Run("readiness without data", func(t *testing.T) {
 		expectStatus(t, get(t, "/health/live"), http.StatusOK)
@@ -531,7 +539,7 @@ func TestStack(t *testing.T) {
 		if m.Attribution.Text != "© OpenStreetMap contributors" {
 			t.Errorf("attribution %q", m.Attribution.Text)
 		}
-		if m.Capabilities["address_geocoding"] || m.Capabilities["online_updates"] || m.Capabilities["manual_updates"] || !m.Capabilities["place_search"] {
+		if m.Capabilities["address_geocoding"] || m.Capabilities["online_updates"] || !m.Capabilities["manual_updates"] || !m.Capabilities["place_search"] {
 			t.Errorf("capabilities %v", m.Capabilities)
 		}
 		if r.header.Get("Cache-Control") != "no-cache" || r.header.Get("ETag") == "" {
@@ -1012,10 +1020,10 @@ func TestStack(t *testing.T) {
 		waitReady(t, true, "ready")
 	})
 
-	t.Run("a second release is refused while one is active", func(t *testing.T) {
+	t.Run("a release of another region does not replace the active one without an explicit region change", func(t *testing.T) {
 		_, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/data/testdata/regions/fixture-alt.json")
-		if code != 4 || !strings.Contains(stderr, "make reset") {
-			t.Fatalf("exit %d, want 4; stderr:\n%s", code, stderr)
+		if code != 4 || !strings.Contains(stderr, "region_changed") {
+			t.Fatalf("exit %d, want 4 (policy: region_changed); stderr:\n%s", code, stderr)
 		}
 		st := waitReady(t, true, "ready")
 		if st["release_id"] != releaseID {
@@ -1024,13 +1032,17 @@ func TestStack(t *testing.T) {
 	})
 
 	t.Run("a changed default view is a new release, never the same immutable URLs", func(t *testing.T) {
-		// While a release is active the importer refuses, and names the
-		// different id the changed region would get.
-		_, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/data/testdata/regions/fixture-other-view.json")
-		m := regexp.MustCompile(`(r[0-9a-f]{24}) is serving; .* before importing (r[0-9a-f]{24})`).FindStringSubmatch(stderr)
-		if code != 4 || m == nil || m[1] != releaseID || m[2] == releaseID {
-			t.Fatalf("exit %d, ids %v; stderr:\n%s", code, m, stderr)
+		// Built without activation (--no-activate): the changed region gets a
+		// different id, and the active release is untouched.
+		res, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/data/testdata/regions/fixture-other-view.json", "--no-activate")
+		if code != 0 || res.ReleaseID == "" || res.ReleaseID == releaseID {
+			t.Fatalf("exit %d, id %q (active %s); stderr:\n%s", code, res.ReleaseID, releaseID, stderr)
 		}
+		if st := waitReady(t, true, "ready"); st["release_id"] != releaseID {
+			t.Fatalf("active release changed to %v", st["release_id"])
+		}
+		// A validated but never activated release is not served.
+		expectError(t, get(t, "/v1/releases/"+res.ReleaseID+"/style.json"), http.StatusNotFound, "unknown_release", "release_id")
 	})
 
 	t.Run("a change below 1e-7 to the box, center or zoom is a new release too", func(t *testing.T) {
@@ -1038,10 +1050,9 @@ func TestStack(t *testing.T) {
 		// zoom by 1e-8 each: the snapshot header still matches (1e-7
 		// tolerance), and the manifest and style would publish the new
 		// values. Rounded identities made this "already active" (exit 0).
-		_, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/data/testdata/regions/fixture-sub-1e-7.json")
-		m := regexp.MustCompile(`(r[0-9a-f]{24}) is serving; .* before importing (r[0-9a-f]{24})`).FindStringSubmatch(stderr)
-		if code != 4 || m == nil || m[1] != releaseID || m[2] == releaseID {
-			t.Fatalf("exit %d, ids %v; stderr:\n%s", code, m, stderr)
+		res, code, stderr := runImport(t, "/data/testdata/fixture/karta-fixture.osm", "/data/testdata/regions/fixture-sub-1e-7.json", "--no-activate")
+		if code != 0 || res.ReleaseID == "" || res.ReleaseID == releaseID {
+			t.Fatalf("exit %d, id %q (active %s); stderr:\n%s", code, res.ReleaseID, releaseID, stderr)
 		}
 	})
 

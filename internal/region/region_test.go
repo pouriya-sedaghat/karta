@@ -1,6 +1,8 @@
 package region
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"math"
 	"os"
 	"path/filepath"
@@ -111,5 +113,71 @@ func TestIdentityIsExact(t *testing.T) {
 	r := c.Identity()
 	if r.ID != c.ID || r.Name != c.Name || r.BBox != c.BBox || r.Center != c.View.Center || r.Zoom != c.View.Zoom {
 		t.Errorf("identity %+v does not match %+v", r, c)
+	}
+}
+
+// The committed fixture region pins exactly the committed fixture files, so a
+// fixture edit that forgets the pin fails here, not in a Docker test.
+func TestFixtureRegionPinsCommittedSnapshots(t *testing.T) {
+	cfg, err := Load("../../config/regions/fixture.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []string{
+		"../../testdata/fixture/karta-fixture.osm",
+		"../../testdata/fixture/snapshots/karta-fixture-a.osm.pbf",
+		"../../testdata/fixture/snapshots/karta-fixture-b.osm.pbf",
+	}
+	var want []string
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(b)
+		want = append(want, hex.EncodeToString(sum[:]))
+	}
+	got := cfg.Source.PinnedDigests()
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("fixture.json pins %v; the committed files are %v", got, want)
+	}
+	if cfg.Source.Pinned(strings.Repeat("0", 64)) {
+		t.Fatal("an unpinned digest is reported as pinned")
+	}
+}
+
+func TestAllowedDigestsAreValidated(t *testing.T) {
+	cfg, err := Load("../../config/regions/fixture.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := cfg
+	bad.Source.AllowedSHA256 = []string{"ABC"}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "allowed_sha256[0]") {
+		t.Errorf("malformed digest: %v", err)
+	}
+	dup := cfg
+	dup.Source.AllowedSHA256 = append([]string{}, cfg.Source.AllowedSHA256[0], cfg.Source.AllowedSHA256[0])
+	if err := dup.Validate(); err == nil || !strings.Contains(err.Error(), "repeats") {
+		t.Errorf("duplicate digest: %v", err)
+	}
+	drop := 1.0
+	cfg.Validation.MaxDropFraction = &drop
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "max_drop_fraction") {
+		t.Errorf("max_drop_fraction 1: %v", err)
+	}
+}
+
+// Every region file the integration tests use must load, so a failing
+// integration case fails for the reason it tests.
+func TestTestdataRegionsLoad(t *testing.T) {
+	files, err := filepath.Glob("../../testdata/regions/*.json")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no testdata regions: %v", err)
+	}
+	for _, f := range files {
+		if _, err := Load(f); err != nil {
+			t.Errorf("%s: %v", f, err)
+		}
 	}
 }

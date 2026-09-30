@@ -1,23 +1,39 @@
-# Karta Stage 1 runbook
+# Karta runbook (Stage 2)
 
-Stage 1 serves **one** imported release: vector tiles, a MapLibre style with
-local glyphs, named-place/POI search and a demo page, all from the local host.
-Replacing the served data requires a reset (downtime); staged releases with
-atomic switching are Stage 2 and are not available yet.
+Karta serves one **active release** of one region: vector tiles, a MapLibre
+style with local glyphs, named-place/POI search and a demo page, all from the
+local host. An operator publishes new releases **while serving** by placing
+snapshots in a local inbox (or with the command-line importer); a release is
+built in an isolated candidate database, validated, and activated in one
+registry transaction. Replaced releases stay servable to pinned clients for a
+grace period and are kept for rollback; old ones are cleaned up. Online
+downloads (Stage 3) are not available: every snapshot arrives through the
+inbox or the command line.
 
 Requirements: Docker Engine with Compose v2.24+ (for `!reset`/`!override` in
 the overlay files), GNU make, `curl`. Go 1.27+ only for tests and
 development. Images are built locally; after `make build` nothing is fetched
 from the network by any service.
 
+## Services
+
+| Service | Image, user | Role | Network, port |
+| --- | --- | --- | --- |
+| `db` | PostGIS 18-3.6 | registry + one database per release | `backend` (internal), no port |
+| `api` | distroless, UID 65532, read-only DB role | public read API, `/demo/` | `backend` + `frontend`, 127.0.0.1:8080 |
+| `publisher` | importer image, UID 10001 | inbox watcher, builds, activation, cleanup, **operator API** | `backend` + `operator` (no NAT), 127.0.0.1:8081 |
+| `operator-cli` | api image, UID 65532 | one-off operator API client (`make op`), holds the raw operator token | `operator` |
+| `importer` | importer image, UID 10001 | one-off command-line publication (`make import-*`) | `backend` |
+
 ## Bootstrap
 
 ```bash
-make secrets        # random passwords in ./secrets (0700 dir), never overwritten
+make secrets        # random DB passwords and operator tokens in ./secrets (0700), never overwritten
 make build          # karta-api:local (distroless, 25 MB) and karta-importer:local
-make up             # PostgreSQL (waits until healthy), then the API
+make up             # PostgreSQL (waits until healthy), then the API and the publisher
 curl -s http://localhost:8080/health/ready
-# 503 {"status":"not_ready","reason":"no_active_release",...}   <- expected before an import
+# 503 {"status":"not_ready","reason":"no_active_release",...}   <- expected before the first publication
+make op-status      # the publisher's view: region, policy, releases, submissions, storage
 ```
 
 On a network that intercepts TLS, pass its CA bundle to the build:
@@ -26,63 +42,361 @@ On a network that intercepts TLS, pass its CA bundle to the build:
 `db` initialisation (first start only) runs `deploy/postgres/initdb/10-karta.sh`:
 roles `karta_reader` (NOLOGIN), `karta_api` (read-only sessions, 5 s statement
 timeout), `karta_importer` (CREATEDB, not superuser), the PostGIS/pg_trgm
-template `karta_template` and the registry database `karta_registry`.
+template `karta_template` and the registry database `karta_registry`. The
+publisher (or the first command-line import) creates and migrates the
+registry schema (version 2, docs/adr/0003-stage2-publication.md), including an
+existing Stage 1 registry, in place.
+
+The publisher serves the region in `KARTA_PUBLISH_REGION` (a file name in
+`config/regions/`, default `tehran-chitgar`); set it in `.env` (for example
+`KARTA_PUBLISH_REGION=fixture`) and `make up` again to change it.
+
+## Publish a snapshot (the inbox)
+
+The inbox is `./data/inbox` (`KARTA_INBOX_HOST_DIR` overrides it), mounted
+read-only into the publisher. A submission named `NAME` is:
+
+| File | |
+| --- | --- |
+| `NAME.osm.pbf` | the snapshot (OSM PBF only; `NAME` matches `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) |
+| `NAME.osm.pbf.provenance.json` | optional provenance sidecar (required by regions with `require_provenance`) |
+| `NAME.osm.pbf.ready` | **completion marker, written last**: the snapshot's SHA-256 (64 hex digits), optionally followed by the file name, i.e. a `sha256sum` line |
+
+**Completion protocol.** Copy each file under a temporary name that does not
+end in these suffixes (a leading dot, or `.part`), rename it into place, and
+create the marker last, also by rename. `scripts/submit.sh` does exactly this:
+
+```bash
+make publish SNAPSHOT=/path/to/snapshot.osm.pbf [NAME=name]     # or: scripts/submit.sh FILE [INBOX] [NAME]
+EXPECTED_SHA256=<hex> scripts/submit.sh FILE                    # refuses a file with another digest
+```
+
+What the publisher does, every `KARTA_INBOX_POLL_INTERVAL` (10 s):
+
+1. Lists the inbox. A submission without a marker is shown as
+   `waiting_for_ready_marker` and **never opened**; files not following the
+   naming rules are ignored; hidden files are the producer's business.
+2. Waits until all of the submission's files have kept their size, mtime and
+   inode for `KARTA_INBOX_SETTLE` (5 s).
+3. Copies the snapshot and sidecar into private staging (never through a
+   symlink; directories, devices and FIFOs are rejected without being
+   opened) and hashes the copy; the source must not change during the copy
+   and the digest must equal the marker's.
+4. Verifies the **staged copy**: the whole PBF structure, the region box
+   (PBF header or sidecar), the provenance sidecar, a trustworthy data
+   timestamp, and that the digest is **pinned or authorized** (next section).
+5. Refuses snapshots older than the active release (see "Rules").
+6. Checks storage, then builds and validates a candidate release database
+   while the API keeps serving the active release.
+7. Activates it in one registry transaction (unless
+   `KARTA_PUBLISH_AUTO_ACTIVATE=false`: then it stays `ready` for
+   `make op CMD='activate --release ID --reason ...'`), and runs retention
+   cleanup. The API switches within `KARTA_RELEASE_POLL_INTERVAL` (5 s).
+
+Follow it with `make op-status` (submissions show `state`, `reason_code` and
+`reason`) and `make logs`. Outcomes are recorded per exact set of files: the
+same unchanged files are never processed again, even after a restart.
+**To submit the same files again** (after authorizing a digest, freeing disk
+space, or a failed build), touch the marker: `touch data/inbox/NAME.osm.pbf.ready`.
+Processed files stay in the inbox (the publisher cannot write there); remove
+them when their outcome is recorded.
+
+| Submission state | Meaning |
+| --- | --- |
+| `published` | built, validated and activated |
+| `ready` | built and validated, not activated: `manual_activation`, `active_changed` (an operator switched releases during the build), or `excessive_data_loss` (a resubmitted ready release would lose too much data relative to the release active now) |
+| `duplicate` | `duplicate_active` (already active: nothing to do) or `duplicate_retained` (exists as a retained release: roll back or activate it instead) |
+| `rejected` | the input failed a check; nothing was built |
+| `failed` | the build or validation failed (the candidate was dropped), or the active release's row counts could not be read (`counts_unavailable`: nothing was built) |
+| `interrupted` | the process or database stopped during it; retried automatically up to `KARTA_PUBLISH_MAX_ATTEMPTS` (3) times |
+
+| Reason code | Cause |
+| --- | --- |
+| `symlink`, `not_regular_file`, `invalid_name` | the submission's files are not plain regular files with a valid name |
+| `invalid_marker`, `marker_digest_mismatch` | the marker is malformed, or the file is not the one the marker describes (incomplete or changed copy) |
+| `changed_during_copy`, `empty_file`, `too_large` | the file changed while staged, is empty, or exceeds `KARTA_MAX_INPUT_MB` |
+| `malformed_snapshot` | truncated, padded or corrupt PBF, unsupported compression or features (history files) |
+| `region_mismatch` | the snapshot's box (header or sidecar) is not the region's box |
+| `provenance_required`, `provenance_invalid` | missing sidecar, or its digest, size, license, box or timestamps do not match |
+| `timestamp_missing`, `timestamp_untrusted` | no data timestamp in the sidecar or header, the two disagree, or it is in the future or before 2004 |
+| `unauthorized_digest` | the SHA-256 is neither pinned in the region file nor authorized by an operator |
+| `older_than_active`, `not_newer`, `region_changed` | the rules below |
+| `insufficient_storage` | not enough space for staging, the storage budget or the database volume, or the disk filled during the build |
+| `validation_failed`, `build_failed` | the candidate failed a region check (counts, relative drop, tiles, searches) or osm2pgsql/SQL failed |
+| `counts_unavailable` | `validation.max_drop_fraction` is set and the active release of the region has no readable row counts (not in the registry, and not decodable from the import report in its database, as for a damaged Stage 1 release); the relative gate is never skipped, so nothing is built. Check the active release's database, or roll back to a release with counts, then touch the marker |
+| `excessive_data_loss` | activating the release would drop more rows than `validation.max_drop_fraction` allows relative to the release active at the switch |
+
+### Rules
+
+* **Forward only.** A snapshot replaces the active release only if it is for
+  the same region and has a **newer data timestamp** (from the provenance
+  source header or the PBF header; file times are never used), or is the
+  **same snapshot** (same SHA-256) rebuilt, for example after a database
+  image upgrade. Older snapshots (`older_than_active`) and different
+  snapshots with the same timestamp (`not_newer`) are refused before any
+  build; going back is a rollback.
+* **Duplicates never switch.** A snapshot whose release is active is a no-op;
+  one whose release is retired is refused (roll back to it explicitly).
+* **No silent data loss.** With `validation.max_drop_fraction`, a new
+  release must keep at least `1 - fraction` of every counted table's rows of
+  the active release of the same region. It is checked when the candidate
+  is validated and again, inside the pointer transaction, against the
+  release active at the moment of every forward switch (publication or
+  `activate`): a release kept `ready` while someone rolled back to a
+  release with more data is refused (`excessive_data_loss`). If the active
+  release's counts cannot be read, the publication or activation is refused
+  (`counts_unavailable`), never let through. Rollback has its own policy and
+  no count gate. If a large drop is intended, raise `max_drop_fraction` in
+  the region file through a reviewed change.
+* **One at a time, in name order.** Builds are serialized; with several
+  ready submissions the newest valid one ends up active regardless of order.
+* **Region changes are explicit**: `make import-tehran IMPORT_FLAGS=--allow-region-change`,
+  or `allow_region_change` on an operator activation or rollback.
+
+## Authorize a new snapshot
+
+Every snapshot's SHA-256 must be **pinned** in the region file or
+**authorized** by an operator; there is no setting that accepts arbitrary or
+merely newer files. `config/regions/tehran-chitgar.json` pins exactly the
+2026-09-27 Chitgar extract; a newer extract is refused (`unauthorized_digest`)
+until you authorize it:
+
+1. Obtain the new extract and verify it **out of band**: record where it came
+   from, check its SHA-256 against the provider's published checksum or your
+   own extraction record (`scripts/extract_tehran.py` writes the sidecar),
+   and inspect it (`osmium fileinfo -e`).
+2. Authorize exactly that digest and size (the reason is audited):
+
+   ```bash
+   make op CMD='authorize --sha256 <64 hex> --size <bytes> --reason "Chitgar 2026-10-04, checked against extraction log X"'
+   # optional: --expires 2026-10-31T00:00:00Z
+   ```
+
+3. Submit it (`make publish-tehran` for the development file, or
+   `make publish SNAPSHOT=...`). A submission already rejected as
+   `unauthorized_digest` is re-evaluated automatically on the next scan.
+
+Revoke an authorization that was not used:
+`make op CMD='revoke --sha256 <hex> --reason "..."'` (built releases stay).
+Alternatively, pin the digest permanently by adding it to `allowed_sha256` in
+the region file through a reviewed change; the publisher reads the region file
+for every submission.
+
+## Operator API
+
+The operator API is served by the publisher on `127.0.0.1:8081`
+(`KARTA_OPERATOR_BIND`, `KARTA_OPERATOR_PORT`), never by the public API. The
+contract is [`openapi/operator.yaml`](../openapi/operator.yaml). Every
+request needs a bearer token; every action needs a `reason` and is audited
+with the credential name.
+
+```bash
+make op-status                                           # status (monitor or operator token)
+make op CMD='audit --limit 50'                           # newest audit records
+make op CMD='rollback --reason "B has broken labels"'    # to the most recently replaced release
+make op CMD='rollback --release rXXXX --reason "..."'    # to a specific retained release
+make op CMD='activate --release rXXXX --reason "..."'    # a ready release (forward only, row counts re-checked)
+make op CMD='cleanup --dry-run --reason "check"'         # what cleanup would remove
+make op CMD='cleanup --reason "free space"'
+# the same over HTTP from the host:
+curl -s -H "Authorization: Bearer $(cat secrets/operator_token)" http://127.0.0.1:8081/v1/operator/status
+curl -s -X POST -H "Authorization: Bearer $(cat secrets/operator_token)" -H 'Content-Type: application/json' \
+     -d '{"reason":"bad data","expected_active_release_id":"rYYYY"}' http://127.0.0.1:8081/v1/operator/rollback
+```
+
+`expected_active_release_id` (`--expected`) makes a switch conditional on the
+release you looked at: if someone switched meanwhile you get
+`409 active_release_changed` instead of undoing their change. Without it, the
+release active when your request arrives is expected. `409 busy` means
+another switch holds the pointer lock (retry after `Retry-After`); a running
+import never blocks a rollback.
+
+### Credentials
+
+`make secrets` creates two random 256-bit tokens and the file the publisher
+reads:
+
+| File | Holder | Scopes |
+| --- | --- | --- |
+| `secrets/operator_token` | operators (`operator-cli`, curl) | `status`, `publish`, `rollback`, `cleanup` |
+| `secrets/operator_monitor_token` | monitoring | `status` |
+| `secrets/operator_tokens` | publisher | `NAME SCOPES SHA256(token)` per line: hashes only |
+
+To add a credential (for example a second operator with only `rollback`),
+generate a token (`od -An -N32 -tx1 /dev/urandom | tr -d ' \n'`), append
+`name rollback,status <sha256 of the token>` to `secrets/operator_tokens`
+(`scripts/gen-secrets.sh` rewrites that file, so keep extra lines in your
+secret store and re-append them) and restart the publisher. Rotate the two
+generated tokens with `make rotate-operator-tokens`. In production keep the
+raw tokens on the operators' side only and give the publisher the hash file
+through the orchestrator's secret store. Tokens are never logged; failed
+authentication is logged and audited (at most 30 audit rows per minute).
+
+## Rollback and pinned clients
+
+* **Rollback** changes only the active pointer, in one audited transaction,
+  to a retained (`ready` or `retired`), validated release that passes the
+  same compatibility checks as serving (schema major, style, serving
+  database toolchain). Removed, failed or incompatible releases are refused
+  (`409`). Rollback is immediate; the API follows within 5 s.
+* **Pinned clients.** When a release is replaced (publication or rollback),
+  clients that pinned its `release_id` keep getting it for
+  `KARTA_RELEASE_PIN_GRACE` (24 h); requests already running always finish on
+  their release. After the grace period, or once cleanup removed it, pinned
+  URLs answer `410 release_expired` and clients refetch the manifest (the
+  demo does). The grace is recorded per release (`pinned_until`) in the
+  registry, so API restarts and several API instances agree.
+* After a rollback, a submission that was building finishes as `ready`
+  (`active_changed`) instead of activating; activate it explicitly if wanted.
+
+## Retention and cleanup
+
+Cleanup keeps the active release, the `KARTA_RETAIN_RELEASES` (2) most
+recent other validated releases (rollback targets), and every release inside
+its pin grace plus `KARTA_CLEANUP_MARGIN` (5 min, longer than the API's
+drain). It never removes a release while any database session uses it. It
+runs after every publication, every `KARTA_CLEANUP_INTERVAL` (15 min) and on
+request (`make op CMD='cleanup --reason ...'`, with `--dry-run` to preview).
+Removed releases keep their registry row (`removed`) and their audit trail.
+An operator's cleanup is audited with its actual result: `succeeded` (it
+removed releases), `noop` (a dry run, whose record lists `would_remove`, or
+nothing to remove) or `failed` (it ended with an error: `503`, the record's
+`error` and the releases it had already `removed`). Rerun it after fixing
+the cause; a release left `removing` is finished by the next cleanup or at
+start.
+
+## Recovery after interruption
+
+Nothing needs to be done by hand after a crash, kill, host reboot or database
+restart: restart the service (Compose does, `restart: unless-stopped`). At
+every start the publisher (and every command-line import, first):
+
+* drops leftover candidate databases and staging copies;
+* marks releases stuck `importing`/`validating` as `failed` and drops their
+  databases; finishes interrupted removals;
+* drops release databases no retained release references;
+* marks submissions left `processing` as `interrupted`; the inbox scan
+  retries them (up to 3 attempts, then `failed`, `too_many_attempts`).
+
+The active pointer only moves in a committed transaction, so after any
+interruption it names either the previous release or the new one, never a
+partial one; a publication interrupted after the switch committed is
+reported as `duplicate_active` when retried. A build that fails because the
+database went away is retried, not failed. The API keeps serving from its
+loaded releases while the registry is unreachable.
+
+## Storage
+
+A release database is about 17 MB for the fixture and 34 MB for the Chitgar
+sample (most of the fixture's is the PostGIS template); a publication needs
+room for the active release, the retained releases and one candidate at the
+same time. Checks before a build:
+
+* staging (`staging` volume): the snapshot plus `KARTA_STAGING_RESERVE_MB` (64);
+* `KARTA_RELEASE_STORAGE_BUDGET_MB` (10240): all release databases plus the
+  candidate estimate (`max(1.25 × the region's largest release,
+  KARTA_CANDIDATE_SIZE_FACTOR (40) × snapshot + 32 MiB)`);
+* optional `KARTA_DB_VOLUME_PATH`: a path in the publisher container on the
+  database volume (mount it read-only); its free space must exceed the
+  estimate plus `KARTA_MIN_FREE_MB` (512).
+
+If the disk still fills during a build, the build fails
+(`insufficient_storage`), the candidate is dropped and serving continues;
+free space and touch the marker. `KARTA_RELEASE_TABLESPACE` puts new release
+databases in a PostgreSQL tablespace (created by the superuser, with `CREATE`
+granted to `karta_importer`) on a separate volume, so imports cannot fill the
+volume holding the registry. `make op-status` shows current use.
 
 ## Import the fixture
 
 ```bash
-make -s import-fixture > fixture-import.json   # JSON report on stdout, logs on stderr
+make -s import-fixture > fixture-import.json   # command-line publication; JSON result on stdout, logs on stderr
 make wait-ready                                 # the API picks the release up within 5 s
 make smoke
 ```
 
 The fixture (`testdata/fixture/karta-fixture.osm`, CC0) imports in under a
-second. The report lists counts, skipped geometry, clipping, every validation
-check and timings; a failed check aborts the import and leaves no release.
+second; its digest is pinned in `config/regions/fixture.json`, like the two
+PBF snapshots A and B the publication tests use
+(`testdata/fixture/snapshots/`). To publish those through the inbox instead,
+start the publisher with `KARTA_PUBLISH_REGION=fixture` and
+`make publish SNAPSHOT=testdata/fixture/snapshots/karta-fixture-a.osm.pbf`.
 
 ## Import the real Chitgar sample
 
 The PBF and its sidecar are **not** in Git. Copy the two supplied files into
-`data/local/` (see `docs/development-data.md`), then:
+`data/local/` (see `docs/development-data.md`), then either publish them
+through the inbox (the publisher's default region is `tehran-chitgar`):
 
 ```bash
-make verify-tehran    # both files present, SHA-256 7d0e69a2…191e, world-readable (importer is UID 10001)
-make reset            # Stage 1 keeps one release: remove the fixture release first
+make verify-tehran    # both files present, SHA-256 7d0e69a2…191e, world-readable (the publisher is UID 10001)
 make up
-make import-tehran    # report also written to artifacts/tehran-import.json
+make publish-tehran   # copies PBF + sidecar into data/inbox with the completion protocol
+make op-status        # the submission becomes published; or follow `make logs`
 make wait-ready
 make test-browser-tehran   # renders lake, park/road and mall views; screenshots in artifacts/tehran/
 ```
 
-`config/regions/tehran-chitgar.json` pins the snapshot digest and requires the
-provenance sidecar: a different file (even a newer Geofabrik snapshot) is
-refused with exit code 3. Do not substitute another snapshot silently.
+or with the command-line importer (`make import-tehran`; add
+`IMPORT_FLAGS=--allow-region-change` if another region's release is active,
+for example the fixture). `config/regions/tehran-chitgar.json` pins the
+snapshot digest and requires the provenance sidecar: a different file (even a
+newer Geofabrik snapshot) is refused until authorized (above). Do not
+substitute another snapshot silently.
 
-## Import exit codes
+## Command-line import (`karta import`) and exit codes
+
+`make import-*` runs `karta import --snapshot FILE --region FILE` in the
+importer container. It stages, verifies, builds and activates exactly like an
+inbox submission and is audited as actor `cli`. Flags: `--no-activate`
+(build and validate only; activate later), `--allow-region-change`,
+`--provenance FILE`, `--reason TEXT`, `--actor NAME`, `--report FILE`,
+`--keep-failed`.
 
 | Code | Meaning | Active release |
 | --- | --- | --- |
-| 0 | imported and activated, or this exact release is already active | new / unchanged |
+| 0 | published and activated; this exact release is already active; or built and ready (`--no-activate`) | new / unchanged |
 | 2 | usage or configuration error | unchanged |
-| 3 | input verification failed: digest, provenance, header box, size, symlink, timestamp | unchanged |
-| 4 | a different release is already active (Stage 1 serves one; `make reset` first) | unchanged |
-| 5 | release validation failed (counts, tile contract, style, search or tile checks) | unchanged |
+| 3 | input verification failed: digest not pinned or authorized, provenance, box, size, symlink, timestamp, malformed PBF | unchanged |
+| 4 | refused by policy: older than the active release, not newer, another region, a retained duplicate, or the active release changed during the build (the release is left `ready`) | unchanged |
+| 5 | release validation failed (counts, relative drop, tile contract, style, search or tile checks) | unchanged |
+| 6 | insufficient storage (budget, staging, database volume, or the disk filled) | unchanged |
+| 7 | another build holds the lock (`KARTA_IMPORT_LOCK_TIMEOUT`) | unchanged |
 | 1 | other failure (database, osm2pgsql) | unchanged |
 | 130 | interrupted | unchanged |
 
-Each import builds in a working database `karta_c<random>`; the release id
-is derived there (it includes the database toolchain versions) and the
-database is renamed to `karta_<release_id>` only after every check passed. On
-failure the candidate is dropped (`--keep-failed` keeps it for inspection
-until the next import, which removes leftover candidates) and the registry
-records the release as `failed` with the reason. Changing a region's name,
-box or default view (by any amount), the provenance sidecar or the toolchain
-gives a new release id; changing only its acceptance thresholds does not.
+Each build runs in a working database `karta_c<random>`; the release id is
+derived there (it includes the database toolchain versions) and the database
+is renamed to `karta_<release_id>` only after every check passed. On failure
+the candidate is dropped (`--keep-failed` keeps it for inspection until the
+next build, which removes leftover candidates) and the registry records the
+release as `failed` with the reason. Changing a region's name, box or default
+view (by any amount), the provenance sidecar or the toolchain gives a new
+release id; changing only its acceptance thresholds does not.
+
+## Upgrading the database image
+
+Tiles and normalized search terms are computed by the serving PostgreSQL.
+The API serves a release only while the running PostgreSQL, PostGIS, GEOS,
+PROJ, pg_trgm and ICU versions equal the ones recorded when it was built
+(checked when a release is loaded and on every new connection), so an
+immutable tile URL never serves bytes computed by other software. After an
+upgrade that changes any of them, readiness reports `release_incompatible`
+(`detail` names the components) until the snapshot is published again:
+
+1. Plan a maintenance window: until step 3 the API answers `503`.
+2. Upgrade the image (pinned by digest in `compose.yaml`) and `make up`.
+3. Submit the active snapshot again (touch its ready marker in the inbox, or
+   `make import-*`): the same snapshot rebuilt is allowed by the forward
+   rule, gets a new release id (the toolchain is part of it) and is activated.
+4. Retained releases built with the old toolchain cannot be rolled back to
+   (`release_incompatible`); cleanup removes them over time.
 
 ## Normal operation
 
 * `make up` / `make down` start and stop without losing data; the API reloads
-  the active release on start. Readiness (`/health/ready`) is 200 only with a
+  the active release (and pinned retired ones) on start; the publisher runs
+  its recovery and resumes watching the inbox. Readiness (`/health/ready`) is 200 only with a
   loaded, compatible release and a reachable database; liveness
   (`/health/live`) reports the process only. The Compose health check uses
   readiness.
@@ -92,7 +406,8 @@ gives a new release id; changing only its acceptance thresholds does not.
 * If PostgreSQL goes away, readiness turns 503 `database_unavailable` and data
   requests return 503; the API recovers by itself when the database returns.
 * Resource limits (override in `.env`): db 2 GiB / 2 CPUs, api 512 MiB / 1 CPU,
-  importer 4 GiB. Measured use for the Chitgar sample is in the PR description.
+  publisher 4 GiB / 2 CPUs, importer 4 GiB. Measured use is in the PR
+  descriptions (Stage 1 for the Chitgar import, Stage 2 for publication).
 * Upgrading the API image or changing `KARTA_PUBLIC_BASE_URL` needs no cache
   purge and no re-import: existing releases keep their ids and tile URLs, the
   style gets a new content-addressed URL (the manifest issues it), and style
@@ -110,10 +425,8 @@ gives a new release id; changing only its acceptance thresholds does not.
   If the old base URL can't be kept, browser-cached copies fail to load tiles
   and glyphs until they expire. Purging a CDN does not clear browser caches.
   See `docs/api.md`, "Transition from builds before content-addressed styles".
-* Upgrading the database image (PostgreSQL/PostGIS) is different: tiles are
-  generated on the serving database, and the API does not yet compare its
-  versions with the toolchain a release was built with. Upgrade it only
-  together with `make reset` and a re-import, which gives a new release id.
+* Upgrading the database image (PostgreSQL/PostGIS) is different: see
+  "Upgrading the database image" above.
 
 ## Behind a reverse proxy with a path prefix
 
@@ -141,13 +454,18 @@ tests through such a proxy (see Development).
 
 ## Reset and cleanup
 
+Removing individual releases is `make op CMD='cleanup ...'` (above). A
+reset is only needed to start over:
+
 ```bash
-make reset   # docker compose down -v: deletes ALL imported releases (the pgdata volume)
+make reset   # docker compose down -v: deletes ALL releases, the registry and its audit log (the pgdata and staging volumes)
 make clean   # reset + remove images, web/dist, web/node_modules and artifacts/
 ```
 
-Secrets in `./secrets` survive both; delete the directory to rotate them
-together with a `make reset` (the roles are created only at first initialisation).
+Secrets in `./secrets` survive both; delete the directory to rotate the
+database passwords together with a `make reset` (the roles are created only
+at first initialisation). Operator tokens rotate without a reset
+(`make rotate-operator-tokens`).
 
 ## Simulated disconnected run
 
@@ -178,8 +496,10 @@ Persian presentation-form glyph ranges were served.
 make web                       # npm ci + copy MapLibre into web/dist (pinned, integrity-checked)
 KARTA_PUBLIC_BASE_URL=http://localhost:8080 KARTA_DB_HOST=… KARTA_DB_PASSWORD_FILE=… \
 KARTA_WEB_DIR=web/dist go run ./cmd/karta serve
-make lint test                 # gofmt, vet, staticcheck, govulncheck, gosec; unit tests
-make test-integration          # isolated compose project on ports 18080/55433
+make lint test                 # gofmt, vet, staticcheck, govulncheck, gosec, fixture check; unit tests
+make test-integration          # isolated compose project on ports 18080/18081/55433 (Stage 1 and Stage 2 suites)
+make test-integration RUN=TestPublication   # only the publication suite
+make fixtures                  # regenerate testdata/fixture/snapshots/*.osm.pbf from their XML sources
 make test-browser              # browser tests against the running stack (BASE_URL)
 make test-browser-prefix       # the same through a proxy serving Karta under /maps, API restarted with that base URL
 ```
@@ -188,8 +508,13 @@ make test-browser-prefix       # the same through a proxy serving Karta under /m
 
 | Symptom | Check |
 | --- | --- |
-| readiness `no_active_release` | no import yet, or the last import failed: read its report/stderr |
-| readiness `release_incompatible` | the release's schema major, style layers or fonts do not match this API build; `detail` names the problem; re-import with the matching importer |
-| import exit 3 "refusing to import a different snapshot" | the file is not the pinned snapshot; restore the documented file |
-| import exit 3 "permission denied" | `chmod 0644` the snapshot and sidecar (importer runs as UID 10001) |
+| readiness `no_active_release` | nothing published yet, or every publication failed: `make op-status` (submissions) |
+| readiness `release_incompatible` | the release's schema major, style layers, fonts or **serving database toolchain** do not match; `detail` names the problem; publish the snapshot again (see "Upgrading the database image") |
+| a submission stays `waiting_for_ready_marker` | write the `.ready` marker (last), e.g. with `scripts/submit.sh` |
+| submission `unauthorized_digest` / import exit 3 "refusing to import a different snapshot" | the file is not a pinned snapshot: restore the documented file, or verify and authorize the new one |
+| submission `marker_digest_mismatch` | the copy is incomplete or the file changed: copy it again with the protocol and touch the marker |
+| import exit 3 "permission denied", submission `io_error` | `chmod 0644` the snapshot and sidecar and `0755` the inbox (the publisher and importer run as UID 10001) |
+| pinned client gets `410 release_expired` | its release was replaced more than `KARTA_RELEASE_PIN_GRACE` ago or removed: refetch the manifest |
+| operator API `401` / `403` | wrong token file, or the credential lacks the scope; see `make op-status` with the operator token |
+| operator API `409 busy` | another switch holds the pointer lock; retry after a few seconds |
 | demo shows nothing, console CSP errors | open the demo at `KARTA_PUBLIC_BASE_URL` + `/demo/` (the page only talks to that origin) |

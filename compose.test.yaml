@@ -6,6 +6,10 @@ services:
     ports:
       - "127.0.0.1:${KARTA_TEST_DB_PORT:-55433}:5432"
     networks: [backend, frontend]
+    # A small filesystem for the disk-exhaustion test: the test creates a
+    # tablespace here, fills it, and points new release databases at it.
+    tmpfs:
+      - /var/lib/postgresql/tight:size=${KARTA_TEST_TIGHT_SIZE:-96m},uid=999,gid=999,mode=0700
   api:
     ports: !override
       - "127.0.0.1:${KARTA_TEST_HTTP_PORT:-18080}:8080"
@@ -15,3 +19,35 @@ services:
       KARTA_PUBLIC_BASE_URL: ${KARTA_TEST_PUBLIC_BASE_URL:-http://127.0.0.1:${KARTA_TEST_HTTP_PORT:-18080}}
       KARTA_RELEASE_POLL_INTERVAL: 1s
       KARTA_CORS_ALLOWED_ORIGINS: https://app.example
+  publisher:
+    ports: !override
+      - "127.0.0.1:${KARTA_TEST_OPERATOR_PORT:-18081}:8081"
+    environment:
+      KARTA_REGION_FILE: /config/regions/fixture.json
+      KARTA_INBOX_POLL_INTERVAL: 1s
+      KARTA_INBOX_SETTLE: 1s
+      KARTA_PUBLISH_AUTO_ACTIVATE: ${KARTA_TEST_AUTO_ACTIVATE:-true}
+      KARTA_RELEASE_PIN_GRACE: ${KARTA_TEST_PIN_GRACE:-20s}
+      KARTA_RETAIN_RELEASES: ${KARTA_TEST_RETAIN:-10}
+      KARTA_CLEANUP_MARGIN: 30s
+      KARTA_RELEASE_STORAGE_BUDGET_MB: ${KARTA_TEST_BUDGET_MB:-10240}
+      KARTA_STAGING_RESERVE_MB: "1"
+      KARTA_MIN_FREE_MB: "0"
+      KARTA_RELEASE_TABLESPACE: ${KARTA_TEST_TABLESPACE:-}
+      # slow-osm2pgsql delays every import by 15 s, for the tests that must
+      # observe or interrupt a running import.
+      KARTA_OSM2PGSQL: ${KARTA_TEST_OSM2PGSQL:-osm2pgsql}
+      # Fault injection (internal/failpoint): test-only.
+      KARTA_FAILPOINTS: ${KARTA_TEST_FAILPOINTS:-}
+    volumes: !override
+      - ${KARTA_INBOX_HOST_DIR:?set by make test-integration}:/data/inbox:ro
+      - ./config/regions:/config/regions:ro
+      - ./tests/integration/slow-osm2pgsql.sh:/usr/local/bin/slow-osm2pgsql:ro
+    tmpfs: !override
+      - /tmp:size=1g,mode=1777
+      - /var/lib/karta/staging:size=${KARTA_TEST_STAGING_SIZE:-64m},uid=10001,gid=10001,mode=0700
+    # A failpoint exit must stay down until the test restarts the publisher.
+    restart: "no"
+  importer:
+    environment:
+      KARTA_RETAIN_RELEASES: "2"

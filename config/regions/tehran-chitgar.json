@@ -8,6 +8,7 @@
   },
   "view": { "center": [51.215, 35.745], "zoom": 13 },
   "validation": {
+    "max_drop_fraction": 0.3,
     "min_counts": {
       "roads": 3500,
       "water": 40,

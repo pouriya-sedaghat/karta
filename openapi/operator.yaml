@@ -1,0 +1,536 @@
+openapi: 3.0.3
+info:
+  title: Karta operator API
+  version: 1.0.0
+  description: |
+    Publication status, snapshot digest authorization, activation, rollback
+    and cleanup. Served by the publisher (`karta publisher`) on its own
+    listener (`KARTA_OPERATOR_LISTEN_ADDR`, published on 127.0.0.1:8081 by
+    default); the public API process has no operator routes and no write
+    access to the registry. See docs/security.md for the threat model and
+    docs/runbook.md for procedures.
+
+    **Authentication.** Every `/v1/operator` request needs
+    `Authorization: Bearer <token>`, a 256-bit random token (64 lowercase hex
+    digits) whose SHA-256 is listed in the publisher's credentials file with
+    a name and scopes: `status` (read status and audit), `publish` (authorize
+    or revoke digests, activate a ready release), `rollback`, `cleanup`.
+    Missing or wrong tokens get `401 unauthenticated`, a missing scope
+    `403 forbidden`; both are logged and audited (at most 30 audit rows per
+    minute for refusals). Tokens are never logged.
+
+    **Requests.** `POST` bodies are `application/json`, at most 16 KiB, one
+    object without unknown fields. Every action requires a `reason`
+    (1–500 characters, no control characters), which is recorded in the
+    audit log with the credential name, action, target and outcome. Every
+    request is bounded by `KARTA_OPERATOR_REQUEST_TIMEOUT`. Responses are
+    `Cache-Control: no-store` and carry `X-Request-ID`.
+
+    **Concurrency.** The active pointer changes only in one registry
+    transaction under a lock, compared against an expected active release:
+    the one given as `expected_active_release_id` (`"none"` for no active
+    release), or else the one active when the request arrived. Of two
+    concurrent switches, the second gets `409 active_release_changed` (or
+    succeeds as a no-op when its target is already active). A switch waits at
+    most a few seconds for the pointer lock (`409 busy`). Imports do not hold
+    the pointer lock, so a rollback is never blocked by a running import; an
+    import that finishes after a rollback stays `ready` instead of activating.
+  license:
+    name: Apache-2.0 (API description)
+servers:
+  - url: http://127.0.0.1:8081
+security:
+  - bearer: []
+paths:
+  /health/live:
+    get:
+      summary: Publisher process liveness (no authentication, no information)
+      operationId: operatorLive
+      security: []
+      responses:
+        "200":
+          description: The process is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+  /v1/operator/status:
+    get:
+      summary: Publication status
+      operationId: operatorStatus
+      description: Scope `status`. Region and policy, active and recent releases, recent submissions, open digest authorizations, the inbox, the job in progress and storage use.
+      responses:
+        "200":
+          description: Status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/audit:
+    get:
+      summary: Audit log, newest first
+      operationId: operatorAudit
+      description: Scope `status`. Append-only records of every publication step and operator action.
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+        - { name: before_id, in: query, description: Only records with a smaller id (paging).,
+            schema: { type: integer, format: int64, minimum: 1 } }
+      responses:
+        "200":
+          description: Audit records.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries]
+                properties:
+                  entries: { type: array, items: { $ref: "#/components/schemas/AuditEntry" } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/openapi.yaml:
+    get:
+      summary: This document
+      operationId: operatorOpenAPI
+      description: Scope `status`.
+      responses:
+        "200":
+          description: OpenAPI document.
+          content:
+            application/yaml:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /v1/operator/authorizations:
+    post:
+      summary: Authorize one exact snapshot digest for the configured region
+      operationId: operatorAuthorize
+      description: |
+        Scope `publish`. Records that the operator has verified this exact
+        snapshot (by SHA-256, and size if given) out of band. Only a digest
+        that is pinned in the region configuration or authorized here is
+        imported; there is no way to accept arbitrary files. An open,
+        unexpired authorization for the same digest and size is returned
+        unchanged (`200`, `created: false`). A submission rejected earlier as
+        `unauthorized_digest` is re-evaluated on the next inbox scan once its
+        digest is authorized.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sha256, reason]
+              properties:
+                sha256: { $ref: "#/components/schemas/SHA256" }
+                size_bytes: { type: integer, format: int64, minimum: 1, description: "If given, only a file of exactly this size matches." }
+                expires_at: { type: string, format: date-time, description: "Optional end of the authorization, in the future and at most one year ahead." }
+                reason: { $ref: "#/components/schemas/Reason" }
+      responses:
+        "201":
+          description: Authorization created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthorizationResult" }
+        "200":
+          description: An equal authorization already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthorizationResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/authorizations/{sha256}/revoke:
+    post:
+      summary: Revoke the open authorization of a digest
+      operationId: operatorRevoke
+      description: Scope `publish`. Releases already built from the digest are not affected.
+      parameters:
+        - { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/SHA256" } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReasonBody" }
+      responses:
+        "200":
+          description: Whether an open authorization was revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked: { type: boolean }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/releases/{release_id}/activate:
+    post:
+      summary: Activate a ready or retired release (forward only)
+      operationId: operatorActivate
+      description: |
+        Scope `publish`. The target must be retained and validated (`ready`
+        or `retired`), pass the same compatibility checks as serving (schema
+        major, style, serving toolchain), and satisfy the forward rule: a
+        newer data timestamp than the active release, or the same snapshot
+        rebuilt. Going back is a rollback. With the region's
+        `validation.max_drop_fraction`, the target must also keep enough of
+        every table's rows of the release active at the moment of the switch
+        (checked in the pointer transaction), whatever it was validated
+        against: otherwise `409 policy_refused` with reason code
+        `excessive_data_loss`, or `counts_unavailable` if either release's
+        row counts cannot be read. The previous release stays servable to
+        pinned clients for the pin grace period.
+      parameters:
+        - { name: release_id, in: path, required: true, schema: { $ref: "#/components/schemas/ReleaseID" } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SwitchBody" }
+      responses:
+        "200":
+          description: Switched, or already active (`changed` false).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SwitchResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/rollback:
+    post:
+      summary: Roll back to a retained, validated, compatible release
+      operationId: operatorRollback
+      description: |
+        Scope `rollback`. Without `release_id`, the target is the most
+        recently replaced retained (`retired`) release. The target must be
+        `ready` or `retired` (never `removing`, `removed` or `failed`) and
+        pass the serving compatibility checks. Only the active pointer
+        changes; release contents are immutable. A region change must be
+        explicit (`allow_region_change`). Rollback is the explicit way back
+        and has no row-count gate.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SwitchBody" }
+      responses:
+        "200":
+          description: Rolled back, or the target is already active (`changed` false).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SwitchResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/cleanup:
+    post:
+      summary: Remove releases beyond the retention policy
+      operationId: operatorCleanup
+      description: |
+        Scope `cleanup`. Keeps the active release, the
+        `KARTA_RETAIN_RELEASES` most recent other validated releases, and
+        every release still inside its pin grace (plus the drain margin).
+        A release whose database has any session is skipped. `dry_run` only
+        reports the decisions. Cleanup also runs after each publication and
+        every `KARTA_CLEANUP_INTERVAL`. The request is audited (action
+        `cleanup`) with its actual result: `succeeded`, `noop` (dry run, with
+        `would_remove`, or nothing removed) or `failed` (answered `503`; the
+        record has the `error` and what was `removed` before it).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                reason: { $ref: "#/components/schemas/Reason" }
+                dry_run: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Decisions and what was removed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CleanupResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+  responses:
+    Error:
+      description: Error.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    ReleaseID: { type: string, pattern: "^r[0-9a-f]{24}$" }
+    SHA256: { type: string, pattern: "^[0-9a-f]{64}$" }
+    Reason: { type: string, minLength: 1, maxLength: 500, description: Why; recorded in the audit log. }
+    ReasonBody:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason: { $ref: "#/components/schemas/Reason" }
+    Timestamp: { type: string, format: date-time }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [unauthenticated, forbidden, invalid_request, request_body_too_large, unsupported_media_type, method_not_allowed,
+                     not_found, unknown_release, release_not_eligible, release_incompatible, active_release_changed, busy,
+                     no_rollback_target, policy_refused, timeout, service_unavailable, internal_error]
+            message: { type: string }
+            reason_code:
+              type: string
+              description: For `policy_refused`, the rule that refused (older_than_active, not_newer, region_changed, excessive_data_loss, counts_unavailable, region_config).
+            request_id: { type: string }
+    SwitchBody:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        release_id: { $ref: "#/components/schemas/ReleaseID" }
+        expected_active_release_id:
+          type: string
+          pattern: "^(r[0-9a-f]{24}|none)$"
+          description: Compare-and-swap guard; defaults to the release active when the request arrived.
+        allow_region_change: { type: boolean, default: false }
+        reason: { $ref: "#/components/schemas/Reason" }
+    SwitchResult:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          required: [previous_release_id, active_release_id, changed, previous_pinned_until]
+          properties:
+            previous_release_id: { type: string, description: Empty when nothing was active. }
+            active_release_id: { type: string }
+            changed: { type: boolean }
+            previous_pinned_until: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true,
+                                     description: Until when clients that pinned the previous release are served. }
+    Release:
+      type: object
+      required: [release_id, database, state, region_id, source_sha256, source_size_bytes, schema_revision, style_revision,
+                 schema_major, data_timestamp, failure_reason, database_bytes, submission_id, activated_at, deactivated_at,
+                 pinned_until, removed_at, created_at, updated_at]
+      properties:
+        release_id: { $ref: "#/components/schemas/ReleaseID" }
+        database: { type: string }
+        state: { type: string, enum: [importing, validating, ready, active, retired, failed, removing, removed] }
+        region_id: { type: string }
+        source_sha256: { $ref: "#/components/schemas/SHA256" }
+        source_size_bytes: { type: integer, format: int64, nullable: true }
+        schema_revision: { type: string }
+        style_revision: { type: string }
+        schema_major: { type: integer, nullable: true }
+        data_timestamp: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        failure_reason: { type: string, nullable: true }
+        database_bytes: { type: integer, format: int64, nullable: true }
+        counts: { type: object, additionalProperties: { type: integer, format: int64 } }
+        submission_id: { type: integer, format: int64, nullable: true }
+        activated_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        deactivated_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        pinned_until: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        removed_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+    ReleaseStatus:
+      allOf:
+        - $ref: "#/components/schemas/Release"
+        - type: object
+          required: [rollback_eligible, pinned_served]
+          properties:
+            rollback_eligible: { type: boolean, description: "Retained, validated and not active." }
+            pinned_served: { type: boolean, description: Retired and still inside its pin grace. }
+    Submission:
+      type: object
+      required: [id, source, name, fingerprint, region_id, marker_sha256, sha256, size_bytes, data_timestamp, state, reason_code,
+                 reason, release_id, attempts, created_at, updated_at, finished_at]
+      properties:
+        id: { type: integer, format: int64 }
+        source: { type: string, enum: [inbox, cli] }
+        name: { type: string }
+        fingerprint: { type: string }
+        region_id: { type: string }
+        marker_sha256: { type: string, nullable: true }
+        sha256: { type: string, nullable: true }
+        size_bytes: { type: integer, format: int64, nullable: true }
+        data_timestamp: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        state: { type: string, enum: [processing, published, ready, duplicate, rejected, failed, interrupted] }
+        reason_code: { type: string, nullable: true }
+        reason: { type: string, nullable: true }
+        release_id: { type: string, nullable: true }
+        attempts: { type: integer }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        finished_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+    Authorization:
+      type: object
+      required: [id, region_id, sha256, size_bytes, reason, created_by, created_at, expires_at, revoked_at, revoked_by, revoke_reason]
+      properties:
+        id: { type: integer, format: int64 }
+        region_id: { type: string }
+        sha256: { $ref: "#/components/schemas/SHA256" }
+        size_bytes: { type: integer, format: int64, nullable: true }
+        reason: { type: string }
+        created_by: { type: string }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        expires_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        revoked_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        revoked_by: { type: string, nullable: true }
+        revoke_reason: { type: string, nullable: true }
+    AuthorizationResult:
+      type: object
+      required: [authorization, created]
+      properties:
+        authorization: { $ref: "#/components/schemas/Authorization" }
+        created: { type: boolean }
+    AuditEntry:
+      type: object
+      required: [id, at, actor, source, action, outcome]
+      properties:
+        id: { type: integer, format: int64 }
+        at: { $ref: "#/components/schemas/Timestamp" }
+        actor: { type: string, description: "Credential name, `inbox`, `cli`, `system` or `anonymous`." }
+        source: { type: string, enum: [operator_api, inbox, cli, system] }
+        action: { type: string }
+        target: { type: string }
+        outcome: { type: string, enum: [succeeded, rejected, failed, denied, noop] }
+        reason: { type: string }
+        request_id: { type: string }
+        detail: {}
+    CleanupResult:
+      type: object
+      required: [dry_run, decisions, removed, skipped]
+      properties:
+        dry_run: { type: boolean }
+        decisions:
+          type: array
+          items:
+            type: object
+            required: [release_id, state, action, why]
+            properties:
+              release_id: { type: string }
+              state: { type: string }
+              action: { type: string, enum: [keep, remove] }
+              why: { type: string }
+        removed: { type: array, items: { type: string } }
+        skipped:
+          type: array
+          items:
+            type: object
+            required: [release_id, why]
+            properties:
+              release_id: { type: string }
+              why: { type: string }
+    Status:
+      type: object
+      required: [region, policy, active, releases, submissions, authorizations, inbox, job, storage]
+      properties:
+        region:
+          type: object
+          required: [id, name, pinned_digests, require_provenance]
+          properties:
+            id: { type: string }
+            name: { type: string }
+            pinned_digests: { type: array, items: { $ref: "#/components/schemas/SHA256" } }
+            require_provenance: { type: boolean }
+            error: { type: string }
+        policy:
+          type: object
+          required: [auto_activate, pin_grace_seconds, retain_releases, max_attempts, inbox_settle_seconds]
+          properties:
+            auto_activate: { type: boolean }
+            pin_grace_seconds: { type: number }
+            retain_releases: { type: integer }
+            max_attempts: { type: integer }
+            inbox_settle_seconds: { type: number }
+        active: { allOf: [{ $ref: "#/components/schemas/Release" }], nullable: true }
+        releases: { type: array, items: { $ref: "#/components/schemas/ReleaseStatus" } }
+        submissions: { type: array, items: { $ref: "#/components/schemas/Submission" } }
+        authorizations: { type: array, items: { $ref: "#/components/schemas/Authorization" } }
+        inbox:
+          type: object
+          required: [enabled, last_scan]
+          properties:
+            enabled: { type: boolean }
+            last_scan:
+              type: object
+              required: [at, pending]
+              properties:
+                at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+                error: { type: string }
+                pending:
+                  type: array
+                  items:
+                    type: object
+                    required: [name, waiting]
+                    properties:
+                      name: { type: string }
+                      waiting: { type: string, enum: [waiting_for_ready_marker, waiting_for_snapshot, settling] }
+                      problem: { type: string }
+        job:
+          type: object
+          nullable: true
+          required: [submission_id, name, source, phase, started_at, phase_started_at]
+          properties:
+            submission_id: { type: integer, format: int64 }
+            name: { type: string }
+            source: { type: string }
+            phase: { type: string }
+            started_at: { $ref: "#/components/schemas/Timestamp" }
+            phase_started_at: { $ref: "#/components/schemas/Timestamp" }
+            release_id: { type: string }
+        storage:
+          type: object
+          required: [release_bytes, candidate_estimate_bytes, budget_bytes, db_volume_free_bytes, staging_free_bytes, min_free_bytes]
+          properties:
+            release_bytes: { type: integer, format: int64 }
+            candidate_estimate_bytes: { type: integer, format: int64 }
+            budget_bytes: { type: integer, format: int64 }
+            db_volume_free_bytes: { type: integer, format: int64, nullable: true }
+            staging_free_bytes: { type: integer, format: int64, nullable: true }
+            min_free_bytes: { type: integer, format: int64 }
+        failpoints: { type: array, items: { type: string }, description: Only present in test runs with fault injection. }

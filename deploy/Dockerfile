@@ -2,7 +2,9 @@
 #
 # Karta images. Every base image is pinned by manifest-list digest.
 #   target api       distroless, non-root: `karta serve` plus the demo assets
+#                    (also `karta operator`, the operator API client)
 #   target importer  Ubuntu 24.04 + osm2pgsql 1.11.0, non-root: `karta import`
+#                    and `karta publisher` (entrypoint overridden in compose)
 #
 # Optional build secret `build_ca`: a PEM bundle for networks that intercept
 # TLS (corporate proxies). Without it the default trust stores are used.
@@ -50,7 +52,9 @@ FROM ${IMPORTER_BASE} AS importer
 RUN apt-get update \
  && apt-get install -y --no-install-recommends osm2pgsql=1.11.0+ds-1 \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --system --uid 10001 --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin karta
+ && useradd --system --uid 10001 --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin karta \
+ && install -d -o 10001 -g 10001 -m 0700 /var/lib/karta/staging \
+ && install -d -o root -g root -m 0755 /data/inbox
 COPY --from=build /out/karta /usr/local/bin/karta
 USER 10001:10001
 WORKDIR /tmp

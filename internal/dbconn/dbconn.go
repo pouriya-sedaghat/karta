@@ -126,6 +126,12 @@ func (p Params) Connect(ctx context.Context, database string) (*pgx.Conn, error)
 
 // Pool opens a connection pool; connections are established lazily.
 func (p Params) Pool(ctx context.Context, database string) (*pgxpool.Pool, error) {
+	return p.PoolAfterConnect(ctx, database, nil)
+}
+
+// PoolAfterConnect opens a pool whose every new connection must pass check
+// before it is used (nil = no check).
+func (p Params) PoolAfterConnect(ctx context.Context, database string, check func(context.Context, *pgx.Conn) error) (*pgxpool.Pool, error) {
 	if !ValidIdent(database) {
 		return nil, fmt.Errorf("database name %q is not a plain identifier", database)
 	}
@@ -146,5 +152,6 @@ func (p Params) Pool(ctx context.Context, database string) (*pgxpool.Pool, error
 	}
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second
+	cfg.AfterConnect = check
 	return pgxpool.NewWithConfig(ctx, cfg)
 }

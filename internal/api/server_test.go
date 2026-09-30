@@ -20,8 +20,10 @@ import (
 // that validates input before touching a database can be tested with it.
 type noReleases struct{}
 
-func (noReleases) Active() *release.Release            { return nil }
-func (noReleases) Get(string) (*release.Release, bool) { return nil, false }
+func (noReleases) Active() *release.Release { return nil }
+func (noReleases) Lookup(string) (*release.Release, release.Lookup) {
+	return nil, release.Unknown
+}
 func (noReleases) Status() release.Status {
 	return release.Status{Reason: release.ReasonNoRelease, Detail: "none", CheckedAt: time.Unix(0, 0)}
 }
