@@ -244,15 +244,17 @@ func TestOnlinePublisher(t *testing.T) {
 	}
 	// The signed sidecar claim must match the complete downloaded bytes.
 	prov := []byte(`{"source":"fixture"}`)
+	provTimestamp := *at("2026-01-15T00:00:00Z")
+	provSnapshot := variant(t, &provTimestamp, nil, nil)
 	provManifest := online.Manifest{RegionID: "fixture", IssuedAt: time.Now().UTC().Truncate(time.Second),
-		ExpiresAt: time.Now().UTC().Add(time.Hour), DataTimestamp: timestamp,
-		SHA256: digestOf(b), SizeBytes: int64(len(b)), SnapshotURL: sourceURL + "/snapshot",
+		ExpiresAt: time.Now().UTC().Add(time.Hour), DataTimestamp: provTimestamp,
+		SHA256: digestOf(provSnapshot), SizeBytes: int64(len(provSnapshot)), SnapshotURL: sourceURL + "/snapshot",
 		ProvenanceURL: sourceURL + "/provenance", ProvenanceSHA256: digestOf(prov), ProvenanceSizeBytes: int64(len(prov))}
-	reply.Store(&fixtureResponse{manifest: signOnlinePayload(t, priv, provManifest), snapshot: b, provenance: []byte(`{"source":"corrupt"}`)})
+	reply.Store(&fixtureResponse{manifest: signOnlinePayload(t, priv, provManifest), snapshot: provSnapshot, provenance: []byte(`{"source":"corrupt"}`)})
 	previous := failed.LastAttempt
 	trigger()
 	st, failed = waitOnlineAttempt(t, previous, "download_failed")
-	if st.activeID() != first.release() || failed.VerifiedDigest == nil || *failed.VerifiedDigest != digestOf(b) {
+	if st.activeID() != first.release() || failed.VerifiedDigest == nil || *failed.VerifiedDigest != digestOf(provSnapshot) {
 		t.Fatalf("invalid signed provenance affected active release: %+v %+v", st.Active, failed)
 	}
 
