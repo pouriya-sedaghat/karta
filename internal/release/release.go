@@ -215,8 +215,8 @@ func NewManager(db dbconn.Params, registryDB string, fontstacks []string, drain 
 		served: map[string]*Release{}, known: map[string]Lookup{},
 		status:    Status{Reason: ReasonStarting, Detail: "release not loaded yet", CheckedAt: time.Now()},
 		freshness: registry.Freshness{UpdateMode: "manual"},
-		now:    time.Now,
-		after:  func(d time.Duration, f func()) { time.AfterFunc(d, f) },
+		now:       time.Now,
+		after:     func(d time.Duration, f func()) { time.AfterFunc(d, f) },
 	}
 	m.serving = m.readRegistry
 	m.fresh = func(ctx context.Context) (registry.Freshness, error) {

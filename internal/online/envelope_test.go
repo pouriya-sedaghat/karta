@@ -243,10 +243,10 @@ func TestParseSource(t *testing.T) {
 		"relative ca file":      base(`"manifest_url":"https://s.test/m","trusted_keys":[` + key + `],"ca_file":"ca.pem"`),
 		"retry max below initial": base(`"manifest_url":"https://s.test/m","trusted_keys":[` + key +
 			`],"retry_initial":"10m","retry_max":"1m"`),
-		"no poll interval":     `{"region_id":"fixture","max_manifest_validity":"1h","manifest_url":"https://s.test/m","trusted_keys":[` + key + `]}`,
-		"no validity bound":    `{"region_id":"fixture","poll_interval":"1h","manifest_url":"https://s.test/m","trusted_keys":[` + key + `]}`,
-		"bad region":           `{"region_id":"Fixture!","poll_interval":"1h","max_manifest_validity":"1h","manifest_url":"https://s.test/m","trusted_keys":[` + key + `]}`,
-		"too many attempts":    base(`"manifest_url":"https://s.test/m","trusted_keys":[` + key + `],"max_download_attempts":1000`),
+		"no poll interval":      `{"region_id":"fixture","max_manifest_validity":"1h","manifest_url":"https://s.test/m","trusted_keys":[` + key + `]}`,
+		"no validity bound":     `{"region_id":"fixture","poll_interval":"1h","manifest_url":"https://s.test/m","trusted_keys":[` + key + `]}`,
+		"bad region":            `{"region_id":"Fixture!","poll_interval":"1h","max_manifest_validity":"1h","manifest_url":"https://s.test/m","trusted_keys":[` + key + `]}`,
+		"too many attempts":     base(`"manifest_url":"https://s.test/m","trusted_keys":[` + key + `],"max_download_attempts":1000`),
 		"stall timeout too low": base(`"manifest_url":"https://s.test/m","trusted_keys":[` + key + `],"stall_timeout":"10ms"`),
 	} {
 		if _, err := ParseSource([]byte(js)); err == nil {
@@ -255,14 +255,14 @@ func TestParseSource(t *testing.T) {
 	}
 	h := mustSource(t, sourceJSON("https://Source.Test/m.json", `,"allowed_hosts":["mirror.test:8443","[2001:db8::1]"]`, map[string]ed25519.PrivateKey{"a": a}))
 	for u, want := range map[string]bool{
-		"https://source.test/x":         true,
-		"https://source.test:443/x":     true,
-		"https://source.test:8443/x":    false,
-		"https://mirror.test:8443/x":    true,
-		"https://mirror.test/x":         false,
-		"https://[2001:db8::1]/x":       true,
-		"https://[2001:db8::1]:8443/x":  false,
-		"https://other.test/x":          false,
+		"https://source.test/x":        true,
+		"https://source.test:443/x":    true,
+		"https://source.test:8443/x":   false,
+		"https://mirror.test:8443/x":   true,
+		"https://mirror.test/x":        false,
+		"https://[2001:db8::1]/x":      true,
+		"https://[2001:db8::1]:8443/x": false,
+		"https://other.test/x":         false,
 	} {
 		got, err := ResolveURL(h, u)
 		if (err == nil) != want {

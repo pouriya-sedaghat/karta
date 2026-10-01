@@ -100,13 +100,13 @@ type Signature struct {
 
 // Manifest is the signed description of one snapshot.
 type Manifest struct {
-	Format    string     `json:"format"`
-	RegionID  string     `json:"region_id"`
-	BBox      BBox       `json:"bbox"`
-	Serial    int64      `json:"serial"`
-	IssuedAt  time.Time  `json:"issued_at"`
-	ExpiresAt time.Time  `json:"expires_at"`
-	Snapshot  Snapshot   `json:"snapshot"`
+	Format    string    `json:"format"`
+	RegionID  string    `json:"region_id"`
+	BBox      BBox      `json:"bbox"`
+	Serial    int64     `json:"serial"`
+	IssuedAt  time.Time `json:"issued_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Snapshot  Snapshot  `json:"snapshot"`
 	// Provenance is the optional provenance sidecar.
 	Provenance *File `json:"provenance,omitempty"`
 }

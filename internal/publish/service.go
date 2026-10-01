@@ -413,7 +413,7 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		gate = onlineGate(cfg.ID)
 	}
 	res, err := registry.Activate(ctx, s.reg, registry.ActivateRequest{
-		Gate: gate,
+		Gate:   gate,
 		Target: built.ReleaseID, Expected: expected, CheckExpected: true, Action: "publish",
 		Actor: req.principal.Name, Source: req.principal.Source, Reason: req.reason, RequestID: req.principal.RequestID,
 		PinGrace: s.cfg.PinGrace,
