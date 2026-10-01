@@ -117,11 +117,26 @@ func (s *Service) verifyDelivery(ctx context.Context, req request, cfg region.Co
 	}, nil
 }
 
-// onlineGate refuses the automatic activation of an online snapshot while
-// automatic activation is paused; it runs inside the pointer transaction.
-func onlineGate(regionID string) func(ctx context.Context, q registry.Querier) error {
+// onlineGate runs inside the pointer transaction of an online snapshot's
+// automatic activation, after the build, and fails closed. The signed
+// manifest the delivery was verified with must still authorize the
+// snapshot (see reauthorizeOnline), and automatic activation of online
+// snapshots must not be paused. A refusal leaves the active release as it
+// is and the validated candidate ready.
+func (s *Service) onlineGate(sv *online.Verified) func(ctx context.Context, q registry.Querier) error {
 	return func(ctx context.Context, q registry.Querier) error {
-		on, err := registry.OnlineAutoActivateLocked(ctx, q, regionID)
+		authorized := func(ctx context.Context, regionID, digest string, size int64) (string, error) {
+			a, err := registry.Authorized(ctx, q, regionID, digest, size)
+			if err != nil || a == nil {
+				return "", err
+			}
+			return fmt.Sprintf("operator authorization %d by %s", a.ID, a.CreatedBy), nil
+		}
+		if err := reauthorizeOnline(ctx, reauthorizeOptions{SourcePath: s.cfg.OnlineSourcePath, RegionPath: s.cfg.RegionPath,
+			Signed: sv, Now: s.now(), Skew: s.cfg.MaxFutureSkew, MaxInputBytes: s.cfg.MaxInputBytes, Authorized: authorized}); err != nil {
+			return err
+		}
+		on, err := registry.OnlineAutoActivateLocked(ctx, q, sv.Manifest.RegionID)
 		if err != nil {
 			return err
 		}
@@ -131,6 +146,69 @@ func onlineGate(regionID string) func(ctx context.Context, q registry.Querier) e
 		}
 		return nil
 	}
+}
+
+type reauthorizeOptions struct {
+	SourcePath, RegionPath string
+	// Signed is the manifest the delivery was verified with; its exact
+	// bytes are verified again.
+	Signed        *online.Verified
+	Now           time.Time
+	Skew          time.Duration
+	MaxInputBytes int64
+	// Authorized looks up operator authorizations (only with
+	// require_operator_authorization).
+	Authorized importer.Authorizer
+}
+
+// reauthorizeOnline decides at the switch whether a delivery's signed
+// manifest still authorizes its snapshot, as at delivery but under the
+// source and region files in force now and at the current time: a manifest
+// that expired during the build, a key removed from the source file or
+// past its not_after, or a source or region file that cannot be read or no
+// longer matches, refuses the switch. With require_operator_authorization
+// (as configured now) the digest must also still be pinned or authorized.
+// A refusal is an *importer.InputError with the verification code; any
+// other error (the registry) also refuses the switch.
+func reauthorizeOnline(ctx context.Context, o reauthorizeOptions) error {
+	refuse := func(code, format string, args ...any) error {
+		return onlineReject(code, "at activation, signed manifest serial %d no longer authorizes the snapshot: %s",
+			o.Signed.Manifest.Serial, fmt.Sprintf(format, args...))
+	}
+	cfg, err := region.Load(o.RegionPath)
+	if err != nil {
+		return refuse(importer.CodeRegionConfig, "region file: %v", err)
+	}
+	src, err := online.LoadSource(o.SourcePath)
+	if err != nil {
+		return refuse(online.CodeConfig, "online source file: %v", err)
+	}
+	if src.RegionID != cfg.ID {
+		return refuse(online.CodeConfig, "the online source is for region %q, the publisher serves %q", src.RegionID, cfg.ID)
+	}
+	v, err := online.Verify(o.Signed.Raw, online.VerifyOptions{Source: src, Region: cfg, Now: o.Now, Skew: o.Skew, MaxSnapshotBytes: o.MaxInputBytes})
+	if err != nil {
+		code := online.CodeOf(err)
+		if code == "" {
+			code = online.CodeManifestInvalid
+		}
+		return refuse(code, "%v", err)
+	}
+	if v.EnvelopeSHA256 != o.Signed.EnvelopeSHA256 {
+		return refuse(online.CodeManifestConflict, "the manifest bytes changed")
+	}
+	m := v.Manifest
+	if src.RequireOperatorAuthorization && !cfg.Source.Pinned(m.Snapshot.SHA256) {
+		by, err := o.Authorized(ctx, cfg.ID, m.Snapshot.SHA256, m.Snapshot.SizeBytes)
+		if err != nil {
+			return err
+		}
+		if by == "" {
+			return refuse(importer.CodeUnauthorizedDigest, "require_operator_authorization is set and SHA-256 %s is neither pinned nor authorized",
+				m.Snapshot.SHA256)
+		}
+	}
+	return nil
 }
 
 // OnlinePolicyResult reports the policy after a pause or resume.

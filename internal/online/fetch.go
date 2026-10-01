@@ -353,3 +353,19 @@ func sha256Hex(b []byte) string {
 	s := sha256.Sum256(b)
 	return hex.EncodeToString(s[:])
 }
+
+// fileDigest returns the SHA-256 and size of a regular file (never read
+// through a symlink).
+func fileDigest(path string) (string, int64, error) {
+	f, err := openNoFollow(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return "", n, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, nil
+}

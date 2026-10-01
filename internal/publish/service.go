@@ -409,8 +409,8 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 	}
 	s.phase("activating", built.ReleaseID)
 	var gate func(context.Context, registry.Querier) error
-	if req.source == SourceOnline {
-		gate = onlineGate(cfg.ID)
+	if signed != nil {
+		gate = s.onlineGate(signed)
 	}
 	res, err := registry.Activate(ctx, s.reg, registry.ActivateRequest{
 		Gate:   gate,
@@ -432,6 +432,16 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		case errors.Is(err, registry.ErrActiveChanged):
 			out.State, out.Code, out.Reason = registry.SubReady, CodeActiveChanged,
 				"validated, but the active release changed during the build ("+err.Error()+"); kept ready for an operator to activate"
+			return out
+		case importer.InputCode(err) != "":
+			// The signed manifest no longer authorizes the snapshot (it
+			// expired or its key was removed during the build): refused.
+			// The validated release stays ready, for an operator to review
+			// (and activate), or for a fresh signed manifest to publish.
+			out.State, out.Code, out.Err = registry.SubRejected, importer.InputCode(err), err
+			out.Reason = fmt.Sprintf("%v; release %s was built and validated but not activated; it stays ready: an operator may review "+
+				"and activate it, retry it with the operator API once the manifest verifies again, or the source can publish a fresh "+
+				"signed manifest for the same snapshot", err, built.ReleaseID)
 			return out
 		case PolicyCode(err) != "":
 			out.State, out.Code, out.Reason = registry.SubReady, PolicyCode(err), err.Error()

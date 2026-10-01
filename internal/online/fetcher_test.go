@@ -232,6 +232,113 @@ func TestFetcherDeliversVerifiedSnapshotsOnce(t *testing.T) {
 	}
 }
 
+// When the delivered manifest stops verifying (it expired, or its key was
+// removed), the publisher may have refused to activate the snapshot; a
+// newer manifest for the same snapshot is then delivered again, without a
+// download. While the delivered manifest still verifies, it is not.
+func TestFetcherRedeliversASnapshotWhoseManifestLapsed(t *testing.T) {
+	e := newFetcherEnv(t, "")
+	f := e.start(t)
+	ctx := context.Background()
+	snap := randomBytes(4000)
+	e.publish(t, 1, snap)
+	f.RunOnce(ctx)
+	first := f.State().Delivered
+	if first == nil || f.State().LastError != nil {
+		t.Fatalf("first delivery: %+v", f.State().LastError)
+	}
+	snapPath := "/karta/snap-1.osm.pbf"
+	resign := func(serial int64, issued time.Time, signer Signer) {
+		m, err := ParseUnverified(e.src.files["/karta/manifest.json"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.Serial, m.IssuedAt, m.ExpiresAt = serial, issued, issued.Add(24*time.Hour)
+		e.src.set("/karta/manifest.json", signed(t, *m, signer))
+	}
+	outbox := func() []string {
+		entries, err := inbox.ScanWith(e.dir, 100, inbox.ScanOptions{Manifests: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, en := range entries {
+			if en.Complete() {
+				names = append(names, en.Name)
+			}
+		}
+		return names
+	}
+
+	// Re-signed while the delivered manifest is valid: up to date.
+	resign(2, e.now, Signer{"k1", e.key})
+	f.RunOnce(ctx)
+	if st := f.State(); st.LastError != nil || st.Delivered.Serial != 1 || len(outbox()) != 1 {
+		t.Fatalf("re-signed, delivered manifest valid: %+v %v", st.LastError, outbox())
+	}
+
+	// The delivered manifest expired; the source re-signed the snapshot.
+	later := e.now.Add(30 * time.Hour)
+	f.now = func() time.Time { return later }
+	resign(3, later.Add(-time.Minute), Signer{"k1", e.key})
+	f.RunOnce(ctx)
+	st := f.State()
+	if st.LastError != nil || st.Delivered.Serial != 3 || st.Delivered.SnapshotSHA256 != digestHex(snap) {
+		t.Fatalf("after expiry: %+v %+v", st.LastError, st.Delivered)
+	}
+	if n := e.src.count(snapPath); n != 1 {
+		t.Errorf("snapshot downloaded %d times", n)
+	}
+	name3 := DeliveryName("fixture", 3, digestHex(snap))
+	if got := outbox(); len(got) != 2 || got[1] != name3 {
+		t.Fatalf("outbox %v", got)
+	}
+	if b, err := os.ReadFile(filepath.Join(e.dir, name3+inbox.SnapshotSuffix)); err != nil || !bytes.Equal(b, snap) {
+		t.Errorf("redelivered snapshot: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(e.dir, first.Name+inbox.SnapshotSuffix)); err != nil || !bytes.Equal(b, snap) {
+		t.Errorf("the earlier delivery lost its snapshot: %v", err)
+	}
+	if left, _ := os.ReadDir(filepath.Join(e.dir, PartialDirName)); len(left) != 0 {
+		t.Errorf("partial files left: %v", left)
+	}
+	f.RunOnce(ctx) // and only once
+	if st := f.State(); st.LastError != nil || st.Delivered.Serial != 3 {
+		t.Fatalf("second check: %+v", st.LastError)
+	}
+
+	// The delivered manifest's key is removed; a newer manifest by the new
+	// key is delivered again.
+	k2 := testKey("fetcher rotation")
+	js := sourceJSON(e.src.srv.URL+"/karta/manifest.json", fmt.Sprintf(`,"ca_file":%q,"allowed_networks":["127.0.0.0/8"]`,
+		filepath.Join(filepath.Dir(e.source), "ca.pem")), map[string]ed25519.PrivateKey{"k2": k2})
+	if err := os.WriteFile(e.source, []byte(js), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resign(4, later.Add(-time.Minute), Signer{"k2", k2})
+	f.RunOnce(ctx)
+	if st := f.State(); st.LastError != nil || st.Delivered.Serial != 4 || e.src.count(snapPath) != 1 {
+		t.Fatalf("after the key was removed: %+v %+v", st.LastError, st.Delivered)
+	}
+
+	// Bytes that no longer match the signed digest are not delivered: the
+	// snapshot is downloaded again.
+	name4 := DeliveryName("fixture", 4, digestHex(snap))
+	if err := os.WriteFile(filepath.Join(e.dir, name4+inbox.SnapshotSuffix), randomBytes(len(snap)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	later = later.Add(30 * time.Hour)
+	resign(5, later.Add(-time.Minute), Signer{"k2", k2})
+	f.RunOnce(ctx)
+	if st := f.State(); st.LastError == nil || st.LastError.Code != CodeDigestMismatch || st.Delivered != nil {
+		t.Fatalf("corrupt delivered bytes: %+v %+v", st.LastError, st.Delivered)
+	}
+	f.RunOnce(ctx)
+	if st := f.State(); st.LastError != nil || st.Delivered == nil || st.Delivered.Serial != 5 || e.src.count(snapPath) != 2 {
+		t.Fatalf("download after corrupt bytes: %+v %+v (%d requests)", st.LastError, st.Delivered, e.src.count(snapPath))
+	}
+}
+
 func TestFetcherSetsASnapshotAsideAfterRepeatedFailures(t *testing.T) {
 	e := newFetcherEnv(t, `,"max_download_attempts":2,"abandon_for":"1h"`)
 	f := e.start(t)
@@ -322,6 +429,60 @@ func TestFetcherRecoversFromAnInterruptedDelivery(t *testing.T) {
 	defer l1.Close()
 	if _, err := LockOutbox(e.dir); err == nil {
 		t.Error("two fetchers locked one outbox")
+	}
+}
+
+// The serial of a verified manifest is on disk before anything else
+// happens. A crash right after verification (fetch.after_manifest: here,
+// CheckOnce stopping at the first request after it, with no later save)
+// must not let an older manifest that is still valid pass the replay check
+// after a restart, even though the newer one was never delivered.
+func TestFetcherPersistsTheAcceptedSerialBeforeAnythingElse(t *testing.T) {
+	e := newFetcherEnv(t, "")
+	f := e.start(t)
+	ctx := context.Background()
+	raw1 := e.publish(t, 1, randomBytes(5000))
+	e.publish(t, 2, randomBytes(5000))
+	e.src.mu.Lock()
+	delete(e.src.files, "/karta/snap-2.osm.pbf.provenance.json")
+	e.src.mu.Unlock()
+	if err := f.CheckOnce(ctx); CodeOf(err) != CodeHTTPStatus {
+		t.Fatalf("serial 2 with its sidecar missing: %v", err)
+	}
+	if st, err := ReadState(e.dir); err != nil || st.HighestSerial != 2 || st.Current == nil || st.Current.Serial != 2 {
+		t.Fatalf("state on disk after verifying serial 2: %+v %v", st, err)
+	}
+
+	// Restart; the source now serves the older, still valid, serial 1.
+	f2 := e.start(t)
+	e.src.set("/karta/manifest.json", raw1)
+	err := f2.CheckOnce(ctx)
+	if CodeOf(err) != CodeManifestReplayed {
+		t.Fatalf("older manifest after a restart: %v", err)
+	}
+	for _, p := range []string{"/karta/snap-1.osm.pbf", "/karta/snap-1.osm.pbf.provenance.json"} {
+		if n := e.src.count(p); n != 0 {
+			t.Errorf("%s requested %d times for a replayed manifest", p, n)
+		}
+	}
+
+	// If the state cannot be saved, the check fails before any download.
+	e.publish(t, 3, randomBytes(5000))
+	stateDir := filepath.Join(e.dir, StateDirName)
+	if err := os.RemoveAll(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateDir, nil, 0o644); err != nil { // not a directory: every save fails
+		t.Fatal(err)
+	}
+	err = f2.CheckOnce(ctx)
+	if CodeOf(err) != CodeIO || !strings.Contains(err.Error(), "the verified manifest") {
+		t.Fatalf("unsavable state: %v", err)
+	}
+	for _, p := range []string{"/karta/snap-3.osm.pbf", "/karta/snap-3.osm.pbf.provenance.json"} {
+		if n := e.src.count(p); n != 0 {
+			t.Errorf("%s requested %d times although the state could not be saved", p, n)
+		}
 	}
 }
 

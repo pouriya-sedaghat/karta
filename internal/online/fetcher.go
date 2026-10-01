@@ -243,6 +243,16 @@ func (f *Fetcher) save() error {
 	return writeFileAtomic(filepath.Join(f.cfg.Dir, StateDirName, StateFileName), b, 0o644)
 }
 
+// persist saves the state as part of a check: a failure fails the check
+// (with the write's code, e.g. insufficient_storage), and nothing that
+// depends on the saved state happens.
+func (f *Fetcher) persist(what string) error {
+	if err := f.save(); err != nil {
+		return errorf(codeOr(CodeOf(err)), "could not record %s in the fetcher state: %s", what, errMsg(err))
+	}
+	return nil
+}
+
 // Run checks the source until ctx ends: at once if the persisted next
 // attempt has passed, otherwise at that time (but never later than one poll
 // interval after a start, so a shortened interval applies after a restart),
@@ -404,9 +414,22 @@ func (f *Fetcher) CheckOnce(ctx context.Context) error {
 		return errorf(CodeManifestConflict, "a different manifest was published under serial %d", m.Serial)
 	}
 	f.state.HighestSerial, f.state.Current = m.Serial, summary(v, f.now())
+	// The accepted serial is on disk before anything else happens: if a
+	// restart forgot it while this manifest's snapshot was never delivered,
+	// an older manifest that is still valid would pass the replay check.
+	if err := f.persist("the verified manifest"); err != nil {
+		return err
+	}
 	failpoint.Hit("fetch.after_manifest")
 	if d := f.state.Delivered; d != nil && d.SnapshotSHA256 == m.Snapshot.SHA256 && f.deliveryPresent(d.Name) {
-		return nil // up to date
+		if d.Serial == m.Serial || f.stillAuthorizes(d.Name, src, reg) {
+			return nil // up to date
+		}
+		// The delivered manifest no longer verifies (it expired, or its key
+		// was removed or retired), so the publisher may have refused to
+		// activate these bytes: hand it this newer manifest for the same
+		// snapshot, without downloading the snapshot again.
+		return f.redeliver(ctx, req, src, v, raw, d)
 	}
 
 	dl := f.state.Download
@@ -425,28 +448,18 @@ func (f *Fetcher) CheckOnce(ctx context.Context) error {
 	if err := f.checkSpace(m); err != nil {
 		return err
 	}
-	var prov []byte
-	if p := m.Provenance; p != nil {
-		u, err := ResolveURL(src, p.URL)
-		if err != nil {
-			return err
-		}
-		if prov, err = req.FetchSmall(ctx, u, p.SizeBytes, smallFileTimeout); err != nil {
-			return err
-		}
-		if int64(len(prov)) != p.SizeBytes {
-			return errorf(CodeSizeMismatch, "the provenance sidecar is %d bytes, the manifest signs %d", len(prov), p.SizeBytes)
-		}
-		if got := sha256Hex(prov); got != p.SHA256 {
-			return errorf(CodeDigestMismatch, "the provenance sidecar has SHA-256 %s, the manifest signs %s", got, p.SHA256)
-		}
+	prov, err := fetchProvenance(ctx, req, src, m)
+	if err != nil {
+		return err
 	}
 	u, err := ResolveURL(src, m.Snapshot.URL)
 	if err != nil {
 		return err
 	}
 	dl.Attempts++
-	_ = f.save()
+	if err := f.persist("the download attempt"); err != nil {
+		return err
+	}
 	part, err := req.Download(ctx, DownloadSpec{URL: u, SHA256: m.Snapshot.SHA256, Size: m.Snapshot.SizeBytes,
 		Dir: filepath.Join(f.cfg.Dir, PartialDirName), Timeout: src.DownloadTimeout.D(), Stall: src.StallTimeout.D(),
 		Progress: func(have int64) {
@@ -464,6 +477,70 @@ func (f *Fetcher) CheckOnce(ctx context.Context) error {
 	}
 	dl.Bytes = m.Snapshot.SizeBytes
 	failpoint.Hit("fetch.after_download")
+	return f.deliver(v, raw, prov, part)
+}
+
+// fetchProvenance fetches the provenance sidecar a manifest signs, if any,
+// and checks it is exactly the signed bytes.
+func fetchProvenance(ctx context.Context, req *Requester, src *Source, m Manifest) ([]byte, error) {
+	p := m.Provenance
+	if p == nil {
+		return nil, nil
+	}
+	u, err := ResolveURL(src, p.URL)
+	if err != nil {
+		return nil, err
+	}
+	prov, err := req.FetchSmall(ctx, u, p.SizeBytes, smallFileTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(prov)) != p.SizeBytes {
+		return nil, errorf(CodeSizeMismatch, "the provenance sidecar is %d bytes, the manifest signs %d", len(prov), p.SizeBytes)
+	}
+	if got := sha256Hex(prov); got != p.SHA256 {
+		return nil, errorf(CodeDigestMismatch, "the provenance sidecar has SHA-256 %s, the manifest signs %s", got, p.SHA256)
+	}
+	return prov, nil
+}
+
+// stillAuthorizes reports whether the manifest of one of our deliveries
+// still verifies under the source file now (as the publisher checks it
+// again when it activates the snapshot).
+func (f *Fetcher) stillAuthorizes(name string, src *Source, reg region.Config) bool {
+	b, err := readRegular(filepath.Join(f.cfg.Dir, name+inbox.ManifestSuffix), MaxEnvelopeBytes)
+	if err != nil {
+		return false
+	}
+	_, err = Verify(b, VerifyOptions{Source: src, Region: reg, Now: f.now(), Skew: f.cfg.MaxFutureSkew, MaxSnapshotBytes: f.cfg.MaxInputBytes})
+	return err == nil
+}
+
+// redeliver delivers a newer manifest for the snapshot of delivery d: the
+// delivered bytes, checked against the signed digest again, are linked
+// into the new delivery (no download).
+func (f *Fetcher) redeliver(ctx context.Context, req *Requester, src *Source, v *Verified, raw []byte, d *Delivery) error {
+	m := v.Manifest
+	prov, err := fetchProvenance(ctx, req, src, m)
+	if err != nil {
+		return err
+	}
+	f.removePartials(m.Snapshot.SHA256)
+	part := PartialPath(filepath.Join(f.cfg.Dir, PartialDirName), m.Snapshot.SHA256)
+	_ = os.Remove(part)
+	if err := os.Link(filepath.Join(f.cfg.Dir, d.Name+inbox.SnapshotSuffix), part); err != nil {
+		return storageErr(err)
+	}
+	if sum, size, err := fileDigest(part); err != nil || sum != m.Snapshot.SHA256 || size != m.Snapshot.SizeBytes {
+		_ = os.Remove(part)
+		if err != nil {
+			return storageErr(err)
+		}
+		f.state.Delivered = nil // the next check downloads the snapshot
+		return errorf(CodeDigestMismatch, "the delivered snapshot %s no longer has the signed digest; it is downloaded again", d.Name)
+	}
+	f.log.Info("the delivered manifest no longer verifies; delivering a newer manifest for the same snapshot", "previous", d.Name,
+		"serial", m.Serial)
 	return f.deliver(v, raw, prov, part)
 }
 

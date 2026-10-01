@@ -71,6 +71,42 @@ signed manifest is not even read. A source file can keep both
 or operator-authorized digest, for owners who want an unattended download
 but an attended publication.
 
+**The authorization is checked again at the switch.** A build can take long
+enough for its manifest to expire, or for an operator to remove the signing
+key from the source file. So the automatic switch of an online snapshot
+verifies the exact staged envelope again inside the pointer transaction,
+after the build and before the pointer moves: the publisher re-reads the
+source and region files and verifies at the current time. Any of these fails
+closed and refuses the switch:
+
+* the manifest expired;
+* its key was removed or is past `not_after`;
+* the source or region file cannot be read or names another region;
+* with `require_operator_authorization` (as configured then), the digest is
+  no longer pinned or authorized.
+
+The submission is then `rejected` with the verification code (the reason
+says "at activation"), the active release is unchanged, and the validated
+release stays `ready`. From there:
+
+* an operator may review it and activate it explicitly (operator authority,
+  as for any ready release);
+* `online/retry` verifies the same manifest again (useful after a key was
+  removed by mistake; an expired manifest stays refused);
+* a fresh manifest from the source for the same snapshot publishes it. When
+  the manifest it delivered no longer verifies (expired, key removed or
+  retired) and the source serves a newer serial for the same snapshot, the
+  fetcher delivers that manifest again with the bytes it already holds,
+  checked against the digest, without a download. The publisher finds the
+  ready release and activates it. While the delivered manifest still
+  verifies, a re-signed manifest for the same snapshot is not delivered (the
+  publisher would only record a duplicate). So in normal operation this
+  costs at most one duplicate submission per lapse of a delivered manifest,
+  for example after a key rotation.
+
+Revocation is a file change, not a database transaction: it applies to every
+switch whose check runs after the file is replaced.
+
 What does **not** authorize anything: the manifest's location, TLS (it
 authenticates the server, not the data), a checksum published next to the
 snapshot, the fetcher's completion marker, file names or times. The
@@ -89,8 +125,12 @@ must not depend on, and an identity policy the owner has not chosen).
 ### Replay, staleness and conflicting claims
 
 * **Replay.** The newest verified serial is persisted twice: by the fetcher
-  (its state file) and, authoritatively, by the publisher in the registry
-  (`registry.source_state`). A lower serial is refused (`manifest_replayed`);
+  (its state file, saved as soon as the manifest is verified and before
+  anything else happens; a failed save fails the check) and,
+  authoritatively, by the publisher in the registry
+  (`registry.source_state`). So a crash after verification cannot let an
+  older, still valid manifest through after a restart, even if the newer
+  one was never delivered. A lower serial is refused (`manifest_replayed`);
   a different envelope under a serial already verified is refused
   (`manifest_conflict`). A source that keeps serving an old but valid
   manifest can only delay updates until `expires_at`; after that every check
@@ -224,7 +264,8 @@ is never visible to the publisher.
 
 | Crash during | Recovery |
 | --- | --- |
-| poll (before or after the manifest verified) | nothing persisted changes; the next check repeats it |
+| poll, before the manifest verified | nothing persisted changes; the next check repeats it |
+| poll, after the manifest verified | its serial was saved first; after the restart an older manifest is a replay, and the next check continues |
 | download | the partial file is resumed (verified as above) |
 | after the download, before the delivery | the complete partial file is delivered without downloading again |
 | delivery, before the marker | the incomplete delivery is removed at start (the publisher never saw it); the verified partial is delivered again |
@@ -232,7 +273,9 @@ is never visible to the publisher.
 | publisher verification, staging, build, switch | Stage 2 recovery: the submission becomes `interrupted` and is retried from the unchanged delivery (up to `KARTA_PUBLISH_MAX_ATTEMPTS`); a recorded serial is accepted again for the same envelope; the pointer only moves in a committed transaction |
 
 Idempotency: the fetcher does not download a snapshot whose digest it
-already delivered (a new serial for the same snapshot is only checked); the
+already delivered (a new serial for the same snapshot is only checked, and
+delivered again, from the bytes it holds, only when the delivered manifest no
+longer verifies); the
 publisher records outcomes per exact set of files, and a snapshot whose
 release exists is a duplicate (Stage 2), so the same digest never builds or
 switches twice, across restarts too. Fault-injection points

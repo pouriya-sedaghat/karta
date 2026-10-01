@@ -271,6 +271,15 @@ If a key may be compromised: remove it from the source file at once,
 release was activated (a rollback also pauses), and have the producer
 publish a manifest with a higher serial signed by a trusted key.
 
+Removing a key, or a manifest expiring, also stops a build that is already
+running from going live: the switch verifies the signed manifest again. Such a
+submission ends `rejected` with the verification code (`signature_untrusted`,
+`manifest_expired`, ...; the reason says "at activation"), the active release
+is unchanged, and the validated release stays `ready`. Review it and
+`activate` it, `online-retry` it (if the key was removed by mistake and is
+back), or have the provider publish a fresh manifest for the same snapshot:
+the fetcher delivers it again without downloading, and it is activated.
+
 ### Pause, resume, retry
 
 ```bash
@@ -324,6 +333,7 @@ manual one within a scan) wins; the other is refused as `not_newer`.
 | `manifest_invalid`, `manifest_too_large` | not a well-formed manifest envelope or payload, or above 64 KiB | provider problem |
 | `manifest_region_mismatch` | the manifest is for another region or box | wrong source file or provider path |
 | `manifest_expired`, `manifest_not_yet_valid`, `manifest_validity_too_long` | outside its validity window, or longer than `max_manifest_validity` | provider must re-sign; check clocks |
+| any verification code, reason "at activation" | the manifest was valid when the build started but no longer at the switch (expired, key removed or retired, source file changed); the release was built and kept `ready`, not activated | review and activate it, `online-retry`, or wait for a fresh manifest for the same snapshot |
 | `manifest_replayed`, `manifest_conflict` | an older serial than one already verified; a different manifest under the same serial, or a signed data timestamp that disagrees with the snapshot | provider problem or attack |
 | `url_refused`, `destination_refused`, `redirect_refused` | a URL that is not https on an allowed host (or carries credentials or a query); an address that is not public and not in `allowed_networks`; a redirect | fix the source file or ask the provider for direct URLs |
 | `http_status`, `network_error`, `tls_error`, `timeout`, `stalled`, `truncated` | the transfer failed | retried with backoff; persistent: check the network and the provider |

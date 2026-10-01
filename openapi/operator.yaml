@@ -45,7 +45,11 @@ info:
     download progress); `status.freshness` the active data's age against
     `KARTA_DATA_STALE_AFTER`. A rollback pauses automatic activation of
     online snapshots (`online/resume` lifts it); paused deliveries are built
-    and kept `ready` with reason code `online_activation_paused`.
+    and kept `ready` with reason code `online_activation_paused`. The
+    signed manifest is verified again at the switch: if it expired or its
+    key was removed during the build, the submission is `rejected` with the
+    verification code (reason "at activation ...") and its validated
+    release stays `ready`.
   license:
     name: Apache-2.0 (API description)
 servers:

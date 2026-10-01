@@ -1132,12 +1132,39 @@ func TestOnline(t *testing.T) {
 					rules[fmt.Sprintf("/karta/snap-%d.osm.pbf", o.serial+1)] = sourceRule{ThrottleBPS: 400}
 				}
 				setRules(t, rules)
+				var older published
+				if fp == "fetch.after_manifest" {
+					// A valid manifest with a serial between the last
+					// delivered one and the one the crash interrupts; it is
+					// served after the crash, as a replay.
+					ots := *at(fmt.Sprintf("2026-06-%02dT12:00:00Z", day))
+					older = o.stage(t, variant(t, &ots, nil, nil), ots, nil)
+				}
 				p, data := next()
 				startFetcher(t, map[string]string{"KARTA_TEST_FETCH_FAILPOINTS": fp})
 				if code := waitFetcherExit(t, 60*time.Second); code != 99 {
 					t.Fatalf("fetcher exit %d", code)
 				}
 				setRules(t, nil)
+				if fp == "fetch.after_manifest" {
+					// The interrupted check persisted serial p before the
+					// crash, so after a restart the older serial is a replay,
+					// refused before any snapshot request.
+					setManifest(t, older.raw)
+					since := time.Now()
+					startFetcher(t, nil)
+					waitFetcher(t, "the older manifest refused as a replay", 60*time.Second, failedWith(online.CodeManifestReplayed, since))
+					stopFetcher(t)
+					if st, _ := online.ReadState(onlineDir); st == nil || st.HighestSerial != p.serial {
+						t.Errorf("highest serial after the replay: %+v", st)
+					}
+					olderSnap := fmt.Sprintf("/karta/snap-%d.osm.pbf", older.serial)
+					if n := countRequests(t, olderSnap); n != 0 {
+						t.Errorf("%d requests for the replayed manifest's snapshot", n)
+					}
+					noSubmission(t, older.name)
+					setManifest(t, p.raw)
+				}
 				startFetcher(t, nil)
 				s := waitSubmission(t, p.name, 120*time.Second)
 				if s.State != "published" {
@@ -1342,6 +1369,96 @@ func TestOnline(t *testing.T) {
 		if s3 := waitSubmission(t, p3.name, 90*time.Second); s3.State != "published" {
 			t.Errorf("after resume: %+v", s3)
 		}
+	})
+
+	t.Run("the signed authorization is checked again at the switch", func(t *testing.T) {
+		o.restartOnlinePublisher(t, map[string]string{"KARTA_TEST_OSM2PGSQL": "/usr/local/bin/slow-osm2pgsql"})
+		t.Cleanup(func() {
+			holdImports(t, false)
+			o.setSource(t, map[string]any{"trusted_keys": o.defaultSource()["trusted_keys"]})
+		})
+		active := status(t).activeID()
+		mustStay := func(t *testing.T, what, candidate string) {
+			t.Helper()
+			st := status(t)
+			if got := st.activeID(); got != active {
+				t.Errorf("%s: active %s, want %s unchanged", what, got, active)
+			}
+			if r := st.release(candidate); r == nil || r.State != "ready" {
+				t.Errorf("%s: candidate %s not kept ready: %+v", what, candidate, r)
+			}
+			if m, _ := publicManifest(t); m.Release.ReleaseID != active {
+				t.Errorf("%s: public manifest serves %s", what, m.Release.ReleaseID)
+			}
+		}
+
+		// The manifest expires while the build is held: the switch is refused.
+		holdImports(t, true)
+		ts := *at("2026-08-03T06:00:00Z")
+		expires := time.Now().Add(35 * time.Second).UTC().Truncate(time.Second)
+		p := o.publishOnline(t, variant(t, &ts, nil, nil), ts, nil, func(m *online.Manifest) { m.ExpiresAt = expires })
+		waitJobPhase(t, "building", 60*time.Second) // verified before it expired
+		time.Sleep(time.Until(expires.Add(2 * time.Second)))
+		holdImports(t, false)
+		s := waitSubmission(t, p.name, 120*time.Second)
+		if s.State != "rejected" || s.code() != online.CodeManifestExpired || s.release() == "" || !strings.Contains(strOr(s.Reason), "at activation") {
+			t.Fatalf("manifest expired during the build: %+v %s", s, strOr(s.Reason))
+		}
+		candidate := s.release()
+		mustStay(t, "expired", candidate)
+
+		// A retry verifies the same manifest again: still expired, refused
+		// before anything is built.
+		r := op(t, http.MethodPost, "/v1/operator/online/retry", admin, map[string]any{"reason": "retry the expired delivery"})
+		expectStatus(t, r, http.StatusOK)
+		deadline := time.Now().Add(90 * time.Second)
+		for s.Attempts < 2 && time.Now().Before(deadline) {
+			time.Sleep(time.Second)
+			s = waitSubmission(t, p.name, 10*time.Second)
+		}
+		if s.State != "rejected" || s.code() != online.CodeManifestExpired || s.Attempts != 2 {
+			t.Fatalf("retry of an expired delivery: %+v", s)
+		}
+		mustStay(t, "expired, retried", candidate)
+
+		// A fresh signed manifest for the same snapshot publishes the kept
+		// candidate; the fetcher delivers it without downloading again.
+		clearRequests(t)
+		fresh := o.resign(t, p, "test-2026a", o.key)
+		if s := waitSubmission(t, fresh.name, 120*time.Second); s.State != "published" || s.release() != candidate {
+			t.Fatalf("fresh manifest for the kept candidate: %+v %s", s, strOr(s.Reason))
+		}
+		waitManifest(t, candidate)
+		if n := countRequests(t, "/karta/"+p.manifest.Snapshot.URL); n != 0 {
+			t.Errorf("the snapshot was downloaded again (%d requests)", n)
+		}
+		active = candidate
+
+		// The signing key is removed from the source file while the build
+		// is held: the switch is refused.
+		holdImports(t, true)
+		ts2 := *at("2026-08-03T12:00:00Z")
+		p2 := o.publishOnline(t, variant(t, &ts2, nil, nil), ts2, nil)
+		waitJobPhase(t, "building", 60*time.Second)
+		o.setSource(t, map[string]any{"trusted_keys": []map[string]string{{"id": "test-2026b", "ed25519_public_key": b64(o.other.Public().(ed25519.PublicKey))}}})
+		holdImports(t, false)
+		s2 := waitSubmission(t, p2.name, 120*time.Second)
+		if s2.State != "rejected" || s2.code() != online.CodeSignatureUntrusted || s2.release() == "" {
+			t.Fatalf("key removed during the build: %+v %s", s2, strOr(s2.Reason))
+		}
+		mustStay(t, "key removed", s2.release())
+
+		// A fresh manifest by the key now trusted publishes it.
+		fresh2 := o.resign(t, p2, "test-2026b", o.other)
+		if s := waitSubmission(t, fresh2.name, 120*time.Second); s.State != "published" || s.release() != s2.release() {
+			t.Fatalf("fresh manifest by the new key: %+v %s", s, strOr(s.Reason))
+		}
+		waitManifest(t, s2.release())
+
+		o.setSource(t, map[string]any{"trusted_keys": o.defaultSource()["trusted_keys"]})
+		o.restartOnlinePublisher(t, nil)
+		waitIdle(t)
+		assertRegistryConsistent(t)
 	})
 
 	t.Run("an online delivery refused for storage is retried on request", func(t *testing.T) {
@@ -1588,6 +1705,34 @@ func waitIdle(t *testing.T) {
 }
 
 func ptr(t time.Time) *time.Time { return &t }
+
+// resign serves a fresh manifest (the next serial, a new validity window)
+// for p's snapshot, signed by key id with k.
+func (o *onlineSuite) resign(t *testing.T, p published, id string, k ed25519.PrivateKey) published {
+	t.Helper()
+	o.serial++
+	now := time.Now().UTC().Truncate(time.Second)
+	m := p.manifest
+	m.Serial, m.IssuedAt, m.ExpiresAt = o.serial, now.Add(-time.Minute), now.Add(12*time.Hour)
+	raw, err := online.Sign(m, online.Signer{KeyID: id, Key: k})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setManifest(t, raw)
+	return published{serial: o.serial, data: p.data, raw: raw, name: online.DeliveryName("fixture", m.Serial, m.Snapshot.SHA256), manifest: m}
+}
+
+// holdImports makes slow-osm2pgsql wait, after its delay, until released.
+func holdImports(t *testing.T, on bool) {
+	t.Helper()
+	args := []string{"exec", "-T", "publisher", "rm", "-f", "/tmp/karta-hold-import"}
+	if on {
+		args = []string{"exec", "-T", "publisher", "touch", "/tmp/karta-hold-import"}
+	}
+	if _, stderr, code := compose(t, args...); code != 0 {
+		t.Fatalf("hold imports %v: %s", on, stderr)
+	}
+}
 
 func mustSign(t *testing.T, m online.Manifest, k ed25519.PrivateKey) []byte {
 	t.Helper()
