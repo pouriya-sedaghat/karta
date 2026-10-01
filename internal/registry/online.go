@@ -32,9 +32,9 @@ func GetOnlineState(ctx context.Context, q Querier) (OnlineState, error) {
 	return s, err
 }
 
-// RecordOnlineCheck persists a verified manifest before publication starts.
-// Identical digests are idempotent across crashes; changed claims for the
-// same timestamp are refused, including after a publisher restart.
+// RecordOnlineCheck persists a verified signed manifest before publication
+// starts, even if the transfer or build later fails. Identical digests can
+// retry across crashes; changed claims for the same timestamp are refused.
 func RecordOnlineCheck(ctx context.Context, q Querier, digest string, timestamp time.Time) error {
 	_, err := q.Exec(ctx, `UPDATE registry.online_state SET last_check = now(),
     verified_digest = $1, verified_timestamp = $2 WHERE singleton`, digest, timestamp)

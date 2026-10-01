@@ -168,7 +168,7 @@ func TestDestinationPolicy(t *testing.T) {
 			t.Fatalf("accepted %s", raw)
 		}
 	}
-	for _, ip := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "100.64.0.1", "198.18.0.1", "::1", "fe80::1", "2001:db8::1"} {
+	for _, ip := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "0.0.0.1", "100.64.0.1", "192.88.99.1", "198.18.0.1", "::1", "fe80::1", "64:ff9b::7f00:1", "64:ff9b:1::1", "2001:db8::1"} {
 		if publicIP(net.ParseIP(ip)) {
 			t.Fatalf("accepted private address %s", ip)
 		}

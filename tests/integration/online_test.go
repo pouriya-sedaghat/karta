@@ -25,10 +25,12 @@ import (
 )
 
 type fixtureResponse struct {
-	manifest []byte
-	snapshot []byte
-	mode     string
-	gate     <-chan struct{}
+	manifest           []byte
+	manifestForRequest func() []byte
+	snapshot           []byte
+	provenance         []byte
+	mode               string
+	gate               <-chan struct{}
 }
 
 type onlineState struct {
@@ -80,11 +82,20 @@ func waitOnlineAttempt(t *testing.T, previous *time.Time, wantError string) (opS
 }
 
 func signedOnlineManifest(t *testing.T, key ed25519.PrivateKey, rawURL string, snapshot []byte, timestamp time.Time) []byte {
+	return signedOnlineManifestFor(t, key, rawURL, snapshot, timestamp, time.Hour)
+}
+
+func signedOnlineManifestFor(t *testing.T, key ed25519.PrivateKey, rawURL string, snapshot []byte, timestamp time.Time, validity time.Duration) []byte {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
-	m := online.Manifest{RegionID: "fixture", IssuedAt: now, ExpiresAt: now.Add(time.Hour),
+	m := online.Manifest{RegionID: "fixture", IssuedAt: now, ExpiresAt: now.Add(validity),
 		DataTimestamp: timestamp, SHA256: digestOf(snapshot), SizeBytes: int64(len(snapshot)),
 		SnapshotURL: rawURL + "/snapshot"}
+	return signOnlinePayload(t, key, m)
+}
+
+func signOnlinePayload(t *testing.T, key ed25519.PrivateKey, m online.Manifest) []byte {
+	t.Helper()
 	payload, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
@@ -134,7 +145,11 @@ func TestOnlinePublisher(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/manifest":
-			_, _ = w.Write(v.manifest)
+			manifest := v.manifest
+			if v.manifestForRequest != nil {
+				manifest = v.manifestForRequest()
+			}
+			_, _ = w.Write(manifest)
 		case "/snapshot":
 			snapshotRequests.Add(1)
 			switch v.mode {
@@ -151,6 +166,8 @@ func TestOnlinePublisher(t *testing.T) {
 			default:
 				_, _ = w.Write(v.snapshot)
 			}
+		case "/provenance":
+			_, _ = w.Write(v.provenance)
 		default:
 			http.NotFound(w, r)
 		}
@@ -221,14 +238,27 @@ func TestOnlinePublisher(t *testing.T) {
 		previous := failed.LastAttempt
 		trigger()
 		st, failed = waitOnlineAttempt(t, previous, "download_failed")
-		if st.activeID() != first.release() || failed.LastCheck != nil {
+		if st.activeID() != first.release() || failed.LastCheck == nil || failed.VerifiedDigest == nil || *failed.VerifiedDigest != digestOf(b) {
 			t.Fatalf("%s changed publication: %+v %+v", mode, st.Active, failed)
 		}
+	}
+	// The signed sidecar claim must match the complete downloaded bytes.
+	prov := []byte(`{"source":"fixture"}`)
+	provManifest := online.Manifest{RegionID: "fixture", IssuedAt: time.Now().UTC().Truncate(time.Second),
+		ExpiresAt: time.Now().UTC().Add(time.Hour), DataTimestamp: timestamp,
+		SHA256: digestOf(b), SizeBytes: int64(len(b)), SnapshotURL: sourceURL + "/snapshot",
+		ProvenanceURL: sourceURL + "/provenance", ProvenanceSHA256: digestOf(prov), ProvenanceSizeBytes: int64(len(prov))}
+	reply.Store(&fixtureResponse{manifest: signOnlinePayload(t, priv, provManifest), snapshot: b, provenance: []byte(`{"source":"corrupt"}`)})
+	previous := failed.LastAttempt
+	trigger()
+	st, failed = waitOnlineAttempt(t, previous, "download_failed")
+	if st.activeID() != first.release() || failed.VerifiedDigest == nil || *failed.VerifiedDigest != digestOf(b) {
+		t.Fatalf("invalid signed provenance affected active release: %+v %+v", st.Active, failed)
 	}
 
 	gate := make(chan struct{})
 	reply.Store(&fixtureResponse{manifest: valid, snapshot: b, mode: "slow", gate: gate})
-	previous := failed.LastAttempt
+	previous = failed.LastAttempt
 	trigger()
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
@@ -389,6 +419,30 @@ func TestOnlinePublisher(t *testing.T) {
 		t.Fatalf("online build overwrote an operator rollback: %+v %+v", finalStatus.Active, finalCheck)
 	}
 	waitManifest(t, manual.release())
+
+	// A manifest can expire during a long build. Its ready release must not
+	// switch the pointer until a fresh signature authorizes the same digest.
+	r = op(t, http.MethodPost, "/v1/operator/online/resume", secret(t, "operator_token"),
+		map[string]any{"reason": "test authorization expiry during build"})
+	expectStatus(t, r, http.StatusOK)
+	g := variant(t, at("2026-07-01T00:00:00Z"), nil, nil)
+	reply.Store(&fixtureResponse{manifestForRequest: func() []byte {
+		return signedOnlineManifestFor(t, priv, sourceURL, g, *at("2026-07-01T00:00:00Z"), 5*time.Second)
+	}, snapshot: g})
+	previous = finalCheck.LastAttempt
+	triggerWith(map[string]string{"KARTA_TEST_OSM2PGSQL": "/usr/local/bin/slow-osm2pgsql"})
+	expiredStatus, expired := waitOnlineAttempt(t, previous, "manifest_expired")
+	if expiredStatus.activeID() != manual.release() || expired.VerifiedDigest == nil || *expired.VerifiedDigest != digestOf(g) {
+		t.Fatalf("expired authorization moved the pointer: %+v %+v", expiredStatus.Active, expired)
+	}
+	reply.Store(&fixtureResponse{manifest: signedOnlineManifest(t, priv, sourceURL, g, *at("2026-07-01T00:00:00Z")), snapshot: g})
+	previous = expired.LastAttempt
+	trigger()
+	renewedStatus, renewed := waitOnlineAttempt(t, previous, "")
+	if renewedStatus.activeID() == manual.release() || renewed.VerifiedDigest == nil || *renewed.VerifiedDigest != digestOf(g) {
+		t.Fatalf("renewed authorization did not publish ready release: %+v %+v", renewedStatus.Active, renewed)
+	}
+	waitManifest(t, renewedStatus.activeID())
 }
 
 func settingsEnv(settings map[string]string) []string {

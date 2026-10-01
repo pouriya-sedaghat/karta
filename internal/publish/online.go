@@ -3,6 +3,7 @@ package publish
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"github.com/pouriya-sedaghat/karta/internal/online"
 	"github.com/pouriya-sedaghat/karta/internal/registry"
 )
+
+var errOnlineManifestExpired = errors.New("signed manifest expired before activation")
 
 // RunOnline polls only in the publisher. The public API never makes network
 // requests; failures schedule a later attempt and leave the active pointer.
@@ -109,16 +112,19 @@ func (s *Service) OnlineOnce(ctx context.Context) (code string) {
 			return "source_conflict"
 		}
 	}
+	// A valid signed check is useful even when the subsequent transfer or
+	// build fails. Persist its identity before claiming or downloading so a
+	// restart cannot accept an older or conflicting signed claim.
+	if err := registry.RecordOnlineCheck(ctx, s.reg, m.SHA256, m.DataTimestamp); err != nil {
+		return "registry_unavailable"
+	}
 	if state.VerifiedDigest != nil && m.SHA256 == *state.VerifiedDigest {
 		prior, err := registry.SubmissionByFingerprint(ctx, s.reg, "online:v1:"+regionID+":"+m.SHA256)
 		if err != nil {
 			return "registry_unavailable"
 		}
 		resume := prior != nil && prior.State == registry.SubReady && prior.ReasonCode != nil && *prior.ReasonCode == "online_paused" && !state.Paused
-		if !resume {
-			if err := registry.RecordOnlineCheck(ctx, s.reg, m.SHA256, m.DataTimestamp); err != nil {
-				return "registry_unavailable"
-			}
+		if prior != nil && (prior.State == registry.SubPublished || prior.State == registry.SubDuplicate || prior.State == registry.SubReady) && !resume {
 			return ""
 		}
 	}
@@ -128,9 +134,6 @@ func (s *Service) OnlineOnce(ctx context.Context) (code string) {
 	}
 	if !claimed {
 		if sub.State == registry.SubPublished || sub.State == registry.SubReady || sub.State == registry.SubDuplicate {
-			if err := registry.RecordOnlineCheck(ctx, s.reg, m.SHA256, m.DataTimestamp); err != nil {
-				return "registry_unavailable"
-			}
 			return ""
 		}
 		return "submission_not_retryable"
@@ -149,7 +152,7 @@ func (s *Service) OnlineOnce(ctx context.Context) (code string) {
 	req.staged = staged
 	failpoint.Hit("online.after_download")
 	if !s.now().Before(m.ExpiresAt) {
-		s.finish(ctx, req, Outcome{SubmissionID: sub.ID, State: registry.SubRejected, Code: "manifest_expired",
+		s.finish(ctx, req, Outcome{SubmissionID: sub.ID, State: registry.SubInterrupted, Code: "manifest_expired",
 			Reason: "signed manifest expired before publication"}, m.SHA256)
 		return "manifest_expired"
 	}
@@ -159,12 +162,12 @@ func (s *Service) OnlineOnce(ctx context.Context) (code string) {
 		s.cleanupAfterPublish(ctx)
 	}
 	if out.State == registry.SubPublished || out.State == registry.SubReady || out.State == registry.SubDuplicate {
-		if err := registry.RecordOnlineCheck(ctx, s.reg, m.SHA256, m.DataTimestamp); err != nil {
-			return "registry_unavailable"
-		}
 		return ""
 	}
 	if out.State == registry.SubInterrupted {
+		if out.Code == "manifest_expired" {
+			return out.Code
+		}
 		return "publication_interrupted"
 	}
 	if out.Code != "" {

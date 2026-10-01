@@ -387,6 +387,11 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		Actor: req.principal.Name, Source: req.principal.Source, Reason: req.reason, RequestID: req.principal.RequestID,
 		PinGrace: s.cfg.PinGrace,
 		Allow: func(a, t *registry.Release) error {
+			// A slow build or pointer-lock wait may outlive the signed
+			// authorization. Check within the pointer transaction.
+			if req.onlineManifest != nil && !s.now().Before(req.onlineManifest.ExpiresAt) {
+				return errOnlineManifestExpired
+			}
 			if err := Forward(a, Candidate{RegionID: t.RegionID, SHA256: t.SourceSHA256, DataTimestamp: ts}, req.allowRegionChange); err != nil {
 				return err
 			}
@@ -405,6 +410,8 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		case errors.Is(err, registry.ErrOnlinePaused):
 			out.State, out.Code, out.Reason = registry.SubReady, "online_paused", "validated; automatic activation was paused by an operator"
 			return out
+		case errors.Is(err, errOnlineManifestExpired):
+			return fail(registry.SubInterrupted, "manifest_expired", err)
 		case PolicyCode(err) != "":
 			out.State, out.Code, out.Reason = registry.SubReady, PolicyCode(err), err.Error()
 			return out

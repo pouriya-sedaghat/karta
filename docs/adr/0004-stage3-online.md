@@ -68,6 +68,13 @@ configured interval. A different digest at the same signed timestamp, an
 older source timestamp, or conflicting claims for the same digest are
 refused across restarts.
 
+The last successful check records a verified signed manifest before its
+download starts. A later transfer or build failure remains visible as the
+last attempt error; the signed source claim remains durable and the same
+digest may retry. A manifest that expires during a slow build cannot
+authorize an automatic pointer switch. The ready release remains available
+for a retry under a fresh signed manifest, within the attempt limit.
+
 The build lock serializes manual and online candidates. The forward policy
 and pointer CAS decide which valid candidate activates; a build that loses
 the CAS stays ready. An explicit operator activation or rollback sets
@@ -90,7 +97,8 @@ update lag, egress firewall and target resource budget need owner decisions.
 Unit tests cover the signature, origin, size, redirect, transfer and timeout
 rules. The integration suite now drives a real Compose publisher with a signed
 local HTTPS fixture, failed downloads, duplicates, rollback, crash recovery,
-manual publication during source failure and serving load. The disposable
+manual publication during source failure, a mismatched signed provenance
+sidecar, expiration during a build, and serving load. The disposable
 `onlinefixture` test image alone can route `example.com` to the host fixture;
 the production image retains its private-address refusal. CI results and an
 independent review are required before marking the PR ready. The suite does

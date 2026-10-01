@@ -71,6 +71,11 @@ the manifest's origin. The operator's `/v1/operator/status` and
 separately. An explicit activation or rollback pauses automatic online
 activation; `karta operator pause-online --reason '...'` and
 `karta operator resume-online --reason '...'` change that audited policy.
+The last successful check means the manifest signature and source claim
+passed; a later download or build failure appears separately as the last
+attempt error. If a signed manifest expires before activation, the publisher
+keeps the active release and retries the candidate only under a fresh signed
+manifest, up to the configured attempt limit.
 Manual publication remains available offline. See ADR 0004 for recovery and
 key rotation.
 
