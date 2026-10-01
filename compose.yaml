@@ -171,6 +171,11 @@ services:
       - ./config/regions:/config/regions:ro
       - ./config/sources:/config/sources:ro
     networks: [egress]
+    # The image's health check probes the API listener, which the fetcher
+    # does not have; its liveness is the age of its state file, reported by
+    # the publisher (karta_online_fetcher_state_age_seconds).
+    healthcheck:
+      disable: true
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
