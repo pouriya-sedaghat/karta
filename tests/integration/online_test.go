@@ -242,25 +242,9 @@ func TestOnlinePublisher(t *testing.T) {
 			t.Fatalf("%s changed publication: %+v %+v", mode, st.Active, failed)
 		}
 	}
-	// The signed sidecar claim must match the complete downloaded bytes.
-	prov := []byte(`{"source":"fixture"}`)
-	provTimestamp := *at("2026-01-15T00:00:00Z")
-	provSnapshot := variant(t, &provTimestamp, nil, nil)
-	provManifest := online.Manifest{RegionID: "fixture", IssuedAt: time.Now().UTC().Truncate(time.Second),
-		ExpiresAt: time.Now().UTC().Add(time.Hour), DataTimestamp: provTimestamp,
-		SHA256: digestOf(provSnapshot), SizeBytes: int64(len(provSnapshot)), SnapshotURL: sourceURL + "/snapshot",
-		ProvenanceURL: sourceURL + "/provenance", ProvenanceSHA256: digestOf(prov), ProvenanceSizeBytes: int64(len(prov))}
-	reply.Store(&fixtureResponse{manifest: signOnlinePayload(t, priv, provManifest), snapshot: provSnapshot, provenance: []byte(`{"source":"corrupt"}`)})
-	previous := failed.LastAttempt
-	trigger()
-	st, failed = waitOnlineAttempt(t, previous, "download_failed")
-	if st.activeID() != first.release() || failed.VerifiedDigest == nil || *failed.VerifiedDigest != digestOf(provSnapshot) {
-		t.Fatalf("invalid signed provenance affected active release: %+v %+v", st.Active, failed)
-	}
-
 	gate := make(chan struct{})
 	reply.Store(&fixtureResponse{manifest: valid, snapshot: b, mode: "slow", gate: gate})
-	previous = failed.LastAttempt
+	previous := failed.LastAttempt
 	trigger()
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
@@ -301,8 +285,27 @@ func TestOnlinePublisher(t *testing.T) {
 		t.Fatalf("duplicate source was re-imported: %+v %+v", duplicateStatus.Active, duplicate)
 	}
 
-	// Signed but older data must be refused without fetching its snapshot.
+	// The signed sidecar claim must match the complete downloaded bytes.
+	// Give this failed candidate a newer timestamp and separate fingerprint;
+	// the earlier b candidate must remain within its retry budget.
+	prov := []byte(`{"source":"fixture"}`)
+	provTimestamp := *at("2026-02-15T00:00:00Z")
+	provSnapshot := variant(t, &provTimestamp, nil, nil)
+	provManifest := online.Manifest{RegionID: "fixture", IssuedAt: time.Now().UTC().Truncate(time.Second),
+		ExpiresAt: time.Now().UTC().Add(time.Hour), DataTimestamp: provTimestamp,
+		SHA256: digestOf(provSnapshot), SizeBytes: int64(len(provSnapshot)), SnapshotURL: sourceURL + "/snapshot",
+		ProvenanceURL: sourceURL + "/provenance", ProvenanceSHA256: digestOf(prov), ProvenanceSizeBytes: int64(len(prov))}
+	reply.Store(&fixtureResponse{manifest: signOnlinePayload(t, priv, provManifest), snapshot: provSnapshot, provenance: []byte(`{"source":"corrupt"}`)})
 	previous = duplicate.LastAttempt
+	trigger()
+	provenanceStatus, provenanceState := waitOnlineAttempt(t, previous, "download_failed")
+	if provenanceStatus.activeID() != st.activeID() || provenanceState.VerifiedDigest == nil || *provenanceState.VerifiedDigest != digestOf(provSnapshot) {
+		t.Fatalf("invalid signed provenance affected active release: %+v %+v", provenanceStatus.Active, provenanceState)
+	}
+
+	// Signed but older data must be refused without fetching its snapshot.
+	previous = provenanceState.LastAttempt
+	beforeRequests = snapshotRequests.Load()
 	reply.Store(&fixtureResponse{manifest: signedOnlineManifest(t, priv, sourceURL, a, *at("2026-01-01T00:00:00Z")), snapshot: a})
 	trigger()
 	olderStatus, older := waitOnlineAttempt(t, previous, "source_conflict")
