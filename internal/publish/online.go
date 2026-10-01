@@ -156,7 +156,10 @@ func (s *Service) OnlineOnce(ctx context.Context) (code string) {
 			Reason: "signed manifest expired before publication"}, m.SHA256)
 		return "manifest_expired"
 	}
-	out := s.publish(ctx, req)
+	// The online deadline covers verification, capacity, build and activation
+	// as well as the network transfer. Outcome recording uses the parent
+	// context below so a timed-out attempt remains visible and retryable.
+	out := s.publish(netCtx, req)
 	s.finish(ctx, req, out, m.SHA256)
 	if out.State == registry.SubPublished {
 		s.cleanupAfterPublish(ctx)
