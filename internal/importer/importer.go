@@ -50,6 +50,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -771,6 +772,11 @@ func runOsm2pgsql(ctx context.Context, opts BuildOptions, snapshot, dbName strin
 	}
 	args = append(args, snapshot)
 	cmd := exec.CommandContext(ctx, opts.Osm2pgsql, args...) // #nosec G204 -- fixed arguments, validated values
+	// A configured wrapper may start child processes that inherit stdout and
+	// keep the import alive after the wrapper is killed. Cancel the whole
+	// process group so an online deadline also stops those children.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.Env = []string{"PGPASSFILE=" + pgpass, "PGSSLMODE=" + opts.DB.SSLMode, "PGAPPNAME=karta-osm2pgsql", "PGCONNECT_TIMEOUT=10", "HOME=" + dir}
 	cmd.Dir = dir
 	out, err := cmd.StdoutPipe()

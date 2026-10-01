@@ -349,6 +349,11 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 	}
 	if err != nil {
 		switch {
+		case ctx.Err() != nil:
+			// A deadline can surface as a tool exit or database error rather
+			// than as context.DeadlineExceeded. Keep the signed submission
+			// retryable when the online operation's time budget expires.
+			return fail(registry.SubInterrupted, CodeInterrupted, ctx.Err())
 		case importer.InputCode(err) != "":
 			return fail(registry.SubRejected, importer.InputCode(err), err)
 		case errors.Is(err, importer.ErrValidation):

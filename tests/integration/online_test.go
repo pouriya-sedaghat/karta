@@ -448,6 +448,83 @@ func TestOnlinePublisher(t *testing.T) {
 		t.Fatalf("renewed authorization did not publish ready release: %+v %+v", renewedStatus.Active, renewed)
 	}
 	waitManifest(t, renewedStatus.activeID())
+
+	// A transfer that exceeds the configured operation deadline must leave
+	// no partial staging data or pointer switch. A later check of the same
+	// signed digest remains eligible for a retry.
+	h := variant(t, at("2026-08-01T00:00:00Z"), nil, nil)
+	hManifest := signedOnlineManifest(t, priv, sourceURL, h, *at("2026-08-01T00:00:00Z"))
+	gate = make(chan struct{})
+	reply.Store(&fixtureResponse{manifest: hManifest, snapshot: h, mode: "slow", gate: gate})
+	previous = renewed.LastAttempt
+	beforeRequests = snapshotRequests.Load()
+	triggerWith(map[string]string{"KARTA_TEST_ONLINE_TIMEOUT": "3s"})
+	timeoutStatus, timedOut := waitOnlineAttempt(t, previous, "download_failed")
+	close(gate)
+	if timeoutStatus.activeID() != renewedStatus.activeID() || snapshotRequests.Load() != beforeRequests+1 ||
+		timedOut.VerifiedDigest == nil || *timedOut.VerifiedDigest != digestOf(h) {
+		t.Fatalf("timed-out transfer changed publication: %+v %+v", timeoutStatus.Active, timedOut)
+	}
+	assertOnlineStagingEmpty(t)
+
+	// With only 1 MiB of staging space, the configured 1 MiB reserve plus
+	// the signed snapshot size cannot fit. Refuse before opening the URL.
+	reply.Store(&fixtureResponse{manifest: hManifest, snapshot: h})
+	previous = timedOut.LastAttempt
+	beforeRequests = snapshotRequests.Load()
+	triggerWith(map[string]string{"KARTA_TEST_STAGING_SIZE": "1m"})
+	spaceStatus, noSpace := waitOnlineAttempt(t, previous, "download_failed")
+	if spaceStatus.activeID() != renewedStatus.activeID() || snapshotRequests.Load() != beforeRequests ||
+		noSpace.VerifiedDigest == nil || *noSpace.VerifiedDigest != digestOf(h) {
+		t.Fatalf("staging preflight changed publication or fetched bytes: %+v %+v", spaceStatus.Active, noSpace)
+	}
+	assertOnlineStagingEmpty(t)
+	previous = noSpace.LastAttempt
+	trigger()
+	spaceRecoveredStatus, spaceRecovered := waitOnlineAttempt(t, previous, "")
+	if spaceRecoveredStatus.activeID() == renewedStatus.activeID() ||
+		spaceRecovered.VerifiedDigest == nil || *spaceRecovered.VerifiedDigest != digestOf(h) {
+		t.Fatalf("same digest did not recover after resource failures: %+v %+v", spaceRecoveredStatus.Active, spaceRecovered)
+	}
+	waitManifest(t, spaceRecoveredStatus.activeID())
+
+	// The deadline also bounds a build after a complete download. An
+	// interrupted build remains retryable with a fresh operation budget.
+	i := variant(t, at("2026-09-01T00:00:00Z"), nil, nil)
+	reply.Store(&fixtureResponse{manifest: signedOnlineManifest(t, priv, sourceURL, i, *at("2026-09-01T00:00:00Z")), snapshot: i})
+	previous = spaceRecovered.LastAttempt
+	triggerWith(map[string]string{"KARTA_TEST_ONLINE_TIMEOUT": "8s", "KARTA_TEST_OSM2PGSQL": "/usr/local/bin/slow-osm2pgsql"})
+	deadline = time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := status(t); s.OnlineJob != nil && s.OnlineJob.Phase == "building" {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if s := status(t); s.OnlineJob == nil || s.OnlineJob.Phase != "building" {
+		t.Fatal("online publisher did not enter the bounded build")
+	}
+	buildStatus, buildTimeout := waitOnlineAttempt(t, previous, "publication_interrupted")
+	if buildStatus.activeID() != spaceRecoveredStatus.activeID() ||
+		buildTimeout.VerifiedDigest == nil || *buildTimeout.VerifiedDigest != digestOf(i) {
+		t.Fatalf("timed-out build changed publication: %+v %+v", buildStatus.Active, buildTimeout)
+	}
+	previous = buildTimeout.LastAttempt
+	trigger()
+	buildRecoveredStatus, buildRecovered := waitOnlineAttempt(t, previous, "")
+	if buildRecoveredStatus.activeID() == spaceRecoveredStatus.activeID() ||
+		buildRecovered.VerifiedDigest == nil || *buildRecovered.VerifiedDigest != digestOf(i) {
+		t.Fatalf("same digest did not recover after build timeout: %+v %+v", buildRecoveredStatus.Active, buildRecovered)
+	}
+	waitManifest(t, buildRecoveredStatus.activeID())
+}
+
+func assertOnlineStagingEmpty(t *testing.T) {
+	t.Helper()
+	out, stderr, code := compose(t, "exec", "-T", "publisher", "find", "/var/lib/karta/staging", "-mindepth", "1", "-maxdepth", "1", "-name", "'online-*'")
+	if code != 0 || out != "" {
+		t.Fatalf("online staging contains partial data: %q (%s; exit %d)", out, stderr, code)
+	}
 }
 
 func settingsEnv(settings map[string]string) []string {

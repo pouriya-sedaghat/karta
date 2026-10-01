@@ -46,7 +46,7 @@ services:
       KARTA_TEST_ONLINE_DIAL_ADDR: ${KARTA_TEST_ONLINE_DIAL_ADDR:-}
       KARTA_TEST_ONLINE_CERT_FILE: ${KARTA_TEST_ONLINE_CERT_FILE:-}
       KARTA_ONLINE_INTERVAL: 1m
-      KARTA_ONLINE_TIMEOUT: 2m
+      KARTA_ONLINE_TIMEOUT: ${KARTA_TEST_ONLINE_TIMEOUT:-2m}
       KARTA_ONLINE_MAX_MB: 1
     volumes: !override
       - ${KARTA_INBOX_HOST_DIR:?set by make test-integration}:/data/inbox:ro
