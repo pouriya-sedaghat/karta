@@ -28,6 +28,7 @@ var Known = []string{
 	"activate.after_commit",
 	"cleanup.after_mark",
 	"cleanup.after_drop",
+	"online.after_download",
 }
 
 var enabled = parse(os.Getenv("KARTA_FAILPOINTS"))

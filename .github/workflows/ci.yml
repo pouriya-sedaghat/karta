@@ -46,7 +46,7 @@ jobs:
           go-version-file: go.mod
       - name: build images
         run: make build
-      - name: integration tests (Stage 1 stack and Stage 2 publication, committed fixtures only)
+      - name: integration tests (Stage 1/2 and signed Stage 3 fixture, no live source)
         run: make test-integration
       - name: browser test against the fixture
         run: |

@@ -36,7 +36,8 @@ COPY cmd/ cmd/
 COPY internal/ internal/
 COPY openapi/ openapi/
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/karta ./cmd/karta
+ARG GO_TAGS=
+RUN CGO_ENABLED=0 go build -tags "${GO_TAGS}" -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/karta ./cmd/karta
 
 FROM ${RUNTIME_IMAGE} AS api
 COPY --from=build /out/karta /usr/local/bin/karta

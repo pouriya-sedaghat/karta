@@ -88,7 +88,11 @@ there is no claim that a retained old release proves a successful check.
 The production HTTPS origin, signing key owner/rotation process, permitted
 update lag, egress firewall and target resource budget need owner decisions.
 Unit tests cover the signature, origin, size, redirect, transfer and timeout
-rules. Full CI evidence still needs an end-to-end local HTTPS fixture through
-the publisher, live serving and concurrent manual/online fault cases. Keep
-the PR draft until these are present and green; do not deploy the overlay to
-the owner's VM on the basis of this ADR.
+rules. The integration suite now drives a real Compose publisher with a signed
+local HTTPS fixture, failed downloads, duplicates, rollback, crash recovery,
+manual publication during source failure and serving load. The disposable
+`onlinefixture` test image alone can route `example.com` to the host fixture;
+the production image retains its private-address refusal. CI results and an
+independent review are required before marking the PR ready. The suite does
+not establish a production provider's trust, availability or resource budget;
+do not deploy the online overlay to the owner's VM on the basis of this ADR.

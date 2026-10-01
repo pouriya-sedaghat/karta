@@ -159,6 +159,7 @@ test: ## Unit tests (no Docker needed)
 .PHONY: test-integration
 test-integration: secrets data-dirs ## Full-stack integration tests on an isolated compose project (committed fixtures only)
 	@mkdir -p $(ARTIFACTS)
+	@docker build $(BUILD_SECRET) --build-arg VERSION=$(VERSION) --build-arg GO_TAGS=onlinefixture -f deploy/Dockerfile --target importer -t karta-importer:online-test .
 	@inbox=$$(mktemp -d) && chmod 755 $$inbox && export KARTA_INBOX_HOST_DIR=$$inbox && \
 	  { $(TEST_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true; } && \
 	  $(TEST_COMPOSE) up -d --wait db && $(TEST_COMPOSE) up -d api publisher && \

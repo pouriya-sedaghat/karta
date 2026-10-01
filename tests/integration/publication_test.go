@@ -179,6 +179,9 @@ type opStatus struct {
 	Job *struct {
 		Name, Phase string
 	} `json:"job"`
+	OnlineJob *struct {
+		Name, Phase string
+	} `json:"online_job"`
 	Storage map[string]any `json:"storage"`
 }
 

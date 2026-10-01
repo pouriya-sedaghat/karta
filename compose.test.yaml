@@ -20,6 +20,8 @@ services:
       KARTA_RELEASE_POLL_INTERVAL: 1s
       KARTA_CORS_ALLOWED_ORIGINS: https://app.example
   publisher:
+    # Built with -tags onlinefixture only for this disposable test project.
+    image: karta-importer:online-test
     ports: !override
       - "127.0.0.1:${KARTA_TEST_OPERATOR_PORT:-18081}:8081"
     environment:
@@ -39,6 +41,13 @@ services:
       KARTA_OSM2PGSQL: ${KARTA_TEST_OSM2PGSQL:-osm2pgsql}
       # Fault injection (internal/failpoint): test-only.
       KARTA_FAILPOINTS: ${KARTA_TEST_FAILPOINTS:-}
+      KARTA_ONLINE_MANIFEST_URL: ${KARTA_TEST_ONLINE_MANIFEST_URL:-}
+      KARTA_ONLINE_PUBLIC_KEY_FILE: ${KARTA_TEST_ONLINE_KEY_FILE:-}
+      KARTA_TEST_ONLINE_DIAL_ADDR: ${KARTA_TEST_ONLINE_DIAL_ADDR:-}
+      KARTA_TEST_ONLINE_CERT_FILE: ${KARTA_TEST_ONLINE_CERT_FILE:-}
+      KARTA_ONLINE_INTERVAL: 1m
+      KARTA_ONLINE_TIMEOUT: 2m
+      KARTA_ONLINE_MAX_MB: 1
     volumes: !override
       - ${KARTA_INBOX_HOST_DIR:?set by make test-integration}:/data/inbox:ro
       - ./config/regions:/config/regions:ro
@@ -48,6 +57,11 @@ services:
       - /var/lib/karta/staging:size=${KARTA_TEST_STAGING_SIZE:-64m},uid=10001,gid=10001,mode=0700
     # A failpoint exit must stay down until the test restarts the publisher.
     restart: "no"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [backend, operator, online-test]
   importer:
     environment:
       KARTA_RETAIN_RELEASES: "2"
+networks:
+  online-test: {}

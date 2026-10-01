@@ -245,6 +245,11 @@ func publisher() int {
 		}
 		pc.Online = online.Config{ManifestURL: cfg.OnlineManifestURL, PublicKey: ed25519.PublicKey(key),
 			MaxBytes: cfg.OnlineMaxBytes, Timeout: cfg.OnlineTimeout, ReserveBytes: cfg.StagingReserveBytes}
+		pc.Online.Client, err = onlineFixtureClient(cfg.OnlineManifestURL)
+		if err != nil {
+			log.Error("online fixture client", "err", err)
+			return exitUsage
+		}
 		pc.OnlineInterval, pc.OnlineStaleAfter = cfg.OnlineInterval, cfg.OnlineStaleAfter
 	}
 	pc.Fontstacks = g.Fontstacks()
