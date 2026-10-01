@@ -37,9 +37,15 @@ a new release or roll back at any time without stopping the service:
   answers `503 service_unavailable` with `Retry-After`; an id that was never
   published is `404 unknown_release`.
 * The manifest's `freshness.activated_at` says when the active release became
-  active; `update_mode` is `manual` (operator publication; online updates are
-  Stage 3). The API notices a switch within `KARTA_RELEASE_POLL_INTERVAL`
-  (5 s), so the manifest can name the previous release for that long.
+  active. `update_mode` is `manual` (operator publication) or `online` (the
+  deployment also polls a signed online source and publishes newer
+  snapshots automatically; `capabilities.online_updates` is then `true`).
+  The mode says how the data is kept current, not that a recent check
+  succeeded: `freshness.stale` (with `stale_after_seconds`, the deployment's
+  threshold; both null when none is configured) and `osm_data_timestamp`
+  describe the data's age. Nothing about the online source is published.
+  The API notices a switch within `KARTA_RELEASE_POLL_INTERVAL` (5 s), so the
+  manifest can name the previous release for that long.
 
 ## Search
 
@@ -197,7 +203,10 @@ Stage 2 changes are additive: `410 release_expired` for expired pins (before,
 only the active release was served and every other id was `404`), the new
 `manual` value of `freshness.update_mode`, `freshness.activated_at`, the
 `release_pinning` capability, and `manual_updates: true`
-(`docs/adr/0003-stage2-publication.md`).
+(`docs/adr/0003-stage2-publication.md`). Stage 3 changes are additive too:
+the `online` value of `freshness.update_mode`, `freshness.stale_after_seconds`
+and `freshness.stale`, and `online_updates: true` on deployments with online
+updates enabled (`docs/adr/0004-stage3-online-updates.md`).
 From the first release on, changes within `/v1` are additive only: new
 endpoints, optional parameters, response fields and error codes may appear;
 nothing existing is removed or redefined. Clients must ignore unknown fields. Tile layers and fields follow

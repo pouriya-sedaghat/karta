@@ -1,4 +1,4 @@
-# Karta runbook (Stage 2)
+# Karta runbook (Stage 3)
 
 Karta serves one **active release** of one region: vector tiles, a MapLibre
 style with local glyphs, named-place/POI search and a demo page, all from the
@@ -6,9 +6,10 @@ local host. An operator publishes new releases **while serving** by placing
 snapshots in a local inbox (or with the command-line importer); a release is
 built in an isolated candidate database, validated, and activated in one
 registry transaction. Replaced releases stay servable to pinned clients for a
-grace period and are kept for rollback; old ones are cleaned up. Online
-downloads (Stage 3) are not available: every snapshot arrives through the
-inbox or the command line.
+grace period and are kept for rollback; old ones are cleaned up. Optionally
+(off by default), a **fetcher** polls a configured HTTPS source for signed
+snapshot manifests and delivers newer verified snapshots to the publisher,
+which publishes them through the same path ("Online updates" below).
 
 Requirements: Docker Engine with Compose v2.24+ (for `!reset`/`!override` in
 the overlay files), GNU make, `curl`. Go 1.27+ only for tests and
@@ -22,6 +23,7 @@ from the network by any service.
 | `db` | PostGIS 18-3.6 | registry + one database per release | `backend` (internal), no port |
 | `api` | distroless, UID 65532, read-only DB role | public read API, `/demo/` | `backend` + `frontend`, 127.0.0.1:8080 |
 | `publisher` | importer image, UID 10001 | inbox watcher, builds, activation, cleanup, **operator API** | `backend` + `operator` (no NAT), 127.0.0.1:8081 |
+| `fetcher` | api image, UID 65532 | **opt-in** (`make up-online`): polls the online source, verifies signed manifests, downloads, delivers to the `online` volume; no database access | `egress` only, no port |
 | `operator-cli` | api image, UID 65532 | one-off operator API client (`make op`), holds the raw operator token | `operator` |
 | `importer` | importer image, UID 10001 | one-off command-line publication (`make import-*`) | `backend` |
 
@@ -182,6 +184,159 @@ Alternatively, pin the digest permanently by adding it to `allowed_sha256` in
 the region file through a reviewed change; the publisher reads the region file
 for every submission.
 
+## Online updates (opt-in)
+
+Online updates are **off** unless you configure them. No production source
+is configured: choosing the HTTPS provider, who holds the signing key and the
+permitted update lag are owner decisions (docs/adr/0004-stage3-online-updates.md).
+When enabled, manual publication through the inbox and the command line
+keeps working unchanged, also when the source or the network is down.
+
+### How it works
+
+1. The source publishes, next to each snapshot (and optional provenance
+   sidecar), a **signed manifest**: a DSSE envelope with an Ed25519
+   signature over the region id and box, a serial number that only grows, a
+   validity window, and the snapshot's exact URL, SHA-256, size and data
+   timestamp (and the sidecar's URL, SHA-256 and size).
+2. The `fetcher` checks the manifest every `poll_interval`: the signature
+   must verify with a key pinned in the **source file**, the region and box
+   must be this deployment's, the serial must not go back, and the manifest
+   must be inside its validity window. Only then does it download, over
+   verified TLS, without redirects, within the size and time limits, into a
+   private partial file; an interrupted download resumes only if the bytes
+   still match. A complete file whose SHA-256 is not the signed one is
+   discarded.
+3. It hands the verified files to the publisher through the `online` volume
+   with the inbox completion protocol (snapshot, sidecar, the exact signed
+   manifest, then the ready marker).
+4. The publisher verifies the signed manifest **again** on its own staged
+   copy (the fetcher is not trusted), records the serial, checks that the
+   bytes are the signed ones and that the signed data timestamp is the one
+   the snapshot carries, and then publishes exactly like an inbox
+   submission: Stage 2 verification, forward rule, storage checks, isolated
+   build, validation, one audited pointer transaction. Serving never stops.
+
+The signature authorizes the snapshot's digest, so no per-snapshot operator
+authorization is needed. To keep that step anyway, set
+`"require_operator_authorization": true` in the source file.
+
+### Enable
+
+1. Write a source file `config/sources/NAME.json` (format:
+   `config/sources/README.md`) with the provider's manifest URL and the
+   public key(s) you trust, and have it reviewed like any trust change.
+2. In `.env`: `KARTA_ONLINE_SOURCE_FILE=/config/sources/NAME.json` and,
+   once the permitted lag is decided, `KARTA_DATA_STALE_AFTER=48h` (for
+   example).
+3. `make up-online` (starts the fetcher too; `make up` does not).
+4. `make op-status`: `online.enabled` is true, `online.source` lists the
+   trusted keys, and `online.fetcher.state` shows the checks.
+
+To turn it off again, remove `KARTA_ONLINE_SOURCE_FILE`, stop the fetcher
+(`docker compose --profile online stop fetcher`) and `make up`.
+
+### Producing signed manifests
+
+On the host where snapshots are produced (never in the Karta deployment):
+
+```bash
+go run ./cmd/karta-sign keygen --out owner-2026a.pem          # prints the public key for trusted_keys
+go run ./cmd/karta-sign sign --signer owner-2026a=owner-2026a.pem \
+    --region config/regions/tehran-chitgar.json \
+    --snapshot tehran-chitgar.osm.pbf --snapshot-url tehran-chitgar-20261001.osm.pbf \
+    --serial 42 --valid-for 168h --out manifest.json
+go run ./cmd/karta-sign verify --source config/sources/NAME.json --region config/regions/tehran-chitgar.json manifest.json
+```
+
+`sign` runs Karta's own input verification on the snapshot first (complete
+PBF scan, region box, provenance sidecar, data timestamp), so it never signs
+a file Karta would refuse; it signs the provenance sidecar next to the
+snapshot automatically. Publish the snapshot and sidecar first and the
+manifest last; increase `--serial` for every manifest. Keys are PKCS#8 PEM,
+interchangeable with OpenSSL (`openssl genpkey -algorithm ed25519`); the
+public key for the source file is
+`openssl pkey -in key.pem -pubout -outform DER | tail -c 32 | base64`.
+
+### Rotate or revoke a signing key
+
+1. Add the new public key to `trusted_keys` (reviewed change; the fetcher and
+   publisher read the source file for every check and delivery, no restart).
+2. Sign with both keys during the overlap (`--signer old=... --signer new=...`).
+3. Sign with the new key only, then remove the old key, or set its
+   `not_after` in advance.
+
+If a key may be compromised: remove it from the source file at once,
+`make op CMD='online-pause --reason "key compromise"'`, roll back if a bad
+release was activated (a rollback also pauses), and have the producer
+publish a manifest with a higher serial signed by a trusted key.
+
+### Pause, resume, retry
+
+```bash
+make op CMD='online-pause --reason "provider incident"'    # validated online snapshots stay ready, not activated
+make op CMD='online-resume --reason "provider fixed"'      # applies to the next delivery
+make op CMD='activate --release rXXXX --reason "..."'      # activate a release kept ready while paused
+make op CMD='online-retry --reason "disk space freed"'     # one more attempt of the newest failed online delivery
+```
+
+**A rollback pauses automatic online activation** (audited as
+`online_pause` with cause `rollback`), so a later online snapshot cannot
+silently undo it; resume when the source has fixed the data. An online build
+that was running when an operator switched or rolled back finishes as
+`ready` (`active_changed`), never active.
+
+### When manual and online snapshots meet
+
+Builds run one at a time. In every publisher scan the inbox goes first, then
+online deliveries (by serial). The Stage 2 rules decide: the newest data
+timestamp ends up active, the same snapshot is a duplicate, and of two
+different snapshots with the same timestamp the first one switched to (the
+manual one within a scan) wins; the other is refused as `not_newer`.
+
+### Freshness, status and metrics
+
+* `make op-status`: `online.fetcher.state` (last check, last success, last
+  error and its code, consecutive failures, **next attempt**, download
+  progress; `online.fetcher.state_age_seconds` grows if the fetcher stopped),
+  `online.verified` (the newest manifest the publisher itself verified),
+  `online.policy` (paused or not) and `freshness` (active data age against
+  `KARTA_DATA_STALE_AFTER`).
+* `make op CMD=metrics` (or scrape `GET /v1/operator/metrics` with the
+  monitoring token): `karta_active_data_age_seconds`, `karta_data_stale`,
+  `karta_online_last_success_timestamp_seconds`,
+  `karta_online_next_attempt_timestamp_seconds`,
+  `karta_online_consecutive_failures`, `karta_online_last_error{code}`,
+  `karta_online_fetcher_state_age_seconds`, `karta_online_verified_serial`,
+  `karta_submissions{source,state}` and more.
+* Alert on **data age** (`karta_data_stale`), not on check success: a
+  source that answers but has nothing new, or an old release that keeps
+  serving, does not make the data fresh. Also alert on a growing
+  `karta_online_fetcher_state_age_seconds`.
+* The public manifest says only `update_mode: online`, `stale` and
+  `stale_after_seconds`; nothing about the source.
+
+### Failure codes (fetcher `last_error.code`, online submission `reason_code`)
+
+| Code | Meaning | Action |
+| --- | --- | --- |
+| `signature_untrusted`, `signature_invalid` | no signature by a trusted, valid key; or a signature claiming a trusted key does not verify | check the key ids and the source file; investigate a possible attack |
+| `manifest_invalid`, `manifest_too_large` | not a well-formed manifest envelope or payload, or above 64 KiB | provider problem |
+| `manifest_region_mismatch` | the manifest is for another region or box | wrong source file or provider path |
+| `manifest_expired`, `manifest_not_yet_valid`, `manifest_validity_too_long` | outside its validity window, or longer than `max_manifest_validity` | provider must re-sign; check clocks |
+| `manifest_replayed`, `manifest_conflict` | an older serial than one already verified; a different manifest under the same serial, or a signed data timestamp that disagrees with the snapshot | provider problem or attack |
+| `url_refused`, `destination_refused`, `redirect_refused` | a URL that is not https on an allowed host (or carries credentials or a query); an address that is not public and not in `allowed_networks`; a redirect | fix the source file or ask the provider for direct URLs |
+| `http_status`, `network_error`, `tls_error`, `timeout`, `stalled`, `truncated` | the transfer failed | retried with backoff; persistent: check the network and the provider |
+| `too_large`, `size_mismatch`, `digest_mismatch`, `unexpected_encoding` | the bytes are not the signed ones | retried; the bad bytes are discarded |
+| `insufficient_storage` | the outbox (fetcher) or staging and release storage (publisher) is full | free space; `online-retry` for a refused delivery |
+| `download_abandoned` | the same snapshot failed `max_download_attempts` times; set aside for `abandon_for` | fix the cause; a different snapshot is tried at once |
+| `source_config` | the source or region file is invalid or names another region | fix the file |
+| `manifest_missing`, `digest_mismatch` (publisher) | a delivery without a signed manifest, or with other bytes | the outbox was tampered with or the fetcher is broken |
+| `online_activation_paused` | built and validated while automatic activation is paused | resume, or activate it |
+
+All Stage 2 reason codes (forward rule, validation, storage) apply to online
+submissions as well.
+
 ## Operator API
 
 The operator API is served by the publisher on `127.0.0.1:8081`
@@ -198,6 +353,8 @@ make op CMD='rollback --release rXXXX --reason "..."'    # to a specific retaine
 make op CMD='activate --release rXXXX --reason "..."'    # a ready release (forward only, row counts re-checked)
 make op CMD='cleanup --dry-run --reason "check"'         # what cleanup would remove
 make op CMD='cleanup --reason "free space"'
+make op CMD=metrics                                      # Prometheus text: freshness, online source, submissions
+make op CMD='online-pause --reason "..."'                # see "Online updates"
 # the same over HTTP from the host:
 curl -s -H "Authorization: Bearer $(cat secrets/operator_token)" http://127.0.0.1:8081/v1/operator/status
 curl -s -X POST -H "Authorization: Bearer $(cat secrets/operator_token)" -H 'Content-Type: application/json' \
@@ -406,7 +563,8 @@ upgrade that changes any of them, readiness reports `release_incompatible`
 * If PostgreSQL goes away, readiness turns 503 `database_unavailable` and data
   requests return 503; the API recovers by itself when the database returns.
 * Resource limits (override in `.env`): db 2 GiB / 2 CPUs, api 512 MiB / 1 CPU,
-  publisher 4 GiB / 2 CPUs, importer 4 GiB. Measured use is in the PR
+  publisher 4 GiB / 2 CPUs, importer 4 GiB, fetcher (online updates only)
+  256 MiB / 0.5 CPU. Measured use is in the PR
   descriptions (Stage 1 for the Chitgar import, Stage 2 for publication).
 * Upgrading the API image or changing `KARTA_PUBLIC_BASE_URL` needs no cache
   purge and no re-import: existing releases keep their ids and tile URLs, the
@@ -497,8 +655,8 @@ make web                       # npm ci + copy MapLibre into web/dist (pinned, i
 KARTA_PUBLIC_BASE_URL=http://localhost:8080 KARTA_DB_HOST=… KARTA_DB_PASSWORD_FILE=… \
 KARTA_WEB_DIR=web/dist go run ./cmd/karta serve
 make lint test                 # gofmt, vet, staticcheck, govulncheck, gosec, fixture check; unit tests
-make test-integration          # isolated compose project on ports 18080/18081/55433 (Stage 1 and Stage 2 suites)
-make test-integration RUN=TestPublication   # only the publication suite
+make test-integration          # isolated compose project on ports 18080/18081/18082/55433 (Stage 1, 2 and 3 suites; local controlled HTTPS source)
+make test-integration RUN=TestPublication   # only the publication suite (RUN=TestOnline: only Stage 3)
 make fixtures                  # regenerate testdata/fixture/snapshots/*.osm.pbf from their XML sources
 make test-browser              # browser tests against the running stack (BASE_URL)
 make test-browser-prefix       # the same through a proxy serving Karta under /maps, API restarted with that base URL
@@ -518,3 +676,7 @@ make test-browser-prefix       # the same through a proxy serving Karta under /m
 | operator API `401` / `403` | wrong token file, or the credential lacks the scope; see `make op-status` with the operator token |
 | operator API `409 busy` | another switch holds the pointer lock; retry after a few seconds |
 | demo shows nothing, console CSP errors | open the demo at `KARTA_PUBLIC_BASE_URL` + `/demo/` (the page only talks to that origin) |
+| `online.enabled` false | `KARTA_ONLINE_SOURCE_FILE` not set for the publisher; online updates are opt-in |
+| `online.fetcher.error` "has not written its state" / growing `state_age_seconds` | the fetcher is not running: `make up-online`, `docker compose --profile online logs fetcher` |
+| online submissions stay `ready` with `online_activation_paused` | automatic activation is paused (by an operator or a rollback): `online-resume`, or activate the release |
+| fetcher `destination_refused` for a private mirror | add its network to the source file's `allowed_networks` |

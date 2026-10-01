@@ -561,6 +561,25 @@ func sampleFetcherMemory(id string, stop <-chan struct{}) <-chan int64 {
 	return out
 }
 
+// cgroupPeak returns a container's peak memory use as its cgroup records it
+// (cgroup v2 memory.peak or v1 memory.max_usage_in_bytes; it includes page
+// cache), or 0 if neither is readable from the test host.
+func cgroupPeak(id string) int64 {
+	for _, p := range []string{
+		"/sys/fs/cgroup/system.slice/docker-" + id + ".scope/memory.peak",
+		"/sys/fs/cgroup/docker/" + id + "/memory.peak",
+		"/sys/fs/cgroup/memory/docker/" + id + "/memory.max_usage_in_bytes",
+		"/sys/fs/cgroup/memory/system.slice/docker-" + id + ".scope/memory.max_usage_in_bytes",
+	} {
+		if b, err := os.ReadFile(p); err == nil {
+			if v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil {
+				return v
+			}
+		}
+	}
+	return 0
+}
+
 func parseMem(s string) int64 {
 	units := []struct {
 		suffix string
@@ -649,27 +668,31 @@ func TestOnline(t *testing.T) {
 	})
 
 	var relOnline1 string
-	dataB := readRepo(t, snapB)
+	var onlineData1 []byte
+	var onlineTS1 time.Time
 	t.Run("a newer signed snapshot is downloaded slowly, verified and activated while serving", func(t *testing.T) {
 		o.restartOnlinePublisher(t, map[string]string{"KARTA_TEST_OSM2PGSQL": "/usr/local/bin/slow-osm2pgsql", "KARTA_TEST_STALE_AFTER": "8760h"})
 		clearRequests(t)
 		pinned := startPinned(relA)
 		l := startLoad(4)
-		ts := *at("2026-02-01T00:00:00Z") // snapshot B's header timestamp
+		// B's data with a later timestamp: a digest that is not pinned in
+		// the region file, so only the signature authorizes it.
+		ts := *at("2026-02-10T00:00:00Z")
+		newer := variant(t, &ts, nil, nil)
 		// About 11 s of download at 200 bytes/s, then a 15 s import.
 		setRules(t, map[string]sourceRule{"/karta/snap-1.osm.pbf": {ThrottleBPS: 200}})
-		p := o.publishOnline(t, dataB, ts, nil)
+		p := o.publishOnline(t, newer, ts, nil)
 		stopMem := make(chan struct{})
 		mem := sampleFetcherMemory(fetcherContainer(t), stopMem)
 		start := time.Now()
 		st := waitFetcher(t, "download in progress", 60*time.Second, func(s *online.State) bool {
-			return s.Download != nil && s.Download.Bytes > 0 && s.Download.Bytes < int64(len(dataB))
+			return s.Download != nil && s.Download.Bytes > 0 && s.Download.Bytes < int64(len(newer))
 		})
 		v := onlineStatus(t)
 		if v.Online.Fetcher.State == nil || v.Online.Fetcher.State.Download == nil {
 			t.Errorf("operator status does not show the download: %+v", v.Online.Fetcher)
 		}
-		t.Logf("download progress %d of %d bytes", st.Download.Bytes, len(dataB))
+		t.Logf("download progress %d of %d bytes", st.Download.Bytes, len(newer))
 		waitFetcher(t, "delivery", 90*time.Second, deliveredSerial(p.serial))
 		downloadSecs := time.Since(start).Seconds()
 		close(stopMem)
@@ -678,19 +701,19 @@ func TestOnline(t *testing.T) {
 		if s.State != "published" {
 			t.Fatalf("online submission: %+v %s", s, strOr(s.Reason))
 		}
-		relOnline1 = s.release()
+		relOnline1, onlineData1, onlineTS1 = s.release(), newer, ts
 		waitManifest(t, relOnline1)
 		time.Sleep(2 * time.Second)
 		sum := l.finish(t, "slow online download, import and switch")
 		pinned.finish(t)
 		recordMeasurement(t, "online_slow_download_import_switch", map[string]any{"load": sum, "download_seconds": downloadSecs,
-			"snapshot_bytes": len(dataB), "fetcher_peak_memory_bytes_sampled": peak, "total_seconds": time.Since(start).Seconds()})
+			"snapshot_bytes": len(newer), "fetcher_peak_memory_bytes_sampled": peak, "total_seconds": time.Since(start).Seconds()})
 		if len(sum.Releases) != 2 {
 			t.Errorf("load saw releases %v, want A then the online release", sum.Releases)
 		}
 		v = onlineStatus(t)
 		if !v.Online.Enabled || !v.Online.AutoActivate || v.Online.Verified == nil || v.Online.Verified.Serial != p.serial ||
-			v.Online.Verified.SnapshotSHA256 != digestOf(dataB) || v.Online.Verified.KeyID != "test-2026a" {
+			v.Online.Verified.SnapshotSHA256 != digestOf(newer) || v.Online.Verified.KeyID != "test-2026a" {
 			t.Errorf("online status after publication: %+v", v.Online)
 		}
 		fs := v.Online.Fetcher.State
@@ -749,7 +772,7 @@ func TestOnline(t *testing.T) {
 		// downloaded or delivered again.
 		clearRequests(t)
 		since := time.Now()
-		p := o.publishOnline(t, dataB, *at("2026-02-01T00:00:00Z"), nil)
+		p := o.publishOnline(t, onlineData1, onlineTS1, nil)
 		waitFetcher(t, "check of the re-signed manifest", 30*time.Second, func(s *online.State) bool {
 			return s.HighestSerial == p.serial && succeededSince(since)(s)
 		})
@@ -767,7 +790,7 @@ func TestOnline(t *testing.T) {
 		// Going back to an earlier manifest is a replay: refused before any
 		// download.
 		replay := p.raw
-		p2 := o.publishOnline(t, variant(t, at("2026-02-02T00:00:00Z"), nil, nil), *at("2026-02-02T00:00:00Z"), nil)
+		p2 := o.publishOnline(t, variant(t, at("2026-02-20T00:00:00Z"), nil, nil), *at("2026-02-20T00:00:00Z"), nil)
 		if s := waitSubmission(t, p2.name, 90*time.Second); s.State != "published" {
 			t.Fatalf("serial %d: %+v", p2.serial, s)
 		}
@@ -822,7 +845,7 @@ func TestOnline(t *testing.T) {
 		forge("forged-wrongkey", newer, mk(cur.Serial+11, newer, *at("2026-06-01T00:00:00Z"), o.other, "test-2026a"), "")
 		// A correctly signed manifest with other bytes behind it: the
 		// marker's digest (written by the fetcher) authorizes nothing.
-		forge("forged-swapped", newer, mk(cur.Serial+12, dataB, *at("2026-02-01T00:00:00Z"), o.key, "test-2026a"), "")
+		forge("forged-swapped", newer, mk(cur.Serial+12, onlineData1, onlineTS1, o.key, "test-2026a"), "")
 		forge("forged-replay", newer, mk(cur.Serial-1, newer, *at("2026-06-01T00:00:00Z"), o.key, "test-2026a"), "")
 		forge("forged-conflict", newer, mk(cur.Serial, newer, *at("2026-06-01T00:00:00Z"), o.key, "test-2026a"), "")
 		for _, c := range cases {
@@ -1371,9 +1394,44 @@ func TestOnline(t *testing.T) {
 				t.Fatalf("%d: %+v", i, s)
 			}
 		}
-		time.Sleep(32 * time.Second) // pin grace 1 s plus the cleanup margin 30 s
+		// Wait until no release is kept for pinned clients any more (earlier
+		// releases were retired with the 20 s test grace, these with 1 s; the
+		// cleanup margin is 30 s), then clean up for real.
+		type decision struct {
+			ReleaseID, Action, Why string
+		}
+		var res struct {
+			Decisions []decision `json:"decisions"`
+			Removed   []string   `json:"removed"`
+			Skipped   []struct {
+				ReleaseID, Why string
+			} `json:"skipped"`
+		}
+		deadline := time.Now().Add(120 * time.Second)
+		for {
+			r := op(t, http.MethodPost, "/v1/operator/cleanup", admin, map[string]any{"reason": "dry run after online publications", "dry_run": true})
+			expectStatus(t, r, http.StatusOK)
+			r.json(t, &res)
+			pinned := 0
+			for _, d := range res.Decisions {
+				if strings.HasPrefix(d.Why, "pinned by clients") {
+					pinned++
+				}
+			}
+			if pinned == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("releases still pinned: %+v", res.Decisions)
+			}
+			time.Sleep(3 * time.Second)
+		}
 		r := op(t, http.MethodPost, "/v1/operator/cleanup", admin, map[string]any{"reason": "after online publications"})
 		expectStatus(t, r, http.StatusOK)
+		r.json(t, &res)
+		if len(res.Skipped) != 0 {
+			t.Errorf("skipped: %+v", res.Skipped)
+		}
 		st := status(t)
 		kept := 0
 		for _, rel := range st.Releases {
@@ -1382,7 +1440,7 @@ func TestOnline(t *testing.T) {
 			}
 		}
 		if kept != 2 { // the active release and KARTA_RETAIN_RELEASES=1 rollback target
-			t.Errorf("%d releases retained after cleanup, want 2", kept)
+			t.Errorf("%d releases retained after cleanup, want 2; decisions %+v", kept, res.Decisions)
 		}
 		files, _ := os.ReadDir(onlineDir)
 		complete := 0
@@ -1486,7 +1544,8 @@ func TestOnline(t *testing.T) {
 			t.Errorf("active changed to %s", got)
 		}
 		recordMeasurement(t, "online_large_download", map[string]any{"bytes": len(big), "seconds_until_delivered": secs,
-			"fetcher_peak_memory_bytes_sampled": peak})
+			"fetcher_peak_memory_bytes_sampled": peak, "fetcher_cgroup_peak_bytes_including_page_cache": cgroupPeak(fetcherContainer(t)),
+			"fetcher_memory_limit_bytes": 256 << 20})
 		if peak > 64<<20 {
 			t.Errorf("fetcher memory peaked at %d bytes for a %d-byte download", peak, len(big))
 		}

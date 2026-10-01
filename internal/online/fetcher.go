@@ -244,13 +244,20 @@ func (f *Fetcher) save() error {
 }
 
 // Run checks the source until ctx ends: at once if the persisted next
-// attempt has passed, otherwise at that time, then on the schedule.
+// attempt has passed, otherwise at that time (but never later than one poll
+// interval after a start, so a shortened interval applies after a restart),
+// then on the schedule.
 func (f *Fetcher) Run(ctx context.Context) {
+	first := true
 	for {
 		wait := time.Duration(0)
 		if n := f.state.NextAttemptAt; n != nil {
 			wait = n.Sub(f.now())
 		}
+		if first && wait > f.pollInterval() {
+			wait = f.pollInterval()
+		}
+		first = false
 		if wait > 0 {
 			t := time.NewTimer(wait)
 			select {
@@ -378,6 +385,9 @@ func (f *Fetcher) CheckOnce(ctx context.Context) error {
 		return err
 	}
 	raw, err := req.FetchSmall(ctx, src.manifestURL, MaxEnvelopeBytes, smallFileTimeout)
+	if CodeOf(err) == CodeTooLarge {
+		return errorf(CodeManifestTooLarge, "the manifest is larger than %d bytes", MaxEnvelopeBytes)
+	}
 	if err != nil {
 		return err
 	}
