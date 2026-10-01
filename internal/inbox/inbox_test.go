@@ -297,3 +297,54 @@ func TestStageFile(t *testing.T) {
 		t.Fatalf("name: %v", err)
 	}
 }
+
+func TestSignedManifestsOnlyInOnlineScans(t *testing.T) {
+	dir := t.TempDir()
+	snap := []byte("snapshot bytes")
+	put(t, dir, "d.osm.pbf", snap)
+	put(t, dir, "d.osm.pbf.manifest.json", []byte(`{"signed":true}`))
+	put(t, dir, "d.osm.pbf.ready", []byte(digest(snap)))
+	// The manual inbox ignores manifest files: the entry and its fingerprint
+	// are exactly what Stage 2 recorded (Manifest nil).
+	manual := scanOne(t, dir, "d")
+	if manual.Manifest != nil {
+		t.Fatal("the manual inbox listed a manifest")
+	}
+	h := sha256.New()
+	h.Write([]byte("karta-inbox/1\x00d\x00" + manual.Snapshot.key() + "\x00-\x00" + manual.Marker.key()))
+	if manual.Fingerprint() != hex.EncodeToString(h.Sum(nil)) {
+		t.Fatal("the inbox fingerprint format changed")
+	}
+	entries, err := ScanWith(dir, 100, ScanOptions{Manifests: true})
+	if err != nil || len(entries) != 1 || entries[0].Manifest == nil {
+		t.Fatalf("online scan: %v %+v", err, entries)
+	}
+	if entries[0].Fingerprint() == manual.Fingerprint() {
+		t.Error("the manifest is not part of an online delivery's fingerprint")
+	}
+	st, err := Stage(dir, entries[0], t.TempDir(), "job", Options{MaxSnapshotBytes: 1 << 20, RequireManifest: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(st.ManifestPath); string(b) != `{"signed":true}` {
+		t.Errorf("staged manifest %q", b)
+	}
+	// Without a manifest, an online delivery is refused before anything is read.
+	put(t, dir, "e.osm.pbf", snap)
+	put(t, dir, "e.osm.pbf.ready", []byte(digest(snap)))
+	entries, _ = ScanWith(dir, 100, ScanOptions{Manifests: true})
+	for _, e := range entries {
+		if e.Name != "e" {
+			continue
+		}
+		if _, err := Stage(dir, e, t.TempDir(), "job2", Options{MaxSnapshotBytes: 1 << 20, RequireManifest: true}); CodeOf(err) != CodeManifestMissing {
+			t.Errorf("no manifest: %v", err)
+		}
+	}
+	// An oversized manifest is refused from its listed size.
+	put(t, dir, "d.osm.pbf.manifest.json", []byte(strings.Repeat(" ", MaxManifestBytes+1)))
+	entries, _ = ScanWith(dir, 100, ScanOptions{Manifests: true})
+	if _, err := Stage(dir, entries[0], t.TempDir(), "job3", Options{MaxSnapshotBytes: 1 << 20, RequireManifest: true}); CodeOf(err) != CodeTooLarge {
+		t.Errorf("oversized manifest: %v", err)
+	}
+}

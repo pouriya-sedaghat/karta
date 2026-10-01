@@ -189,16 +189,18 @@ type Manager struct {
 	// servable; it must exceed the request timeout.
 	drain time.Duration
 
-	mu       sync.RWMutex
-	active   *Release
-	served   map[string]*Release
-	known    map[string]Lookup
-	status   Status
-	registry *pgxpool.Pool
+	mu        sync.RWMutex
+	active    *Release
+	served    map[string]*Release
+	known     map[string]Lookup
+	status    Status
+	freshness registry.Freshness
+	registry  *pgxpool.Pool
 
 	// Replaceable in tests.
 	now     func() time.Time
 	serving func(ctx context.Context) (*registry.ServedRelease, []registry.ServedRelease, error)
+	fresh   func(ctx context.Context) (registry.Freshness, error)
 	load    func(ctx context.Context, ref registry.ServedRelease) (*Release, string, error)
 	ping    func(ctx context.Context, rel *Release) error
 	close   func(rel *Release)
@@ -211,11 +213,18 @@ func NewManager(db dbconn.Params, registryDB string, fontstacks []string, drain 
 	m := &Manager{
 		db: db, registryDB: registryDB, fontstacks: fontstacks, log: log, drain: drain,
 		served: map[string]*Release{}, known: map[string]Lookup{},
-		status: Status{Reason: ReasonStarting, Detail: "release not loaded yet", CheckedAt: time.Now()},
-		now:    time.Now,
-		after:  func(d time.Duration, f func()) { time.AfterFunc(d, f) },
+		status:    Status{Reason: ReasonStarting, Detail: "release not loaded yet", CheckedAt: time.Now()},
+		freshness: registry.Freshness{UpdateMode: "manual"},
+		now:       time.Now,
+		after:     func(d time.Duration, f func()) { time.AfterFunc(d, f) },
 	}
 	m.serving = m.readRegistry
+	m.fresh = func(ctx context.Context) (registry.Freshness, error) {
+		if m.registry == nil { // the registry was never reached (or a test replaced serving)
+			return registry.Freshness{UpdateMode: "manual"}, nil
+		}
+		return registry.ReadFreshness(ctx, m.registry)
+	}
 	m.load = m.loadRelease
 	m.ping = func(ctx context.Context, rel *Release) error { return rel.Pool.Ping(ctx) }
 	m.close = func(rel *Release) {
@@ -244,6 +253,14 @@ func (m *Manager) Lookup(id string) (*Release, Lookup) {
 		return rel, Served
 	}
 	return nil, m.known[id]
+}
+
+// Freshness returns the update mode and staleness threshold last read from
+// the registry (manual and none until read).
+func (m *Manager) Freshness() registry.Freshness {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.freshness
 }
 
 // Status returns the last readiness state.
@@ -384,9 +401,16 @@ func (m *Manager) Refresh(ctx context.Context) {
 	if activeRef != nil && newActive == nil && status.Reason == ReasonNoRelease {
 		status = Status{Reason: ReasonRegistryBroken, ReleaseID: activeRef.ID, Detail: "active release is not listed in the registry"}
 	}
+	fresh, ferr := m.fresh(ctx)
 	m.mu.Lock()
 	m.active, m.served, m.known = newActive, served, known
+	if ferr == nil {
+		m.freshness = fresh
+	}
 	m.mu.Unlock()
+	if ferr != nil {
+		m.log.Warn("could not read the update mode from the registry; keeping the last one", "err", ferr)
+	}
 	m.retire(current, served)
 	m.setStatus(status)
 }

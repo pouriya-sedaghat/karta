@@ -52,6 +52,7 @@ import (
 	"github.com/pouriya-sedaghat/karta/internal/failpoint"
 	"github.com/pouriya-sedaghat/karta/internal/importer"
 	"github.com/pouriya-sedaghat/karta/internal/inbox"
+	"github.com/pouriya-sedaghat/karta/internal/online"
 	"github.com/pouriya-sedaghat/karta/internal/region"
 	"github.com/pouriya-sedaghat/karta/internal/registry"
 	"github.com/pouriya-sedaghat/karta/internal/release"
@@ -93,12 +94,20 @@ type Config struct {
 	Build               importer.BuildOptions
 	RegistryDB          string
 	Fontstacks          []string
+	// OnlineSourcePath enables online deliveries: the source file whose
+	// trusted keys verify them ("" = online updates off).
+	OnlineSourcePath string
+	// OnlineDir is the fetcher's outbox (read-only).
+	OnlineDir string
+	// StaleAfter is the data age after which the active release is stale
+	// (0 = no threshold configured).
+	StaleAfter time.Duration
 }
 
 // Principal is who asks for an action.
 type Principal struct {
 	Name string
-	// Source is operator_api, inbox, cli or system.
+	// Source is operator_api, inbox, cli, online or system.
 	Source    string
 	RequestID string
 }
@@ -109,11 +118,13 @@ type Service struct {
 	log *slog.Logger
 	reg *pgxpool.Pool
 
-	settler *inbox.Settler
-	mu      sync.Mutex
-	job     *JobStatus
-	scan    ScanStatus
-	now     func() time.Time
+	settler       *inbox.Settler
+	onlineSettler *inbox.Settler
+	mu            sync.Mutex
+	job           *JobStatus
+	scan          ScanStatus
+	onlineScan    ScanStatus
+	now           func() time.Time
 	// readCounts reads a release database's stored counts (a test seam).
 	readCounts reportCountsReader
 }
@@ -159,9 +170,26 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 		pool.Close()
 		return nil, fmt.Errorf("migrate registry: %w", err)
 	}
-	s := &Service{cfg: cfg, log: log, reg: pool, settler: inbox.NewSettler(), now: time.Now}
+	s := &Service{cfg: cfg, log: log, reg: pool, settler: inbox.NewSettler(), onlineSettler: inbox.NewSettler(), now: time.Now}
 	s.readCounts = s.readReportCounts
 	return s, nil
+}
+
+// Announce records the update mode and staleness threshold the public
+// manifest reports, and creates the online policy row (publisher only).
+func (s *Service) Announce(ctx context.Context) error {
+	f := registry.Freshness{UpdateMode: s.updateMode()}
+	if s.cfg.StaleAfter > 0 {
+		d := s.cfg.StaleAfter
+		f.StaleAfter = &d
+	}
+	if err := registry.SetFreshness(ctx, s.reg, f); err != nil {
+		return err
+	}
+	if s.onlineEnabled() {
+		return registry.EnsureOnlinePolicy(ctx, s.reg, s.regionID())
+	}
+	return nil
 }
 
 // Close releases the registry pool.
@@ -212,6 +240,23 @@ type request struct {
 	reason            string
 }
 
+// feed is a watched directory of submissions: the manual inbox or the
+// online fetcher's outbox.
+type feed struct {
+	source  string
+	dir     string
+	settler *inbox.Settler
+	online  bool
+}
+
+func (s *Service) inboxFeed() feed {
+	return feed{source: SourceInbox, dir: s.cfg.InboxDir, settler: s.settler}
+}
+
+func (s *Service) onlineFeed() feed {
+	return feed{source: SourceOnline, dir: s.cfg.OnlineDir, settler: s.onlineSettler, online: true}
+}
+
 // authorizer looks up operator authorizations for digests not pinned in
 // the region configuration.
 func (s *Service) authorizer(ctx context.Context, regionID, digest string, size int64) (string, error) {
@@ -235,9 +280,21 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		return fail(registry.SubRejected, importer.CodeRegionConfig, fmt.Errorf("%w: region: %v", importer.ErrInput, err))
 	}
 	s.phase("verifying", "")
+	authorize := importer.Authorizer(s.authorizer)
+	var signed *online.Verified
+	if req.source == SourceOnline {
+		sv, auth, err := s.verifyDelivery(ctx, req, cfg)
+		if err != nil {
+			if code := importer.InputCode(err); code != "" {
+				return fail(registry.SubRejected, code, err)
+			}
+			return fail(registry.SubInterrupted, CodeInterrupted, err)
+		}
+		signed, authorize = sv, auth
+	}
 	v, err := importer.Verify(ctx, importer.VerifyOptions{
 		SnapshotPath: req.staged.SnapshotPath, ProvenancePath: req.staged.SidecarPath, Region: cfg,
-		MaxInputBytes: s.cfg.MaxInputBytes, MaxFutureSkew: s.cfg.MaxFutureSkew, Now: s.now, Authorize: s.authorizer,
+		MaxInputBytes: s.cfg.MaxInputBytes, MaxFutureSkew: s.cfg.MaxFutureSkew, Now: s.now, Authorize: authorize,
 	})
 	if err != nil {
 		if code := importer.InputCode(err); code != "" {
@@ -246,6 +303,12 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		return fail(registry.SubFailed, CodeBuildFailed, err)
 	}
 	ts := v.Source.DataTimestamp
+	if signed != nil && !ts.Equal(signed.Manifest.Snapshot.DataTimestamp) {
+		// The signer's claim and the data disagree: refuse rather than pick one.
+		return fail(registry.SubRejected, online.CodeManifestConflict, onlineReject(online.CodeManifestConflict,
+			"the manifest signs data timestamp %s, the snapshot's trusted timestamp (%s) is %s",
+			signed.Manifest.Snapshot.DataTimestamp.UTC().Format(time.RFC3339), v.Source.DataTimestampSource, ts.UTC().Format(time.RFC3339)))
+	}
 	s.updateSubmission(ctx, req.subID, registry.SubmissionUpdate{State: registry.SubProcessing, SHA256: v.Info.SHA256, SizeBytes: v.Info.Size, DataTimestamp: &ts})
 	cand := Candidate{RegionID: cfg.ID, SHA256: v.Info.SHA256, DataTimestamp: ts}
 
@@ -345,7 +408,12 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		return out
 	}
 	s.phase("activating", built.ReleaseID)
+	var gate func(context.Context, registry.Querier) error
+	if signed != nil {
+		gate = s.onlineGate(signed)
+	}
 	res, err := registry.Activate(ctx, s.reg, registry.ActivateRequest{
+		Gate:   gate,
 		Target: built.ReleaseID, Expected: expected, CheckExpected: true, Action: "publish",
 		Actor: req.principal.Name, Source: req.principal.Source, Reason: req.reason, RequestID: req.principal.RequestID,
 		PinGrace: s.cfg.PinGrace,
@@ -364,6 +432,16 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		case errors.Is(err, registry.ErrActiveChanged):
 			out.State, out.Code, out.Reason = registry.SubReady, CodeActiveChanged,
 				"validated, but the active release changed during the build ("+err.Error()+"); kept ready for an operator to activate"
+			return out
+		case importer.InputCode(err) != "":
+			// The signed manifest no longer authorizes the snapshot (it
+			// expired or its key was removed during the build): refused.
+			// The validated release stays ready, for an operator to review
+			// (and activate), or for a fresh signed manifest to publish.
+			out.State, out.Code, out.Err = registry.SubRejected, importer.InputCode(err), err
+			out.Reason = fmt.Sprintf("%v; release %s was built and validated but not activated; it stays ready: an operator may review "+
+				"and activate it, retry it with the operator API once the manifest verifies again, or the source can publish a fresh "+
+				"signed manifest for the same snapshot", err, built.ReleaseID)
 			return out
 		case PolicyCode(err) != "":
 			out.State, out.Code, out.Reason = registry.SubReady, PolicyCode(err), err.Error()
@@ -624,7 +702,8 @@ func (s *Service) regionID() string {
 	return cfg.ID
 }
 
-// RunInbox scans the inbox until ctx ends.
+// RunInbox scans the inbox, and the online fetcher's outbox when online
+// updates are enabled, until ctx ends.
 func (s *Service) RunInbox(ctx context.Context) {
 	t := time.NewTicker(s.cfg.InboxPoll)
 	defer t.Stop()
@@ -638,40 +717,57 @@ func (s *Service) RunInbox(ctx context.Context) {
 	}
 }
 
-// ScanOnce lists the inbox and processes every complete, settled
-// submission that has no final outcome yet, in name order.
+// ScanOnce processes every complete, settled submission that has no final
+// outcome yet: first the manual inbox, then online deliveries, each in name
+// order (online deliveries are named by serial). Builds are one at a time,
+// so when a manual and an online snapshot are both waiting, the manual one
+// is built and switched to first; the forward rule then decides the second
+// (a newer data timestamp replaces it; the same digest is a duplicate; a
+// different snapshot with the same timestamp is refused as not newer).
 func (s *Service) ScanOnce(ctx context.Context) {
+	s.scanFeed(ctx, s.inboxFeed())
+	if s.onlineEnabled() && ctx.Err() == nil {
+		s.scanFeed(ctx, s.onlineFeed())
+	}
+}
+
+func (s *Service) scanFeed(ctx context.Context, f feed) {
 	now := s.now()
-	entries, err := inbox.Scan(s.cfg.InboxDir, s.cfg.InboxMaxEntries)
+	entries, err := inbox.ScanWith(f.dir, s.cfg.InboxMaxEntries, inbox.ScanOptions{Manifests: f.online})
 	st := ScanStatus{At: &now, Pending: []PendingEntry{}}
+	setStatus := func() {
+		s.mu.Lock()
+		if f.online {
+			s.onlineScan = st
+		} else {
+			s.scan = st
+		}
+		s.mu.Unlock()
+	}
 	if err != nil {
 		st.Error = err.Error()
-		s.log.Error("inbox scan failed", "err", err)
-		s.mu.Lock()
-		s.scan = st
-		s.mu.Unlock()
+		s.log.Error("scan failed", "source", f.source, "err", err)
+		setStatus()
 		return
 	}
-	s.settler.Forget(entries)
+	f.settler.Forget(entries)
 	var ready []inbox.Entry
 	for _, e := range entries {
 		switch {
 		case !e.Complete():
 			st.Pending = append(st.Pending, PendingEntry{Name: e.Name, Waiting: e.Waiting(), Problem: e.Problem})
-		case !s.settler.Stable(e, now, s.cfg.InboxSettle):
+		case !f.settler.Stable(e, now, s.cfg.InboxSettle):
 			st.Pending = append(st.Pending, PendingEntry{Name: e.Name, Waiting: "settling", Problem: e.Problem})
 		default:
 			ready = append(ready, e)
 		}
 	}
-	s.mu.Lock()
-	s.scan = st
-	s.mu.Unlock()
+	setStatus()
 	for _, e := range ready {
 		if ctx.Err() != nil {
 			return
 		}
-		s.processEntry(ctx, e)
+		s.processEntry(ctx, f, e)
 	}
 }
 
@@ -680,13 +776,18 @@ func (s *Service) retryable(ctx context.Context) func(*registry.Submission) bool
 	return func(prior *registry.Submission) bool {
 		switch prior.State {
 		case registry.SubInterrupted:
-			return prior.Attempts < s.cfg.MaxAttempts
+			return prior.Attempts < s.cfg.MaxAttempts || s.retryRequested(ctx, prior)
 		case registry.SubProcessing:
 			// The inbox is processed by this goroutine only, one submission
 			// at a time: a processing record seen by a scan was left behind
 			// when its outcome could not be written (registry outage).
 			return prior.Attempts < s.cfg.MaxAttempts
+		case registry.SubFailed:
+			return s.retryRequested(ctx, prior)
 		case registry.SubRejected:
+			if s.retryRequested(ctx, prior) {
+				return true
+			}
 			// An unauthorized digest is re-evaluated once an operator has
 			// authorized exactly that digest (and size).
 			if prior.ReasonCode == nil || *prior.ReasonCode != importer.CodeUnauthorizedDigest || prior.SHA256 == nil || prior.SizeBytes == nil {
@@ -699,17 +800,17 @@ func (s *Service) retryable(ctx context.Context) func(*registry.Submission) bool
 	}
 }
 
-func (s *Service) processEntry(ctx context.Context, e inbox.Entry) {
-	principal := Principal{Name: "inbox", Source: "inbox"}
+func (s *Service) processEntry(ctx context.Context, f feed, e inbox.Entry) {
+	principal := Principal{Name: f.source, Source: f.source}
 	fp := e.Fingerprint()
 	prior, err := registry.SubmissionByFingerprint(ctx, s.reg, fp)
 	if err != nil {
-		s.log.Error("registry unavailable; inbox processing deferred", "err", err)
+		s.log.Error("registry unavailable; processing deferred", "source", f.source, "err", err)
 		return
 	}
-	if prior != nil && prior.State == registry.SubInterrupted && prior.Attempts >= s.cfg.MaxAttempts {
+	if prior != nil && prior.State == registry.SubInterrupted && prior.Attempts >= s.cfg.MaxAttempts && !s.retryRequested(ctx, prior) {
 		s.updateSubmission(ctx, prior.ID, registry.SubmissionUpdate{State: registry.SubFailed, ReasonCode: CodeTooManyAttempts,
-			Reason: fmt.Sprintf("interrupted %d times; touch the ready marker to submit again", prior.Attempts)})
+			Reason: fmt.Sprintf("interrupted %d times; %s", prior.Attempts, resubmitHint(f))})
 		_ = registry.Audit(ctx, s.reg, registry.AuditEntry{Actor: principal.Name, Source: principal.Source, Action: "submission",
 			Target: e.Name, Outcome: registry.OutcomeFailed, Reason: "too many interrupted attempts", Detail: map[string]any{"submission_id": prior.ID}})
 		return
@@ -717,21 +818,21 @@ func (s *Service) processEntry(ctx context.Context, e inbox.Entry) {
 	if prior != nil && !s.retryable(ctx)(prior) {
 		return // final outcome already recorded for these exact files
 	}
-	sub, claimed, err := registry.ClaimSubmission(ctx, s.reg, registry.Submission{Source: "inbox", Name: e.Name, Fingerprint: fp,
+	sub, claimed, err := registry.ClaimSubmission(ctx, s.reg, registry.Submission{Source: f.source, Name: e.Name, Fingerprint: fp,
 		RegionID: s.regionID()}, s.retryable(ctx))
 	if err != nil || !claimed {
 		if err != nil {
-			s.log.Error("could not claim submission", "name", e.Name, "err", err)
+			s.log.Error("could not claim submission", "source", f.source, "name", e.Name, "err", err)
 		}
 		return
 	}
-	req := request{source: "inbox", name: e.Name, principal: principal, subID: sub.ID, activate: s.cfg.AutoActivate,
-		reason: "inbox submission " + e.Name}
-	s.log.Info("processing inbox submission", "name", e.Name, "submission_id", sub.ID, "attempt", sub.Attempts)
-	s.setJob(&JobStatus{SubmissionID: sub.ID, Name: e.Name, Source: "inbox", Phase: "staging", StartedAt: s.now(), PhaseAt: s.now()})
+	req := request{source: f.source, name: e.Name, principal: principal, subID: sub.ID, activate: s.cfg.AutoActivate,
+		reason: f.source + " submission " + e.Name}
+	s.log.Info("processing submission", "source", f.source, "name", e.Name, "submission_id", sub.ID, "attempt", sub.Attempts)
+	s.setJob(&JobStatus{SubmissionID: sub.ID, Name: e.Name, Source: f.source, Phase: "staging", StartedAt: s.now(), PhaseAt: s.now()})
 	defer s.setJob(nil)
-	staged, err := inbox.Stage(s.cfg.InboxDir, e, s.cfg.StagingDir, "sub-"+strconv.FormatInt(sub.ID, 10)+"-"+strconv.Itoa(sub.Attempts),
-		inbox.Options{MaxSnapshotBytes: s.cfg.MaxInputBytes, ReserveBytes: s.cfg.StagingReserveBytes})
+	staged, err := inbox.Stage(f.dir, e, s.cfg.StagingDir, f.source+"-"+strconv.FormatInt(sub.ID, 10)+"-"+strconv.Itoa(sub.Attempts),
+		inbox.Options{MaxSnapshotBytes: s.cfg.MaxInputBytes, ReserveBytes: s.cfg.StagingReserveBytes, RequireManifest: f.online})
 	var out Outcome
 	marker := ""
 	if err != nil {
@@ -747,6 +848,13 @@ func (s *Service) processEntry(ctx context.Context, e inbox.Entry) {
 	if out.State == registry.SubPublished {
 		s.cleanupAfterPublish(ctx)
 	}
+}
+
+func resubmitHint(f feed) string {
+	if f.online {
+		return "retry it with the operator API (online retry) or wait for the next delivery"
+	}
+	return "touch the ready marker to submit again"
 }
 
 func (s *Service) cleanupAfterPublish(ctx context.Context) {
@@ -821,7 +929,7 @@ func (s *Service) Activate(ctx context.Context, p Principal, a ActionRequest) (r
 			return err
 		}
 		return s.countGate(ctx, cfg, cfgErr, active, target)
-	})
+	}, nil)
 }
 
 // Rollback makes a retained, validated, compatible release active again.
@@ -841,16 +949,29 @@ ORDER BY deactivated_at DESC NULLS LAST, release_id LIMIT 1`).Scan(&id)
 		}
 		a.ReleaseID = id
 	}
+	// An explicit rollback is not undone by automation: with online updates
+	// enabled, it pauses automatic activation of online snapshots in the
+	// same transaction, until an operator resumes it.
+	var inTx func(context.Context, registry.Querier) error
+	if s.onlineEnabled() {
+		regionID := s.regionID()
+		inTx = func(ctx context.Context, q registry.Querier) error {
+			_, err := registry.SetOnlineAutoActivate(ctx, q, regionID, false, p.Name, p.Source,
+				"paused automatically by a rollback: "+a.Reason, p.RequestID, map[string]any{"cause": "rollback", "rollback_to": a.ReleaseID})
+			return err
+		}
+	}
 	return s.switchTo(ctx, p, "rollback", a, func(active, target *registry.Release) error {
 		if active != nil && active.RegionID != target.RegionID && !a.AllowRegionChange {
 			return policyErr(CodeRegionChanged, "release %s serves region %q, the active release %q; a region change must be explicit",
 				target.ID, target.RegionID, active.RegionID)
 		}
 		return nil
-	})
+	}, inTx)
 }
 
-func (s *Service) switchTo(ctx context.Context, p Principal, action string, a ActionRequest, allow func(active, target *registry.Release) error) (registry.ActivateResult, error) {
+func (s *Service) switchTo(ctx context.Context, p Principal, action string, a ActionRequest, allow func(active, target *registry.Release) error,
+	inTx func(context.Context, registry.Querier) error) (registry.ActivateResult, error) {
 	target, err := registry.Get(ctx, s.reg, a.ReleaseID)
 	if err != nil {
 		return registry.ActivateResult{}, err
@@ -880,7 +1001,7 @@ func (s *Service) switchTo(ctx context.Context, p Principal, action string, a Ac
 	}
 	res, err := registry.Activate(ctx, s.reg, registry.ActivateRequest{
 		Target: target.ID, Expected: expected, CheckExpected: true, Action: action,
-		Actor: p.Name, Source: p.Source, Reason: a.Reason, RequestID: p.RequestID, PinGrace: s.cfg.PinGrace, Allow: allow,
+		Actor: p.Name, Source: p.Source, Reason: a.Reason, RequestID: p.RequestID, PinGrace: s.cfg.PinGrace, Allow: allow, InTx: inTx,
 		BeforeCommit: func() { failpoint.Hit("activate.before_commit") },
 	}, s.cfg.PointerLockTimeout)
 	if err != nil {
@@ -1214,6 +1335,8 @@ type Status struct {
 	Inbox          InboxStatus              `json:"inbox"`
 	Job            *JobStatus               `json:"job"`
 	Storage        Capacity                 `json:"storage"`
+	Online         OnlineStatus             `json:"online"`
+	Freshness      FreshnessStatus          `json:"freshness"`
 	Failpoints     []string                 `json:"failpoints,omitempty"`
 }
 
@@ -1285,6 +1408,10 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	if st.Storage, err = s.capacity(ctx, 0, st.Region.ID); err != nil {
 		return st, err
 	}
+	if st.Online, err = s.onlineStatus(ctx, st.Region.ID); err != nil {
+		return st, err
+	}
+	st.Freshness = s.freshness(st.Active)
 	s.mu.Lock()
 	st.Inbox = InboxStatus{Enabled: s.cfg.InboxDir != "", LastScan: s.scan}
 	if s.job != nil {

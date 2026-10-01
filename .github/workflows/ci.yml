@@ -34,9 +34,10 @@ jobs:
   stack:
     name: stack, publication, browser and disconnected tests (fixtures)
     runs-on: ubuntu-24.04
-    # The publication suite waits on purpose (slow imports, pin grace
-    # periods, cleanup margins): about 7 minutes of the budget.
-    timeout-minutes: 50
+    # The publication and online suites wait on purpose (slow imports and
+    # downloads, pin grace periods, cleanup margins, backoff): about 20
+    # minutes of the budget.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,7 +47,7 @@ jobs:
           go-version-file: go.mod
       - name: build images
         run: make build
-      - name: integration tests (Stage 1 stack and Stage 2 publication, committed fixtures only)
+      - name: integration tests (Stage 1 stack, Stage 2 publication, Stage 3 online updates; committed fixtures and a local controlled HTTPS source only)
         run: make test-integration
       - name: browser test against the fixture
         run: |

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -54,5 +55,60 @@ func TestImportDefaults(t *testing.T) {
 	}
 	if _, err := LoadImport(env(map[string]string{"KARTA_TEMPLATE_DB": "x; DROP DATABASE y"})); err == nil {
 		t.Error("unsafe template name accepted")
+	}
+}
+
+func TestOnlineConfig(t *testing.T) {
+	dir := t.TempDir()
+	region := dir + "/region.json"
+	source := dir + "/source.json"
+	for _, f := range []string{region, source} {
+		if err := os.WriteFile(f, []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := map[string]string{"KARTA_REGION_FILE": region, "KARTA_INBOX_DIR": dir}
+	c, err := LoadPublisher(env(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.OnlineSourceFile != "" || c.StaleAfter != 0 {
+		t.Errorf("online updates or a staleness threshold on by default: %+v", c)
+	}
+	on := map[string]string{"KARTA_ONLINE_SOURCE_FILE": source, "KARTA_ONLINE_DIR": dir, "KARTA_DATA_STALE_AFTER": "48h"}
+	for k, v := range base {
+		on[k] = v
+	}
+	if c, err = LoadPublisher(env(on)); err != nil || c.OnlineSourceFile != source || c.OnlineDir != dir || c.StaleAfter != 48*time.Hour {
+		t.Fatalf("online publisher: %v %+v", err, c)
+	}
+	for name, change := range map[string]map[string]string{
+		"source file missing":   {"KARTA_ONLINE_SOURCE_FILE": dir + "/nope.json"},
+		"no outbox":             {"KARTA_ONLINE_DIR": ""},
+		"outbox not a dir":      {"KARTA_ONLINE_DIR": source},
+		"bad stale threshold":   {"KARTA_DATA_STALE_AFTER": "soon"},
+		"stale threshold > 1 y": {"KARTA_DATA_STALE_AFTER": "9000h"},
+	} {
+		m := map[string]string{}
+		for k, v := range on {
+			m[k] = v
+		}
+		for k, v := range change {
+			m[k] = v
+		}
+		if _, err := LoadPublisher(env(m)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+
+	f, err := LoadFetcher(env(map[string]string{"KARTA_ONLINE_SOURCE_FILE": source, "KARTA_REGION_FILE": region, "KARTA_ONLINE_DIR": dir}))
+	if err != nil || f.ReserveBytes != 64<<20 || f.MaxInputBytes != 4096<<20 || f.MaxFutureSkew != 10*time.Minute {
+		t.Fatalf("fetcher defaults: %v %+v", err, f)
+	}
+	_, err = LoadFetcher(env(map[string]string{}))
+	for _, want := range []string{"KARTA_ONLINE_SOURCE_FILE", "KARTA_REGION_FILE", "KARTA_ONLINE_DIR"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("fetcher without %s: %v", want, err)
+		}
 	}
 }

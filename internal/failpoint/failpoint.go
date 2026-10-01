@@ -28,6 +28,15 @@ var Known = []string{
 	"activate.after_commit",
 	"cleanup.after_mark",
 	"cleanup.after_drop",
+	// Stage 3: the publisher, after an online delivery's signed manifest
+	// was verified and its serial recorded.
+	"online.after_verify",
+	// Stage 3: the fetcher.
+	"fetch.after_manifest",
+	"fetch.mid_download",
+	"fetch.after_download",
+	"fetch.before_marker",
+	"fetch.after_marker",
 }
 
 var enabled = parse(os.Getenv("KARTA_FAILPOINTS"))

@@ -3,8 +3,8 @@ info:
   title: Karta operator API
   version: 1.0.0
   description: |
-    Publication status, snapshot digest authorization, activation, rollback
-    and cleanup. Served by the publisher (`karta publisher`) on its own
+    Publication status, snapshot digest authorization, activation, rollback,
+    cleanup, online update policy and metrics. Served by the publisher (`karta publisher`) on its own
     listener (`KARTA_OPERATOR_LISTEN_ADDR`, published on 127.0.0.1:8081 by
     default); the public API process has no operator routes and no write
     access to the registry. See docs/security.md for the threat model and
@@ -35,6 +35,21 @@ info:
     most a few seconds for the pointer lock (`409 busy`). Imports do not hold
     the pointer lock, so a rollback is never blocked by a running import; an
     import that finishes after a rollback stays `ready` instead of activating.
+
+    **Online updates (Stage 3, opt-in).** With `KARTA_ONLINE_SOURCE_FILE`
+    set, the publisher also processes the online fetcher's deliveries: each
+    must carry a manifest signed by a key pinned in the source file (see
+    docs/adr/0004-stage3-online-updates.md). `status.online` reports the
+    source, the activation policy, the newest manifest the publisher
+    verified and the fetcher's own report (checks, errors, next attempt,
+    download progress); `status.freshness` the active data's age against
+    `KARTA_DATA_STALE_AFTER`. A rollback pauses automatic activation of
+    online snapshots (`online/resume` lifts it); paused deliveries are built
+    and kept `ready` with reason code `online_activation_paused`. The
+    signed manifest is verified again at the switch: if it expired or its
+    key was removed during the build, the submission is `rejected` with the
+    verification code (reason "at activation ...") and its validated
+    release stays `ready`.
   license:
     name: Apache-2.0 (API description)
 servers:
@@ -61,7 +76,7 @@ paths:
     get:
       summary: Publication status
       operationId: operatorStatus
-      description: Scope `status`. Region and policy, active and recent releases, recent submissions, open digest authorizations, the inbox, the job in progress and storage use.
+      description: Scope `status`. Region and policy, active and recent releases, recent submissions, open digest authorizations, the inbox, online updates, data freshness, the job in progress and storage use.
       responses:
         "200":
           description: Status.
@@ -285,6 +300,123 @@ paths:
         "413": { $ref: "#/components/responses/Error" }
         "415": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/metrics:
+    get:
+      summary: Publication, freshness and online-source metrics (Prometheus text format)
+      operationId: operatorMetrics
+      description: |
+        Scope `status` (scrape with the monitoring token as a bearer token).
+        Gauges computed at scrape time from the registry and the fetcher's
+        state, for example `karta_active_data_age_seconds`, `karta_data_stale`
+        (only with a staleness threshold), `karta_online_last_success_timestamp_seconds`,
+        `karta_online_next_attempt_timestamp_seconds`,
+        `karta_online_consecutive_failures`, `karta_online_fetcher_state_age_seconds`,
+        `karta_online_verified_serial`, `karta_submissions{source,state}`.
+      responses:
+        "200":
+          description: Metrics.
+          content:
+            text/plain:
+              schema: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/online/pause:
+    post:
+      summary: Pause automatic activation of online snapshots
+      operationId: operatorOnlinePause
+      description: |
+        Scope `publish`. Online deliveries are still downloaded, verified,
+        built and validated, but kept `ready` (reason code
+        `online_activation_paused`) for an explicit activation. The pause is
+        recorded in the registry (it survives restarts) and audited
+        (`online_pause`; a request that changes nothing is audited as
+        `noop`). A rollback pauses automatically. `409 online_disabled` when
+        online updates are not enabled (audited as rejected).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReasonBody" }
+      responses:
+        "200":
+          description: The policy after the request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OnlinePolicyResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/online/resume:
+    post:
+      summary: Resume automatic activation of online snapshots
+      operationId: operatorOnlineResume
+      description: |
+        Scope `publish`. Applies to the next delivery; a release kept `ready`
+        while paused is activated explicitly (`releases/{id}/activate`).
+        Audited as `online_resume`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReasonBody" }
+      responses:
+        "200":
+          description: The policy after the request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OnlinePolicyResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/online/retry:
+    post:
+      summary: Queue the newest failed online delivery for another attempt
+      operationId: operatorOnlineRetry
+      description: |
+        Scope `publish`. The newest online submission must have ended
+        `failed`, `rejected` or `interrupted` and its files must still be in
+        the fetcher's outbox (for example after freeing disk space). The next
+        scan processes it again. `409 nothing_to_retry` otherwise. Audited as
+        `online_retry`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReasonBody" }
+      responses:
+        "200":
+          description: The delivery queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [queued]
+                properties:
+                  queued:
+                    type: object
+                    required: [submission_id, name, previous_state, previous_reason_code]
+                    properties:
+                      submission_id: { type: integer, format: int64 }
+                      name: { type: string }
+                      previous_state: { type: string }
+                      previous_reason_code: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bearer:
@@ -319,7 +451,8 @@ components:
               type: string
               enum: [unauthenticated, forbidden, invalid_request, request_body_too_large, unsupported_media_type, method_not_allowed,
                      not_found, unknown_release, release_not_eligible, release_incompatible, active_release_changed, busy,
-                     no_rollback_target, policy_refused, timeout, service_unavailable, internal_error]
+                     no_rollback_target, policy_refused, timeout, service_unavailable, internal_error, online_disabled,
+                     nothing_to_retry]
             message: { type: string }
             reason_code:
               type: string
@@ -387,10 +520,10 @@ components:
     Submission:
       type: object
       required: [id, source, name, fingerprint, region_id, marker_sha256, sha256, size_bytes, data_timestamp, state, reason_code,
-                 reason, release_id, attempts, created_at, updated_at, finished_at]
+                 reason, release_id, attempts, created_at, updated_at, finished_at, manifest_serial, manifest_sha256]
       properties:
         id: { type: integer, format: int64 }
-        source: { type: string, enum: [inbox, cli] }
+        source: { type: string, enum: [inbox, cli, online] }
         name: { type: string }
         fingerprint: { type: string }
         region_id: { type: string }
@@ -406,6 +539,8 @@ components:
         created_at: { $ref: "#/components/schemas/Timestamp" }
         updated_at: { $ref: "#/components/schemas/Timestamp" }
         finished_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        manifest_serial: { type: integer, format: int64, nullable: true, description: Serial of the signed manifest of an online delivery. }
+        manifest_sha256: { type: string, nullable: true, description: SHA-256 of the signed manifest envelope of an online delivery. }
     Authorization:
       type: object
       required: [id, region_id, sha256, size_bytes, reason, created_by, created_at, expires_at, revoked_at, revoked_by, revoke_reason]
@@ -434,7 +569,7 @@ components:
         id: { type: integer, format: int64 }
         at: { $ref: "#/components/schemas/Timestamp" }
         actor: { type: string, description: "Credential name, `inbox`, `cli`, `system` or `anonymous`." }
-        source: { type: string, enum: [operator_api, inbox, cli, system] }
+        source: { type: string, enum: [operator_api, inbox, cli, system, online] }
         action: { type: string }
         target: { type: string }
         outcome: { type: string, enum: [succeeded, rejected, failed, denied, noop] }
@@ -467,7 +602,7 @@ components:
               why: { type: string }
     Status:
       type: object
-      required: [region, policy, active, releases, submissions, authorizations, inbox, job, storage]
+      required: [region, policy, active, releases, submissions, authorizations, inbox, job, storage, online, freshness]
       properties:
         region:
           type: object
@@ -533,4 +668,160 @@ components:
             db_volume_free_bytes: { type: integer, format: int64, nullable: true }
             staging_free_bytes: { type: integer, format: int64, nullable: true }
             min_free_bytes: { type: integer, format: int64 }
+        online: { $ref: "#/components/schemas/OnlineStatus" }
+        freshness:
+          type: object
+          required: [update_mode, active_data_timestamp, active_data_age_seconds, stale_after_seconds, stale]
+          description: Age of the active release's data (never derived from a source check) against KARTA_DATA_STALE_AFTER.
+          properties:
+            update_mode: { type: string, enum: [manual, online] }
+            active_data_timestamp: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+            active_data_age_seconds: { type: number, nullable: true }
+            stale_after_seconds: { type: number, nullable: true, description: Null when no threshold is configured. }
+            stale: { type: boolean, nullable: true, description: Null when no threshold is configured or nothing is active. }
         failpoints: { type: array, items: { type: string }, description: Only present in test runs with fault injection. }
+    OnlinePolicy:
+      type: object
+      required: [region_id, auto_activate, changed_at, changed_by, change_reason, retry_requested_at]
+      properties:
+        region_id: { type: string }
+        auto_activate: { type: boolean, description: False while automatic activation of online snapshots is paused. }
+        changed_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        changed_by: { type: string, nullable: true }
+        change_reason: { type: string, nullable: true }
+        retry_requested_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+    OnlinePolicyResult:
+      type: object
+      required: [changed, policy]
+      properties:
+        changed: { type: boolean }
+        policy: { $ref: "#/components/schemas/OnlinePolicy" }
+    Problem:
+      type: object
+      nullable: true
+      required: [at, code, message]
+      properties:
+        at: { $ref: "#/components/schemas/Timestamp" }
+        code: { type: string }
+        message: { type: string }
+    OnlineStatus:
+      type: object
+      required: [enabled, source, auto_activate, policy, verified, fetcher, last_scan]
+      properties:
+        enabled: { type: boolean }
+        source:
+          type: object
+          nullable: true
+          required: [region_id, manifest, trusted_keys, require_operator_authorization, poll_interval_seconds, max_manifest_validity_seconds]
+          properties:
+            region_id: { type: string }
+            manifest: { type: string, description: "Manifest URL (https, no credentials or query)." }
+            trusted_keys:
+              type: array
+              items:
+                type: object
+                required: [id, fingerprint, not_after]
+                properties:
+                  id: { type: string }
+                  fingerprint: { type: string, description: "sha256: of the raw Ed25519 public key." }
+                  not_after: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+            require_operator_authorization: { type: boolean }
+            poll_interval_seconds: { type: number }
+            max_manifest_validity_seconds: { type: number }
+            error: { type: string, description: The source file could not be read. }
+        auto_activate: { type: boolean, description: "Whether a validated online snapshot is activated now: KARTA_PUBLISH_AUTO_ACTIVATE and not paused." }
+        policy: { allOf: [{ $ref: "#/components/schemas/OnlinePolicy" }], nullable: true }
+        verified:
+          type: object
+          nullable: true
+          description: The newest signed manifest the publisher verified on a delivery.
+          required: [region_id, serial, envelope_sha256, snapshot_sha256, snapshot_size_bytes, data_timestamp, issued_at, expires_at,
+                     key_id, submission_id, verified_at]
+          properties:
+            region_id: { type: string }
+            serial: { type: integer, format: int64 }
+            envelope_sha256: { $ref: "#/components/schemas/SHA256" }
+            snapshot_sha256: { $ref: "#/components/schemas/SHA256" }
+            snapshot_size_bytes: { type: integer, format: int64 }
+            data_timestamp: { $ref: "#/components/schemas/Timestamp" }
+            issued_at: { $ref: "#/components/schemas/Timestamp" }
+            expires_at: { $ref: "#/components/schemas/Timestamp" }
+            key_id: { type: string }
+            submission_id: { type: integer, format: int64, nullable: true }
+            verified_at: { $ref: "#/components/schemas/Timestamp" }
+        fetcher:
+          type: object
+          required: [state, state_age_seconds]
+          description: The fetcher's own report, read from its state file (the network-facing process; shown as reported).
+          properties:
+            state: { allOf: [{ $ref: "#/components/schemas/FetcherState" }], nullable: true }
+            state_age_seconds: { type: number, nullable: true, description: Seconds since the fetcher last wrote its state. }
+            error: { type: string }
+        last_scan:
+          type: object
+          required: [at, pending]
+          properties:
+            at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+            error: { type: string }
+            pending:
+              type: array
+              items:
+                type: object
+                required: [name, waiting]
+                properties:
+                  name: { type: string }
+                  waiting: { type: string, enum: [waiting_for_ready_marker, waiting_for_snapshot, settling] }
+                  problem: { type: string }
+    FetcherState:
+      type: object
+      required: [version, updated_at, source, last_check_at, last_success_at, last_error, consecutive_failures, next_attempt_at,
+                 highest_serial, current, delivered, download]
+      properties:
+        version: { type: integer }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        source: { type: string }
+        last_check_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        last_success_at:
+          allOf: [{ $ref: "#/components/schemas/Timestamp" }]
+          nullable: true
+          description: Last check that completed (manifest fetched and verified; the snapshot it names delivered or already delivered).
+        last_error: { $ref: "#/components/schemas/Problem" }
+        consecutive_failures: { type: integer }
+        next_attempt_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        highest_serial: { type: integer, format: int64 }
+        current:
+          type: object
+          nullable: true
+          required: [serial, envelope_sha256, snapshot_sha256, size_bytes, data_timestamp, issued_at, expires_at, key_id, verified_at]
+          properties:
+            serial: { type: integer, format: int64 }
+            envelope_sha256: { type: string }
+            snapshot_sha256: { type: string }
+            size_bytes: { type: integer, format: int64 }
+            data_timestamp: { $ref: "#/components/schemas/Timestamp" }
+            issued_at: { $ref: "#/components/schemas/Timestamp" }
+            expires_at: { $ref: "#/components/schemas/Timestamp" }
+            key_id: { type: string }
+            verified_at: { $ref: "#/components/schemas/Timestamp" }
+        delivered:
+          type: object
+          nullable: true
+          required: [name, serial, snapshot_sha256, size_bytes, data_timestamp, delivered_at]
+          properties:
+            name: { type: string }
+            serial: { type: integer, format: int64 }
+            snapshot_sha256: { type: string }
+            size_bytes: { type: integer, format: int64 }
+            data_timestamp: { $ref: "#/components/schemas/Timestamp" }
+            delivered_at: { $ref: "#/components/schemas/Timestamp" }
+        download:
+          type: object
+          nullable: true
+          required: [snapshot_sha256, size_bytes, bytes, started_at, attempts, abandoned_until]
+          properties:
+            snapshot_sha256: { type: string }
+            size_bytes: { type: integer, format: int64 }
+            bytes: { type: integer, format: int64 }
+            started_at: { $ref: "#/components/schemas/Timestamp" }
+            attempts: { type: integer }
+            abandoned_until: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }

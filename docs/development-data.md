@@ -80,6 +80,41 @@ candidate and activated it:
 Switching, rollback and cleanup were tested with the two committed fixture
 snapshots, not with this single real snapshot.
 
+## Stage 3 online publication of this snapshot (2026-10-01, implementation environment)
+
+The same two files were published through the **online path**, served by the
+local controlled HTTPS test source (`tests/integration/sourceserver`, a
+test CA), with a manifest signed by a throwaway key generated for the run
+(`cmd/karta-sign sign`, serial 1, valid 24 h). This exercises the online
+path with real data; it is **not** a real provider, a production key, or a
+run on the owner's VM.
+
+* `karta-sign sign` first ran the importer's input verification on the file
+  (complete PBF scan, region box, sidecar, data timestamp) and signed SHA-256
+  `7d0e69a2…191e`, 1,149,950 bytes, data timestamp 2026-09-27T20:23:36Z (from
+  the sidecar's source header) and the sidecar's digest and size (4,607 bytes).
+* The fetcher (region `tehran-chitgar`, the test source on an internal Docker
+  network) verified the manifest, downloaded the snapshot and sidecar, checked
+  both digests and delivered them 1.7 s after it started; the publisher
+  verified the envelope again 4.5 s after the fetcher started, recorded serial
+  1, staged and verified the file, built and validated it, and activated it
+  about 7.6 s after the fetcher started (`activated_at` 12:23:54Z; 1 s inbox
+  poll and settle intervals in this run).
+* Release id `rf210a8fe8237f20095686597`, the **same id as the Stage 1 and
+  Stage 2 publications** of this file, with the same row counts (roads 7,511,
+  water 80, waterways 33, landcover 1,990, buildings 8,087, features 2,673,
+  place names 3,329). Build 3.6 s (osm2pgsql 0.61 s, post-import SQL 2.45 s).
+  The import report's `authorized_by` is `region configuration`: this exact
+  digest is pinned in `config/regions/tehran-chitgar.json`, which the
+  importer checks first; the online path still required and verified the
+  signature. Signature-only authorization of unpinned digests is exercised by
+  the fixture variants in `make test-integration`.
+* `دریاچه چیتگر` returns way `1259635603` first and relation `8128152`
+  second; the manifest reports `update_mode: online`, `online_updates: true`,
+  `stale: false` against a 168 h test threshold.
+* Fetcher memory: 6.2 MiB after the run (`docker stats`), cgroup peak 10.6 MB
+  including page cache; publisher 7.5 MiB idle; PostgreSQL 114 MiB.
+
 ## Obtain and extract
 
 On a machine with sufficient RAM/disk (the osmium reference check can use substantial RAM even for a small extract), Python 3.9+, and [osmium-tool](https://osmcode.org/osmium-tool/) installed, download `iran-latest.osm.pbf` from [Geofabrik's Iran extract](https://download.geofabrik.de/asia/iran.html) using a browser or your normal trusted downloader. Record its download URL, date and published checksum if one is provided. Do not commit the input or the resulting PBF. Run:

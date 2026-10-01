@@ -181,10 +181,61 @@ FROM registry.events ORDER BY id;
 
 GRANT SELECT ON registry.schema_migrations TO karta_reader;
 `,
+	3: `
+-- Stage 3: online deliveries are a third submission source and audit source.
+ALTER TABLE registry.submissions DROP CONSTRAINT IF EXISTS submissions_source_check;
+ALTER TABLE registry.submissions ADD CONSTRAINT submissions_source_check CHECK (source IN ('inbox', 'cli', 'online'));
+ALTER TABLE registry.submissions
+    ADD COLUMN IF NOT EXISTS manifest_serial bigint,
+    ADD COLUMN IF NOT EXISTS manifest_sha256 text;
+ALTER TABLE registry.audit DROP CONSTRAINT IF EXISTS audit_source_check;
+ALTER TABLE registry.audit ADD CONSTRAINT audit_source_check
+    CHECK (source IN ('operator_api', 'inbox', 'cli', 'system', 'online'));
+
+-- The newest signed manifest the publisher verified, per region: a delivery
+-- with a lower serial (a replay) or another manifest under the same serial
+-- (a conflicting claim) is refused.
+CREATE TABLE registry.source_state (
+    region_id text PRIMARY KEY,
+    last_serial bigint NOT NULL CHECK (last_serial > 0),
+    envelope_sha256 text NOT NULL CHECK (envelope_sha256 ~ '^[0-9a-f]{64}$'),
+    snapshot_sha256 text NOT NULL CHECK (snapshot_sha256 ~ '^[0-9a-f]{64}$'),
+    snapshot_size bigint NOT NULL CHECK (snapshot_size > 0),
+    data_timestamp timestamptz NOT NULL,
+    issued_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    key_id text NOT NULL,
+    submission_id bigint,
+    verified_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Operator policy for online deliveries: automatic activation can be
+-- paused (an operator, or automatically by a rollback), and one failed
+-- delivery can be queued for another attempt.
+CREATE TABLE registry.online_policy (
+    region_id text PRIMARY KEY,
+    auto_activate boolean NOT NULL DEFAULT true,
+    changed_at timestamptz,
+    changed_by text,
+    change_reason text,
+    retry_fingerprint text,
+    retry_requested_at timestamptz
+);
+
+-- What the public manifest may say about freshness: the update mode and
+-- the configured staleness threshold. Nothing about the upstream source.
+CREATE TABLE registry.freshness (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    update_mode text NOT NULL CHECK (update_mode IN ('manual', 'online')),
+    stale_after_seconds bigint CHECK (stale_after_seconds > 0),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+GRANT SELECT ON registry.freshness TO karta_reader;
+`,
 }
 
 // SchemaVersion is the registry schema this build writes.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 // Migrate brings the registry schema to SchemaVersion (idempotent; safe to
 // run concurrently from several processes).
@@ -489,6 +540,14 @@ type ActivateRequest struct {
 	// Allow is the caller's policy check, run inside the transaction with
 	// the current active release (nil if none) and the locked target row.
 	Allow func(active, target *Release) error
+	// Gate, if set, is a further check inside the transaction, after Allow,
+	// that can read the registry (for example the online activation
+	// policy, read with a row lock so a concurrent pause is serialized).
+	Gate func(ctx context.Context, q Querier) error
+	// InTx, if set, runs inside the transaction after the pointer moved and
+	// before the commit, so its changes commit or roll back with the switch
+	// (a rollback pausing automatic online activation).
+	InTx func(ctx context.Context, q Querier) error
 	// BeforeCommit runs last inside the transaction (fault injection in tests).
 	BeforeCommit func()
 }
@@ -559,6 +618,14 @@ func Activate(ctx context.Context, db TxBeginner, req ActivateRequest, lockTimeo
 			return res, err
 		}
 	}
+	if req.Gate != nil {
+		if err := req.Gate(ctx, tx); err != nil {
+			if isLockTimeout(err) {
+				return res, ErrBusy
+			}
+			return res, err
+		}
+	}
 	if active != nil {
 		var until time.Time
 		if err := tx.QueryRow(ctx, `
@@ -587,6 +654,11 @@ ON CONFLICT (singleton) DO UPDATE SET release_id = EXCLUDED.release_id, activate
 	if err := Audit(ctx, tx, AuditEntry{Actor: req.Actor, Source: req.Source, Action: req.Action, Target: target.ID,
 		Outcome: OutcomeSucceeded, Reason: req.Reason, RequestID: req.RequestID, Detail: detail}); err != nil {
 		return res, err
+	}
+	if req.InTx != nil {
+		if err := req.InTx(ctx, tx); err != nil {
+			return res, err
+		}
 	}
 	if req.BeforeCommit != nil {
 		req.BeforeCommit()
@@ -664,7 +736,7 @@ UPDATE registry.releases SET state = 'removed', removed_at = now(), database_byt
 WHERE release_id = $1 AND state = 'removing'`, id))
 }
 
-// Submission is one inbox or CLI submission.
+// Submission is one inbox, CLI or online submission.
 type Submission struct {
 	ID            int64      `json:"id"`
 	Source        string     `json:"source"`
@@ -683,6 +755,10 @@ type Submission struct {
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 	FinishedAt    *time.Time `json:"finished_at"`
+	// ManifestSerial and ManifestSHA256 identify the signed manifest of an
+	// online delivery (null otherwise).
+	ManifestSerial *int64  `json:"manifest_serial"`
+	ManifestSHA256 *string `json:"manifest_sha256"`
 }
 
 // Submission states.
@@ -697,12 +773,13 @@ const (
 )
 
 const submissionColumns = `id, source, name, fingerprint, region_id, marker_sha256, sha256, size_bytes, data_timestamp,
-    state, reason_code, reason, release_id, attempts, created_at, updated_at, finished_at`
+    state, reason_code, reason, release_id, attempts, created_at, updated_at, finished_at, manifest_serial, manifest_sha256`
 
 func scanSubmission(row pgx.Row) (*Submission, error) {
 	var s Submission
 	err := row.Scan(&s.ID, &s.Source, &s.Name, &s.Fingerprint, &s.RegionID, &s.MarkerSHA256, &s.SHA256, &s.SizeBytes,
-		&s.DataTimestamp, &s.State, &s.ReasonCode, &s.Reason, &s.ReleaseID, &s.Attempts, &s.CreatedAt, &s.UpdatedAt, &s.FinishedAt)
+		&s.DataTimestamp, &s.State, &s.ReasonCode, &s.Reason, &s.ReleaseID, &s.Attempts, &s.CreatedAt, &s.UpdatedAt, &s.FinishedAt,
+		&s.ManifestSerial, &s.ManifestSHA256)
 	return &s, err
 }
 
@@ -748,14 +825,16 @@ WHERE id = $1 AND state = $2 RETURNING `+submissionColumns, prior.ID, prior.Stat
 
 // SubmissionUpdate is the outcome written to a submission.
 type SubmissionUpdate struct {
-	State         string
-	ReasonCode    string
-	Reason        string
-	ReleaseID     string
-	MarkerSHA256  string
-	SHA256        string
-	SizeBytes     int64
-	DataTimestamp *time.Time
+	State          string
+	ReasonCode     string
+	Reason         string
+	ReleaseID      string
+	MarkerSHA256   string
+	SHA256         string
+	SizeBytes      int64
+	DataTimestamp  *time.Time
+	ManifestSerial int64
+	ManifestSHA256 string
 }
 
 // UpdateSubmission records progress or the outcome of a submission.
@@ -766,8 +845,10 @@ UPDATE registry.submissions SET state = $2, reason_code = NULLIF($3, ''), reason
     release_id = COALESCE(NULLIF($5, ''), release_id), marker_sha256 = COALESCE(NULLIF($6, ''), marker_sha256),
     sha256 = COALESCE(NULLIF($7, ''), sha256), size_bytes = COALESCE(NULLIF($8, 0), size_bytes),
     data_timestamp = COALESCE($9, data_timestamp), updated_at = now(),
-    finished_at = CASE WHEN $10 THEN now() ELSE NULL END
-WHERE id = $1`, id, u.State, u.ReasonCode, truncate(u.Reason, 2000), u.ReleaseID, u.MarkerSHA256, u.SHA256, u.SizeBytes, u.DataTimestamp, terminal)
+    finished_at = CASE WHEN $10 THEN now() ELSE NULL END,
+    manifest_serial = COALESCE(NULLIF($11, 0), manifest_serial), manifest_sha256 = COALESCE(NULLIF($12, ''), manifest_sha256)
+WHERE id = $1`, id, u.State, u.ReasonCode, truncate(u.Reason, 2000), u.ReleaseID, u.MarkerSHA256, u.SHA256, u.SizeBytes, u.DataTimestamp, terminal,
+		u.ManifestSerial, u.ManifestSHA256)
 	return err
 }
 
