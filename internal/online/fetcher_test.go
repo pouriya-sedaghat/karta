@@ -391,3 +391,12 @@ func TestReadStateIsStrictAndBounded(t *testing.T) {
 		}
 	}
 }
+
+func TestLimitsAgreeWithTheInbox(t *testing.T) {
+	if inbox.MaxManifestBytes != MaxEnvelopeBytes || inbox.MaxSidecarBytes != MaxProvenanceBytes {
+		t.Fatal("the publisher's staging limits differ from the fetcher's")
+	}
+	if !inbox.NamePattern.MatchString(DeliveryName("a-region-id-of-sixty-three-characters-is-still-a-valid-name-xx", 1<<40, strings.Repeat("f", 64))) {
+		t.Fatal("a delivery name is not a valid submission name")
+	}
+}

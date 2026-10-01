@@ -310,15 +310,6 @@ func resetOutbox(t *testing.T) {
 	}
 }
 
-func fetcherState(t *testing.T) *online.State {
-	t.Helper()
-	s, err := online.ReadState(onlineDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return s
-}
-
 // waitFetcher waits until the fetcher's state satisfies ok.
 func waitFetcher(t *testing.T, what string, timeout time.Duration, ok func(*online.State) bool) *online.State {
 	t.Helper()
@@ -336,13 +327,6 @@ func waitFetcher(t *testing.T, what string, timeout time.Duration, ok func(*onli
 	b, _ := json.Marshal(last)
 	t.Fatalf("fetcher: %s not reached within %s; state %s", what, timeout, b)
 	return nil
-}
-
-func errCode(s *online.State) string {
-	if s.LastError == nil {
-		return ""
-	}
-	return s.LastError.Code
 }
 
 // failedWith waits for a check that failed with code after since.
@@ -629,6 +613,7 @@ func TestOnline(t *testing.T) {
 		t.Fatalf("A: %+v", s)
 	}
 	relA := status(t).activeID()
+	waitManifest(t, relA)
 
 	t.Run("online updates are off unless configured", func(t *testing.T) {
 		v := onlineStatus(t)
@@ -918,6 +903,9 @@ func TestOnline(t *testing.T) {
 			t.Error("the corrupt download was kept")
 		}
 		noSubmission(t, p.name)
+		if got := status(t).activeID(); got != before {
+			t.Errorf("active changed to %s while the source misbehaved", got)
+		}
 		setRules(t, nil)
 		if s := waitSubmission(t, p.name, 90*time.Second); s.State != "published" {
 			t.Fatalf("after the source was repaired: %+v", s)
@@ -1209,6 +1197,7 @@ func TestOnline(t *testing.T) {
 				if v := onlineStatus(t).Online.Verified; v == nil || v.Serial != p.serial {
 					t.Errorf("verified %+v", v)
 				}
+				waitIdle(t)
 				assertRegistryConsistent(t)
 			})
 		}
@@ -1287,6 +1276,7 @@ func TestOnline(t *testing.T) {
 			t.Errorf("final active %s, want the newest (online) %s", final, s.release())
 		}
 		o.restartOnlinePublisher(t, nil)
+		waitIdle(t)
 		assertRegistryConsistent(t)
 	})
 
@@ -1387,24 +1377,33 @@ func TestOnline(t *testing.T) {
 	t.Run("pinned clients, cleanup and the outbox stay bounded", func(t *testing.T) {
 		// (Pinned clients through an online switch: the first subtest.)
 		o.restartOnlinePublisher(t, map[string]string{"KARTA_TEST_RETAIN": "1", "KARTA_TEST_PIN_GRACE": "1s"})
+		x := status(t).activeID()
+		var rels []string
 		for i := 0; i < 3; i++ {
 			ts := *at(fmt.Sprintf("2026-08-%02dT00:00:00Z", 10+i))
 			p := o.publishOnline(t, variant(t, &ts, nil, nil), ts, nil)
-			if s := waitSubmission(t, p.name, 90*time.Second); s.State != "published" {
+			s := waitSubmission(t, p.name, 90*time.Second)
+			if s.State != "published" {
 				t.Fatalf("%d: %+v", i, s)
 			}
+			rels = append(rels, s.release())
 		}
-		// Wait until no release is kept for pinned clients any more (earlier
-		// releases were retired with the 20 s test grace, these with 1 s; the
-		// cleanup margin is 30 s), then clean up for real.
+		waitIdle(t)
+		// X, P1 and P2 were retired with a 1 s grace; wait out the grace and
+		// the 30 s cleanup margin. (Releases retired earlier by command-line
+		// imports keep the importer's 24 h grace and stay, as pinned.)
+		mine := map[string]bool{x: true, rels[0]: true, rels[1]: true}
 		type decision struct {
-			ReleaseID, Action, Why string
+			ReleaseID string `json:"release_id"`
+			Action    string `json:"action"`
+			Why       string `json:"why"`
 		}
 		var res struct {
 			Decisions []decision `json:"decisions"`
 			Removed   []string   `json:"removed"`
 			Skipped   []struct {
-				ReleaseID, Why string
+				ReleaseID string `json:"release_id"`
+				Why       string `json:"why"`
 			} `json:"skipped"`
 		}
 		deadline := time.Now().Add(120 * time.Second)
@@ -1412,13 +1411,13 @@ func TestOnline(t *testing.T) {
 			r := op(t, http.MethodPost, "/v1/operator/cleanup", admin, map[string]any{"reason": "dry run after online publications", "dry_run": true})
 			expectStatus(t, r, http.StatusOK)
 			r.json(t, &res)
-			pinned := 0
+			waiting := 0
 			for _, d := range res.Decisions {
-				if strings.HasPrefix(d.Why, "pinned by clients") {
-					pinned++
+				if mine[d.ReleaseID] && strings.HasPrefix(d.Why, "pinned by clients") {
+					waiting++
 				}
 			}
-			if pinned == 0 {
+			if waiting == 0 {
 				break
 			}
 			if time.Now().After(deadline) {
@@ -1429,18 +1428,37 @@ func TestOnline(t *testing.T) {
 		r := op(t, http.MethodPost, "/v1/operator/cleanup", admin, map[string]any{"reason": "after online publications"})
 		expectStatus(t, r, http.StatusOK)
 		r.json(t, &res)
-		if len(res.Skipped) != 0 {
-			t.Errorf("skipped: %+v", res.Skipped)
+		removed := map[string]bool{}
+		for _, id := range res.Removed {
+			removed[id] = true
+		}
+		pinned := 0
+		for _, d := range res.Decisions {
+			switch {
+			case d.Action == "remove" && !removed[d.ReleaseID]:
+				t.Errorf("%s was selected for removal but not removed: %+v", d.ReleaseID, res.Skipped)
+			case d.Action == "keep" && strings.HasPrefix(d.Why, "pinned by clients"):
+				pinned++
+			}
+		}
+		if !removed[x] || !removed[rels[0]] {
+			t.Errorf("the releases replaced by online publications were not removed: %v", res.Removed)
 		}
 		st := status(t)
+		if st.activeID() != rels[2] {
+			t.Errorf("active %s, want %s", st.activeID(), rels[2])
+		}
+		if r := st.release(rels[1]); r == nil || r.State != "retired" {
+			t.Errorf("the rollback target %s: %+v", rels[1], r)
+		}
 		kept := 0
 		for _, rel := range st.Releases {
 			if rel.State == "ready" || rel.State == "retired" || rel.State == "active" {
 				kept++
 			}
 		}
-		if kept != 2 { // the active release and KARTA_RETAIN_RELEASES=1 rollback target
-			t.Errorf("%d releases retained after cleanup, want 2; decisions %+v", kept, res.Decisions)
+		if kept != 2+pinned { // the active release, one rollback target (KARTA_RETAIN_RELEASES=1) and pinned ones
+			t.Errorf("%d releases retained after cleanup, want %d; decisions %+v", kept, 2+pinned, res.Decisions)
 		}
 		files, _ := os.ReadDir(onlineDir)
 		complete := 0
@@ -1554,6 +1572,20 @@ func TestOnline(t *testing.T) {
 }
 
 // --- small helpers ------------------------------------------------------------------
+
+// waitIdle waits until the publisher runs no publication (including the
+// retention cleanup that follows one).
+func waitIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if status(t).Job == nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("the publisher did not become idle")
+}
 
 func ptr(t time.Time) *time.Time { return &t }
 

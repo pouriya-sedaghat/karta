@@ -25,7 +25,6 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -78,7 +77,7 @@ type Request struct {
 }
 
 type server struct {
-	root  string
+	root  *os.Root
 	mu    sync.Mutex
 	rules map[string]*Rule
 	used  map[string]int
@@ -121,8 +120,9 @@ func (s *server) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(rule.Status)
 		return
 	}
-	clean := path.Clean("/" + r.URL.Path)
-	body, err := os.ReadFile(filepath.Join(s.root, filepath.FromSlash(clean))) // #nosec G304 -- test server, cleaned path under its root
+	// os.Root confines every lookup to the document root (no "..", no
+	// symlink out of it).
+	body, err := s.root.ReadFile(strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/"))
 	if err != nil {
 		rec.Status = http.StatusNotFound
 		http.NotFound(w, r)
@@ -136,6 +136,8 @@ func (s *server) serve(w http.ResponseWriter, r *http.Request) {
 	etag := fmt.Sprintf(`"%x-%d"`, len(body), bytesSum(body))
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if rule.ContentEncoding != "" {
 		w.Header().Set("Content-Encoding", rule.ContentEncoding)
 	}
@@ -190,7 +192,7 @@ func write(w http.ResponseWriter, r *http.Request, b []byte, bps int) int64 {
 	var n int64
 	for len(b) > 0 {
 		c := min(chunk, len(b))
-		k, err := w.Write(b[:c])
+		k, err := w.Write(b[:c]) // #nosec G705 -- test fixture bytes served as application/octet-stream with nosniff
 		n += int64(k)
 		if err != nil {
 			return n
@@ -258,7 +260,11 @@ func env(k, def string) string {
 }
 
 func main() {
-	s := &server{root: env("SOURCE_DOCROOT", "/docroot"), rules: map[string]*Rule{}, used: map[string]int{}}
+	root, err := os.OpenRoot(env("SOURCE_DOCROOT", "/docroot"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	s := &server{root: root, rules: map[string]*Rule{}, used: map[string]int{}}
 	cert, err := tls.LoadX509KeyPair(env("SOURCE_TLS_CERT", "/tls/server.pem"), env("SOURCE_TLS_KEY", "/tls/server-key.pem"))
 	if err != nil {
 		log.Fatal(err)
@@ -269,7 +275,7 @@ func main() {
 	errc := make(chan error, 2)
 	go func() { errc <- tlsSrv.ListenAndServeTLS("", "") }()
 	go func() { errc <- ctl.ListenAndServe() }()
-	log.Printf("sourceserver: TLS %s, control %s, root %s", tlsSrv.Addr, ctl.Addr, s.root)
+	log.Printf("sourceserver: TLS %s, control %s, root %s", tlsSrv.Addr, ctl.Addr, s.root.Name())
 	err = <-errc
 	if !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(strings.TrimSpace(err.Error()))
