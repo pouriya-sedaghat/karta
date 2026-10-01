@@ -325,6 +325,26 @@ manual one within a scan) wins; the other is refused as `not_newer`.
 * The public manifest says only `update_mode: online`, `stale` and
   `stale_after_seconds`; nothing about the source.
 
+### The fetcher refuses to start: state cannot be read
+
+The fetcher keeps its state in `.fetcher/state.json` inside its outbox. That
+file records the highest manifest serial it verified, which may belong to a
+manifest that was never delivered and so is unknown to the publisher. If the
+file exists but cannot be read (damaged, an unsupported version, replaced by
+a symlink or a directory), the fetcher logs "refusing to start" and exits
+without contacting the source. It does not start from an empty state, which
+would let an older but still valid manifest through.
+
+* Restore the file from a backup if you have one, then start the fetcher.
+* Otherwise, before moving it aside, note the serial the source serves now
+  and `online.verified.serial` in `make op-status` (the newest serial the
+  publisher verified). After the file is moved aside, the fetcher starts from
+  the newest complete delivery in its outbox, and the publisher still refuses
+  anything below the serial it verified. Only a serial that was verified but
+  never delivered is forgotten.
+* Only the fetcher writes this file: find out how it was damaged (disk,
+  volume, or someone with write access to the outbox volume).
+
 ### Failure codes (fetcher `last_error.code`, online submission `reason_code`)
 
 | Code | Meaning | Action |

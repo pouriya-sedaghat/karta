@@ -1151,6 +1151,38 @@ func TestOnline(t *testing.T) {
 					// crash, so after a restart the older serial is a replay,
 					// refused before any snapshot request.
 					setManifest(t, older.raw)
+					olderSnap := fmt.Sprintf("/karta/snap-%d.osm.pbf", older.serial)
+					// A damaged state file must not reset the serial: the
+					// fetcher refuses to start, requests nothing and
+					// delivers nothing until the file is repaired.
+					statePath := filepath.Join(onlineDir, online.StateDirName, online.StateFileName)
+					good, err := os.ReadFile(statePath)
+					if err != nil {
+						t.Fatal(err)
+					}
+					writeFileAtomic(t, statePath, good[:len(good)/2], 0o644)
+					clearRequests(t)
+					startFetcher(t, nil)
+					if code := waitFetcherExit(t, 60*time.Second); code == 0 || code == 99 {
+						t.Fatalf("fetcher exit %d with a damaged state", code)
+					}
+					if logs := fetcherLogs(t); !strings.Contains(logs, "refusing to start") {
+						t.Errorf("fetcher logs do not explain the refusal:\n%s", logs)
+					}
+					if reqs := sourceRequests(t); len(reqs) != 0 {
+						t.Errorf("%d source requests with a damaged state: %+v", len(reqs), reqs)
+					}
+					if b, _ := os.ReadFile(statePath); !bytes.Equal(b, good[:len(good)/2]) {
+						t.Error("the damaged state was overwritten")
+					}
+					if entries, _ := os.ReadDir(onlineDir); len(entries) > 0 {
+						for _, en := range entries {
+							if strings.HasPrefix(en.Name(), older.name) {
+								t.Errorf("delivered %s", en.Name())
+							}
+						}
+					}
+					writeFileAtomic(t, statePath, good, 0o644) // repaired
 					since := time.Now()
 					startFetcher(t, nil)
 					waitFetcher(t, "the older manifest refused as a replay", 60*time.Second, failedWith(online.CodeManifestReplayed, since))
@@ -1158,7 +1190,6 @@ func TestOnline(t *testing.T) {
 					if st, _ := online.ReadState(onlineDir); st == nil || st.HighestSerial != p.serial {
 						t.Errorf("highest serial after the replay: %+v", st)
 					}
-					olderSnap := fmt.Sprintf("/karta/snap-%d.osm.pbf", older.serial)
 					if n := countRequests(t, olderSnap); n != 0 {
 						t.Errorf("%d requests for the replayed manifest's snapshot", n)
 					}

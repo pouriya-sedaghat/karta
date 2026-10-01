@@ -58,8 +58,9 @@ type Fetcher struct {
 	lastSaved time.Time
 }
 
-// NewFetcher prepares the outbox, loads the persisted state and recovers
-// from an interrupted run: temporary files and deliveries without a
+// NewFetcher prepares the outbox, loads the persisted state (refusing to
+// start if a state exists but cannot be read) and recovers from an
+// interrupted run: temporary files and deliveries without a
 // completion marker are removed (the verified bytes stay in the partial
 // directory and are delivered again), and a complete delivery the state
 // does not record is adopted.
@@ -81,7 +82,14 @@ func NewFetcher(cfg FetcherConfig, log *slog.Logger) (*Fetcher, error) {
 	}
 	st, err := ReadState(cfg.Dir)
 	if err != nil {
-		log.Warn("fetcher state unreadable; starting from an empty state", "err", err)
+		// Only a missing state (first start) starts empty. A state that
+		// exists but cannot be read is never replaced: it holds the highest
+		// verified serial, which may be newer than anything delivered and so
+		// unknown to the publisher; starting from zero would let an older
+		// manifest that is still valid pass the replay check.
+		return nil, fmt.Errorf("the fetcher state %s exists but cannot be read (%w); refusing to start so that the highest verified "+
+			"serial it records is not forgotten: restore the file, or follow the runbook (online updates, fetcher state) before moving it aside",
+			filepath.Join(cfg.Dir, StateDirName, StateFileName), err)
 	}
 	if st != nil {
 		f.state = *st

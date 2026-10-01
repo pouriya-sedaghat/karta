@@ -130,7 +130,10 @@ must not depend on, and an identity policy the owner has not chosen).
   authoritatively, by the publisher in the registry
   (`registry.source_state`). So a crash after verification cannot let an
   older, still valid manifest through after a restart, even if the newer
-  one was never delivered. A lower serial is refused (`manifest_replayed`);
+  one was never delivered. For the same reason the fetcher refuses to start
+  when its state file exists but cannot be read (damaged, unsupported
+  version, not a regular file). Only a missing file, on first start, starts
+  empty; an operator repairs or knowingly moves aside a damaged one (runbook). A lower serial is refused (`manifest_replayed`);
   a different envelope under a serial already verified is refused
   (`manifest_conflict`). A source that keeps serving an old but valid
   manifest can only delay updates until `expires_at`; after that every check
@@ -266,6 +269,7 @@ is never visible to the publisher.
 | --- | --- |
 | poll, before the manifest verified | nothing persisted changes; the next check repeats it |
 | poll, after the manifest verified | its serial was saved first; after the restart an older manifest is a replay, and the next check continues |
+| (state file damaged on disk) | the fetcher refuses to start and requests nothing until the file is restored or deliberately moved aside |
 | download | the partial file is resumed (verified as above) |
 | after the download, before the delivery | the complete partial file is delivered without downloading again |
 | delivery, before the marker | the incomplete delivery is removed at start (the publisher never saw it); the verified partial is delivered again |

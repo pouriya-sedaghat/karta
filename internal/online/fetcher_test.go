@@ -486,6 +486,102 @@ func TestFetcherPersistsTheAcceptedSerialBeforeAnythingElse(t *testing.T) {
 	}
 }
 
+// A state file that exists but cannot be read is never replaced by an
+// empty state: it may hold a verified serial that was never delivered (so
+// the publisher does not know it), and starting from zero would let an
+// older manifest that is still valid through. The fetcher refuses to start
+// until the file is repaired; only a missing state starts empty.
+func TestFetcherRefusesToStartFromAnUnreadableState(t *testing.T) {
+	e := newFetcherEnv(t, "")
+	f := e.start(t)
+	ctx := context.Background()
+	raw1 := e.publish(t, 1, randomBytes(5000))
+	e.publish(t, 2, randomBytes(5000))
+	e.src.mu.Lock()
+	delete(e.src.files, "/karta/snap-2.osm.pbf.provenance.json") // serial 2 is verified, never delivered
+	e.src.mu.Unlock()
+	if err := f.CheckOnce(ctx); CodeOf(err) != CodeHTTPStatus {
+		t.Fatalf("serial 2: %v", err)
+	}
+	statePath := filepath.Join(e.dir, StateDirName, StateFileName)
+	good, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.src.set("/karta/manifest.json", raw1) // the source now serves the older, still valid serial 1
+
+	start := func() (*Fetcher, error) {
+		return NewFetcher(FetcherConfig{SourcePath: e.source, RegionPath: e.region, Dir: e.dir, MaxInputBytes: 1 << 30,
+			MaxFutureSkew: time.Minute, Version: "test"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}
+	damaged := map[string]func() error{
+		"truncated JSON":      func() error { return os.WriteFile(statePath, good[:len(good)/2], 0o644) },
+		"not JSON":            func() error { return os.WriteFile(statePath, []byte("\x00\x01garbage"), 0o644) },
+		"unsupported version": func() error { return os.WriteFile(statePath, []byte(`{"version":99}`), 0o644) },
+		"unknown field":       func() error { return os.WriteFile(statePath, append(good[:len(good)-2], []byte(`,"x":1}`)...), 0o644) },
+		"oversized":           func() error { return os.WriteFile(statePath, bytes.Repeat([]byte(" "), MaxStateBytes+1), 0o644) },
+		"a symlink":           func() error { return os.Symlink("/etc/hostname", statePath) },
+		"a directory":         func() error { return os.Mkdir(statePath, 0o755) },
+	}
+	for name, damage := range damaged {
+		t.Run(name, func(t *testing.T) {
+			_ = os.RemoveAll(statePath)
+			if err := damage(); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := os.ReadDir(e.dir)
+			f2, err := start()
+			if err == nil || f2 != nil || !strings.Contains(err.Error(), "refusing to start") {
+				t.Fatalf("started from a damaged state: %v", err)
+			}
+			if _, err := os.Lstat(statePath); err != nil {
+				t.Errorf("the damaged state was removed: %v", err)
+			}
+			if name == "truncated JSON" {
+				if b, _ := os.ReadFile(statePath); !bytes.Equal(b, good[:len(good)/2]) {
+					t.Error("the damaged state was overwritten")
+				}
+			}
+			after, _ := os.ReadDir(e.dir)
+			if len(after) != len(before) {
+				t.Errorf("the outbox changed: %d entries, then %d", len(before), len(after))
+			}
+		})
+	}
+	for _, p := range []string{"/karta/snap-1.osm.pbf", "/karta/snap-1.osm.pbf.provenance.json"} {
+		if n := e.src.count(p); n != 0 {
+			t.Errorf("%s requested %d times", p, n)
+		}
+	}
+	if entries, _ := inbox.ScanWith(e.dir, 100, inbox.ScanOptions{Manifests: true}); len(entries) != 0 {
+		t.Errorf("deliveries: %+v", entries)
+	}
+
+	// Repaired (restored), the fetcher starts and refuses serial 1 as a replay.
+	_ = os.RemoveAll(statePath)
+	if err := os.WriteFile(statePath, good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f3, err := start()
+	if err != nil {
+		t.Fatalf("restored state: %v", err)
+	}
+	if err := f3.CheckOnce(ctx); CodeOf(err) != CodeManifestReplayed {
+		t.Fatalf("serial 1 after the repair: %v", err)
+	}
+	if n := e.src.count("/karta/snap-1.osm.pbf"); n != 0 {
+		t.Errorf("snapshot 1 requested %d times", n)
+	}
+
+	// A missing state (first start) still starts empty.
+	if err := os.Remove(statePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := start(); err != nil {
+		t.Fatalf("missing state: %v", err)
+	}
+}
+
 func TestFetcherRefusesAForeignRegionOrKey(t *testing.T) {
 	e := newFetcherEnv(t, "")
 	f := e.start(t)
