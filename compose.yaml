@@ -8,6 +8,11 @@
 # additionally on `operator`, only to publish the operator API port (bound to
 # 127.0.0.1 by default); that network does not masquerade, so the publisher,
 # which reads untrusted snapshots, has no NAT route to outside hosts.
+#
+# Online updates (Stage 3) are opt-in: the `fetcher` service (profile
+# `online`, `make up-online`) is the only one with a route out, on its own
+# `egress` network. It has no database credential; it writes verified
+# deliveries into the `online` volume, which the publisher reads read-only.
 name: karta
 
 x-logging: &logging
@@ -110,11 +115,19 @@ services:
       KARTA_OSM2PGSQL_CACHE_MB: ${KARTA_OSM2PGSQL_CACHE_MB:-800}
       KARTA_OSM2PGSQL_PROCESSES: ${KARTA_OSM2PGSQL_PROCESSES:-2}
       KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+      # Online updates: empty (the default) keeps them off. Set to a source
+      # file such as /config/sources/NAME.json and run `make up-online`.
+      KARTA_ONLINE_SOURCE_FILE: ${KARTA_ONLINE_SOURCE_FILE:-}
+      KARTA_ONLINE_DIR: /data/online
+      # Data age after which the active release is reported stale (empty: no threshold).
+      KARTA_DATA_STALE_AFTER: ${KARTA_DATA_STALE_AFTER:-}
     secrets: [db_importer_password, operator_tokens]
     volumes:
       - ${KARTA_INBOX_HOST_DIR:-./data/inbox}:/data/inbox:ro
       - staging:/var/lib/karta/staging
       - ./config/regions:/config/regions:ro
+      - ./config/sources:/config/sources:ro
+      - online:/data/online:ro
     tmpfs:
       - /tmp:size=1g,mode=1777
     read_only: true
@@ -135,6 +148,35 @@ services:
       timeout: 4s
       retries: 3
       start_period: 60s
+    restart: unless-stopped
+    logging: *logging
+
+  # Online source poller (opt-in, `make up-online`): polls the HTTPS source
+  # named in KARTA_ONLINE_SOURCE_FILE, verifies signed manifests, downloads
+  # within the source's limits and delivers verified snapshots to the
+  # publisher through the `online` volume. No database access, no listener.
+  fetcher:
+    image: karta-api:${KARTA_IMAGE_TAG:-local}
+    profiles: [online]
+    command: ["fetcher"]
+    environment:
+      KARTA_ONLINE_SOURCE_FILE: ${KARTA_ONLINE_SOURCE_FILE:-}
+      KARTA_REGION_FILE: /config/regions/${KARTA_PUBLISH_REGION:-tehran-chitgar}.json
+      KARTA_ONLINE_DIR: /var/lib/karta/online
+      KARTA_MAX_INPUT_MB: ${KARTA_MAX_INPUT_MB:-4096}
+      KARTA_ONLINE_RESERVE_MB: ${KARTA_ONLINE_RESERVE_MB:-64}
+      KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+    volumes:
+      - online:/var/lib/karta/online
+      - ./config/regions:/config/regions:ro
+      - ./config/sources:/config/sources:ro
+    networks: [egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KARTA_FETCHER_MEM_LIMIT:-256m}
+    cpus: ${KARTA_FETCHER_CPUS:-0.5}
+    pids_limit: 64
     restart: unless-stopped
     logging: *logging
 
@@ -189,10 +231,14 @@ networks:
   operator:
     driver_opts:
       com.docker.network.bridge.enable_ip_masquerade: "false"
+  # Only the fetcher joins it: its route to the online source.
+  egress: {}
 
 volumes:
   pgdata: {}
   staging: {}
+  # The fetcher's outbox: written by the fetcher, read-only for the publisher.
+  online: {}
 
 secrets:
   db_superuser_password:

@@ -176,11 +176,6 @@ func (f *Fetcher) recover() error {
 		}
 		newest = e
 	}
-	if d := f.state.Delivered; d != nil && f.deliveryPresent(d.Name) {
-		// A crash after the marker can leave the delivered bytes' partial
-		// file behind (it is a second link to the delivered snapshot).
-		_ = os.Remove(PartialPath(filepath.Join(f.cfg.Dir, PartialDirName), d.SnapshotSHA256))
-	}
 	if newest != nil && (f.state.Delivered == nil || newest.serial > f.state.Delivered.Serial) {
 		d, err := f.readDelivery(newest.name)
 		if err != nil {
@@ -192,6 +187,11 @@ func (f *Fetcher) recover() error {
 			}
 			f.log.Info("adopted a complete delivery left by an interrupted run", "name", d.Name)
 		}
+	}
+	if d := f.state.Delivered; d != nil && f.deliveryPresent(d.Name) {
+		// A crash after the marker can leave the delivered bytes' partial
+		// file behind (a second link to the delivered snapshot).
+		_ = os.Remove(PartialPath(filepath.Join(f.cfg.Dir, PartialDirName), d.SnapshotSHA256))
 	}
 	return nil
 }

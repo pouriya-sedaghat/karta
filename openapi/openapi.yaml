@@ -58,6 +58,10 @@ info:
     `410 release_expired`, `freshness.update_mode: manual`,
     `freshness.activated_at` and the `release_pinning` capability, and
     `manual_updates` became true (docs/adr/0003-stage2-publication.md).
+    Stage 3 added the `online` value of `freshness.update_mode`,
+    `freshness.stale_after_seconds` and `freshness.stale`, and
+    `online_updates` is true on deployments that enabled online updates
+    (docs/adr/0004-stage3-online-updates.md).
 
     **CORS.** Read-only `GET`/`HEAD` from origins listed in
     `KARTA_CORS_ALLOWED_ORIGINS` (exact origins or `*`); no credentials. Exposed
@@ -478,9 +482,17 @@ components:
           properties:
             update_mode:
               type: string
-              enum: [static, manual]
-              description: "`manual`: an operator publishes snapshots through the local inbox or the command line (Stage 2); online updates are not available. `static` was Stage 1's value."
+              enum: [static, manual, online]
+              description: "`online`: this deployment polls a configured, signed online source and publishes newer snapshots automatically (Stage 3); operators can still publish manually. `manual`: an operator publishes snapshots through the local inbox or the command line (Stage 2). `static` was Stage 1's value. The mode says how the data is kept current, not that a recent check succeeded: use `stale` and `osm_data_timestamp` for the data's age."
             osm_data_timestamp: { type: string, format: date-time }
+            stale_after_seconds:
+              type: integer
+              nullable: true
+              description: The deployment's configured staleness threshold; null when none is configured.
+            stale:
+              type: boolean
+              nullable: true
+              description: Whether `osm_data_timestamp` is older than `stale_after_seconds`; null when no threshold is configured. Computed from the data timestamp only.
             activated_at:
               type: string
               format: date-time

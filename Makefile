@@ -57,6 +57,13 @@ up: secrets data-dirs ## Start PostgreSQL, the API and the publisher (the API re
 	$(COMPOSE) up -d --wait db
 	$(COMPOSE) up -d api publisher
 
+.PHONY: up-online
+up-online: secrets data-dirs ## Start the stack with online updates (set KARTA_ONLINE_SOURCE_FILE in .env first; docs/runbook.md)
+	@{ test -n "$$KARTA_ONLINE_SOURCE_FILE" || grep -Eq '^KARTA_ONLINE_SOURCE_FILE=.+' .env 2>/dev/null; } || { \
+	  echo "Online updates are opt-in: set KARTA_ONLINE_SOURCE_FILE=/config/sources/NAME.json (a reviewed source file) in .env first." >&2; exit 2; }
+	$(COMPOSE) up -d --wait db
+	$(COMPOSE) --profile online up -d api publisher fetcher
+
 .PHONY: wait-ready
 wait-ready: ## Wait until /health/ready returns 200
 	@for i in $$(seq 1 60); do \
@@ -156,17 +163,23 @@ lint: ## gofmt, go vet, staticcheck, govulncheck, gosec, committed fixture check
 test: ## Unit tests (no Docker needed)
 	go test -race -count=1 ./...
 
+.PHONY: testsource
+testsource: ## Build the controlled HTTPS source image of the Stage 3 tests (test-only)
+	docker build $(BUILD_SECRET) -q -f tests/integration/sourceserver/Dockerfile -t karta-testsource:local . > /dev/null
+
 .PHONY: test-integration
-test-integration: secrets data-dirs ## Full-stack integration tests on an isolated compose project (committed fixtures only)
+test-integration: secrets data-dirs testsource ## Full-stack integration tests on an isolated compose project (committed fixtures, local controlled HTTPS source only)
 	@mkdir -p $(ARTIFACTS)
-	@inbox=$$(mktemp -d) && chmod 755 $$inbox && export KARTA_INBOX_HOST_DIR=$$inbox && \
-	  { $(TEST_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true; } && \
+	@tmp=$$(mktemp -d) && chmod 755 $$tmp && mkdir -m 755 $$tmp/inbox $$tmp/online $$tmp/sources $$tmp/docroot $$tmp/tls && \
+	  export KARTA_INBOX_HOST_DIR=$$tmp/inbox KARTA_ONLINE_HOST_DIR=$$tmp/online KARTA_TEST_SOURCE_CONFIG_DIR=$$tmp/sources \
+	    KARTA_TEST_SOURCE_DOCROOT=$$tmp/docroot KARTA_TEST_SOURCE_TLS_DIR=$$tmp/tls KARTA_TEST_UID=$$(id -u) KARTA_TEST_GID=$$(id -g) && \
+	  { $(TEST_COMPOSE) --profile online down -v --remove-orphans >/dev/null 2>&1 || true; } && \
 	  $(TEST_COMPOSE) up -d --wait db && $(TEST_COMPOSE) up -d api publisher && \
 	  KARTA_TEST_COMPOSE="$(TEST_COMPOSE)" KARTA_TEST_ARTIFACTS=$(CURDIR)/$(ARTIFACTS) \
-	    go test -tags integration -count=1 -timeout 30m -v $(if $(RUN),-run '$(RUN)') ./tests/integration/ ; \
-	  status=$$?; $(TEST_COMPOSE) logs --no-color api > $(CURDIR)/$(ARTIFACTS)/integration-api.log 2>&1 || true; \
-	  $(TEST_COMPOSE) logs --no-color publisher > $(CURDIR)/$(ARTIFACTS)/integration-publisher.log 2>&1 || true; \
-	  $(TEST_COMPOSE) down -v --remove-orphans; rm -rf -- "$$inbox"; exit $$status
+	    go test -tags integration -count=1 -timeout 45m -v $(if $(RUN),-run '$(RUN)') ./tests/integration/ ; \
+	  status=$$?; for s in api publisher fetcher source; do \
+	    $(TEST_COMPOSE) --profile online logs --no-color $$s > $(CURDIR)/$(ARTIFACTS)/integration-$$s.log 2>&1 || true; done; \
+	  $(TEST_COMPOSE) --profile online down -v --remove-orphans; rm -rf -- "$$tmp"; exit $$status
 
 .PHONY: test-browser
 test-browser: ## Render the demo in headless Chromium against the running stack (BASE_URL)

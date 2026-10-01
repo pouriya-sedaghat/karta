@@ -2,7 +2,8 @@
 #
 # Karta images. Every base image is pinned by manifest-list digest.
 #   target api       distroless, non-root: `karta serve` plus the demo assets
-#                    (also `karta operator`, the operator API client)
+#                    (also `karta operator`, the operator API client, and
+#                    `karta fetcher`, the opt-in online source poller)
 #   target importer  Ubuntu 24.04 + osm2pgsql 1.11.0, non-root: `karta import`
 #                    and `karta publisher` (entrypoint overridden in compose)
 #
@@ -36,11 +37,14 @@ COPY cmd/ cmd/
 COPY internal/ internal/
 COPY openapi/ openapi/
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/karta ./cmd/karta
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/karta ./cmd/karta \
+ && mkdir -p /out/online
 
 FROM ${RUNTIME_IMAGE} AS api
 COPY --from=build /out/karta /usr/local/bin/karta
 COPY --from=web /src/web/dist /opt/karta/web
+# The fetcher's outbox (a named volume takes this owner when first mounted).
+COPY --from=build --chown=65532:65532 /out/online /var/lib/karta/online
 ENV KARTA_WEB_DIR=/opt/karta/web
 USER 65532:65532
 EXPOSE 8080
@@ -54,7 +58,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin karta \
  && install -d -o 10001 -g 10001 -m 0700 /var/lib/karta/staging \
- && install -d -o root -g root -m 0755 /data/inbox
+ && install -d -o root -g root -m 0755 /data/inbox \
+ && install -d -o 65532 -g 65532 -m 0755 /data/online
 COPY --from=build /out/karta /usr/local/bin/karta
 USER 10001:10001
 WORKDIR /tmp

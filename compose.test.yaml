@@ -39,10 +39,17 @@ services:
       KARTA_OSM2PGSQL: ${KARTA_TEST_OSM2PGSQL:-osm2pgsql}
       # Fault injection (internal/failpoint): test-only.
       KARTA_FAILPOINTS: ${KARTA_TEST_FAILPOINTS:-}
+      # Online updates are off unless the Stage 3 suite turns them on.
+      KARTA_ONLINE_SOURCE_FILE: ${KARTA_TEST_ONLINE_SOURCE_FILE:-}
+      KARTA_DATA_STALE_AFTER: ${KARTA_TEST_STALE_AFTER:-}
     volumes: !override
       - ${KARTA_INBOX_HOST_DIR:?set by make test-integration}:/data/inbox:ro
       - ./config/regions:/config/regions:ro
       - ./tests/integration/slow-osm2pgsql.sh:/usr/local/bin/slow-osm2pgsql:ro
+      # The Stage 3 suite's source files (test keys, test CA) and the
+      # fetcher's outbox, both host directories the tests control.
+      - ${KARTA_TEST_SOURCE_CONFIG_DIR:?set by make test-integration}:/config/sources:ro
+      - ${KARTA_ONLINE_HOST_DIR:?set by make test-integration}:/data/online:ro
     tmpfs: !override
       - /tmp:size=1g,mode=1777
       - /var/lib/karta/staging:size=${KARTA_TEST_STAGING_SIZE:-64m},uid=10001,gid=10001,mode=0700
@@ -51,3 +58,55 @@ services:
   importer:
     environment:
       KARTA_RETAIN_RELEASES: "2"
+  # The fetcher only reaches the controlled test source: `sourcenet` is
+  # internal (no route out of Docker), so the suite cannot download from a
+  # live external host. It runs as the test user so the tests can inspect,
+  # tamper with and reset its outbox.
+  fetcher:
+    user: "${KARTA_TEST_UID:-65532}:${KARTA_TEST_GID:-65532}"
+    environment:
+      KARTA_ONLINE_SOURCE_FILE: ${KARTA_TEST_ONLINE_SOURCE_FILE:-/config/sources/online.json}
+      KARTA_REGION_FILE: /config/regions/fixture.json
+      KARTA_ONLINE_RESERVE_MB: "1"
+      KARTA_MAX_INPUT_MB: ${KARTA_TEST_FETCH_MAX_INPUT_MB:-64}
+      KARTA_FAILPOINTS: ${KARTA_TEST_FETCH_FAILPOINTS:-}
+    volumes: !override
+      - ${KARTA_ONLINE_HOST_DIR:?set by make test-integration}:/var/lib/karta/online
+      - ./config/regions:/config/regions:ro
+      - ${KARTA_TEST_SOURCE_CONFIG_DIR:?set by make test-integration}:/config/sources:ro
+    networks: !override [sourcenet]
+    # Names of local and private addresses, for the destination-policy tests.
+    extra_hosts:
+      - "loopback.test:127.0.0.1"
+      - "metadata.test:169.254.169.254"
+      - "lan.test:10.232.0.1"
+    restart: "no"
+  # The controlled HTTPS source (tests/integration/sourceserver), test-only.
+  source:
+    image: karta-testsource:local
+    profiles: [online]
+    environment:
+      SOURCE_DOCROOT: /docroot
+      SOURCE_TLS_CERT: /tls/server.pem
+      SOURCE_TLS_KEY: /tls/server-key.pem
+    volumes:
+      - ${KARTA_TEST_SOURCE_DOCROOT:?set by make test-integration}:/docroot:ro
+      - ${KARTA_TEST_SOURCE_TLS_DIR:?set by make test-integration}:/tls:ro
+    networks:
+      sourcenet:
+        aliases: [source.test, mirror.test]
+      sourcectl: {}
+    ports:
+      - "127.0.0.1:${KARTA_TEST_SOURCE_CTL_PORT:-18082}:8444"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+networks:
+  sourcenet:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${KARTA_TEST_SOURCE_SUBNET:-10.231.0.0/24}
+  sourcectl: {}
