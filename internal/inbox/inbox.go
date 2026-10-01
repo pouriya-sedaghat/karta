@@ -55,12 +55,17 @@ const (
 	SnapshotSuffix = ".osm.pbf"
 	SidecarSuffix  = ".osm.pbf.provenance.json"
 	MarkerSuffix   = ".osm.pbf.ready"
+	// ManifestSuffix is the signed manifest envelope of an online delivery
+	// (Stage 3). Only scans with ScanOptions.Manifests recognise it; the
+	// manual inbox ignores such files.
+	ManifestSuffix = ".osm.pbf.manifest.json"
 )
 
 // Limits.
 const (
-	MaxMarkerBytes  = 512
-	MaxSidecarBytes = 1 << 20
+	MaxMarkerBytes   = 512
+	MaxSidecarBytes  = 1 << 20
+	MaxManifestBytes = 64 << 10
 )
 
 // NamePattern restricts submission names.
@@ -78,6 +83,7 @@ const (
 	CodeEmpty             = "empty_file"
 	CodeInsufficientSpace = "insufficient_storage"
 	CodeIO                = "io_error"
+	CodeManifestMissing   = "manifest_missing"
 )
 
 // Rejection is a submission problem with a stable code.
@@ -123,6 +129,9 @@ type Entry struct {
 	Snapshot *FileState
 	Sidecar  *FileState
 	Marker   *FileState
+	// Manifest is the signed manifest of an online delivery (only listed
+	// by scans with ScanOptions.Manifests).
+	Manifest *FileState
 	// Problem is a rejection code for a submission that is structurally
 	// invalid (symlink, not a regular file, bad name); ProblemDetail says why.
 	Problem       string
@@ -136,6 +145,10 @@ func (e Entry) Complete() bool { return e.Marker != nil }
 func (e Entry) Fingerprint() string {
 	h := sha256.New()
 	fmt.Fprintf(h, "karta-inbox/1\x00%s\x00%s\x00%s\x00%s", e.Name, e.Snapshot.key(), e.Sidecar.key(), e.Marker.key())
+	if e.Manifest != nil {
+		// Only online deliveries have one; inbox fingerprints are unchanged.
+		fmt.Fprintf(h, "\x00manifest\x00%s", e.Manifest.key())
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -158,10 +171,20 @@ func stateOf(fi fs.FileInfo) *FileState {
 	return fs
 }
 
+// ScanOptions change what a scan recognises.
+type ScanOptions struct {
+	// Manifests lists NAME.osm.pbf.manifest.json files (the online
+	// fetcher's outbox).
+	Manifests bool
+}
+
 // Scan lists the submissions in dir, in name order, without opening any
 // file. At most limit directory entries are considered; more is an error so
 // a flooded inbox is reported rather than scanned partially.
-func Scan(dir string, limit int) ([]Entry, error) {
+func Scan(dir string, limit int) ([]Entry, error) { return ScanWith(dir, limit, ScanOptions{}) }
+
+// ScanWith is Scan with options.
+func ScanWith(dir string, limit int, opts ScanOptions) ([]Entry, error) {
 	d, err := os.Open(dir) // #nosec G304 -- the configured inbox directory
 	if err != nil {
 		return nil, err
@@ -182,6 +205,8 @@ func Scan(dir string, limit int) ([]Entry, error) {
 		var base string
 		var slot func(*Entry) **FileState
 		switch {
+		case opts.Manifests && strings.HasSuffix(n, ManifestSuffix):
+			base, slot = strings.TrimSuffix(n, ManifestSuffix), func(e *Entry) **FileState { return &e.Manifest }
 		case strings.HasSuffix(n, MarkerSuffix):
 			base, slot = strings.TrimSuffix(n, MarkerSuffix), func(e *Entry) **FileState { return &e.Marker }
 		case strings.HasSuffix(n, SidecarSuffix):
@@ -312,7 +337,10 @@ type Staged struct {
 	Dir          string
 	SnapshotPath string
 	// SidecarPath is "" when the submission has no sidecar.
-	SidecarPath  string
+	SidecarPath string
+	// ManifestPath is the staged signed manifest of an online delivery
+	// ("" otherwise).
+	ManifestPath string
 	SHA256       string
 	Size         int64
 	MarkerSHA256 string
@@ -323,6 +351,9 @@ type Options struct {
 	MaxSnapshotBytes int64
 	// ReserveBytes must remain free on the staging filesystem after the copy.
 	ReserveBytes int64
+	// RequireManifest refuses a submission without a signed manifest
+	// (online deliveries).
+	RequireManifest bool
 }
 
 // Stage copies a complete submission into a new directory under stagingDir
@@ -347,6 +378,12 @@ func Stage(dir string, e Entry, stagingDir, id string, opts Options) (st *Staged
 	}
 	if e.Sidecar != nil && e.Sidecar.Size > MaxSidecarBytes {
 		return nil, reject(CodeTooLarge, "the provenance sidecar is larger than %d bytes", MaxSidecarBytes)
+	}
+	if opts.RequireManifest && e.Manifest == nil {
+		return nil, reject(CodeManifestMissing, "the delivery has no signed manifest (%s)", e.Name+ManifestSuffix)
+	}
+	if e.Manifest != nil && e.Manifest.Size > MaxManifestBytes {
+		return nil, reject(CodeTooLarge, "the signed manifest is larger than %d bytes", MaxManifestBytes)
 	}
 	need := e.Snapshot.Size + opts.ReserveBytes
 	if e.Sidecar != nil {
@@ -383,6 +420,16 @@ func Stage(dir string, e Entry, stagingDir, id string, opts Options) (st *Staged
 		}
 		st.SidecarPath = filepath.Join(jobDir, "snapshot"+SidecarSuffix)
 		if err := writeNew(st.SidecarPath, b); err != nil {
+			return nil, err
+		}
+	}
+	if e.Manifest != nil && opts.RequireManifest {
+		b, err := readSmall(dir, e.Name+ManifestSuffix, e.Manifest, MaxManifestBytes)
+		if err != nil {
+			return nil, err
+		}
+		st.ManifestPath = filepath.Join(jobDir, "snapshot"+ManifestSuffix)
+		if err := writeNew(st.ManifestPath, b); err != nil {
 			return nil, err
 		}
 	}

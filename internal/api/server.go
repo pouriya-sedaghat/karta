@@ -30,6 +30,7 @@ import (
 
 	"github.com/pouriya-sedaghat/karta/internal/glyphs"
 	"github.com/pouriya-sedaghat/karta/internal/mvt"
+	"github.com/pouriya-sedaghat/karta/internal/registry"
 	"github.com/pouriya-sedaghat/karta/internal/release"
 	"github.com/pouriya-sedaghat/karta/internal/releaseid"
 	"github.com/pouriya-sedaghat/karta/internal/search"
@@ -265,6 +266,23 @@ type manifestFreshness struct {
 	UpdateMode    string  `json:"update_mode"`
 	DataTimestamp string  `json:"osm_data_timestamp"`
 	ActivatedAt   *string `json:"activated_at"`
+	// StaleAfterSeconds is the deployment's configured staleness threshold
+	// and Stale whether the data is older than it; both null when no
+	// threshold is configured. Computed from the data timestamp only.
+	StaleAfterSeconds *int64 `json:"stale_after_seconds"`
+	Stale             *bool  `json:"stale"`
+}
+
+// freshnessSource is implemented by release.Manager.
+type freshnessSource interface {
+	Freshness() registry.Freshness
+}
+
+func (s *Server) freshness() registry.Freshness {
+	if f, ok := s.releases.(freshnessSource); ok {
+		return f.Freshness()
+	}
+	return registry.Freshness{UpdateMode: "manual"}
 }
 
 func (s *Server) noRelease(w http.ResponseWriter, r *http.Request) {
@@ -295,6 +313,17 @@ func (s *Server) manifest(w http.ResponseWriter, r *http.Request) {
 	}
 	base := s.cfg.PublicBaseURL
 	ts := i.DataTimestamp.UTC().Format(time.RFC3339)
+	fresh := s.freshness()
+	mode := "manual"
+	if fresh.UpdateMode == "online" {
+		mode = "online"
+	}
+	mf := manifestFreshness{UpdateMode: mode, DataTimestamp: ts, ActivatedAt: activatedAt(rel)}
+	if fresh.StaleAfter != nil {
+		secs := int64(fresh.StaleAfter.Seconds())
+		stale := time.Since(i.DataTimestamp) > *fresh.StaleAfter
+		mf.StaleAfterSeconds, mf.Stale = &secs, &stale
+	}
 	writeJSON(w, r, http.StatusOK, cacheRevalid, manifestBody{
 		APIVersion: "1",
 		Release: manifestRelease{
@@ -319,9 +348,9 @@ func (s *Server) manifest(w http.ResponseWriter, r *http.Request) {
 		Capabilities: map[string]bool{
 			"vector_tiles": true, "place_search": true,
 			"address_geocoding": false, "reverse_geocoding": false, "routing": false,
-			"manual_updates": true, "online_updates": false, "release_pinning": true,
+			"manual_updates": true, "online_updates": mode == "online", "release_pinning": true,
 		},
-		Freshness: manifestFreshness{UpdateMode: "manual", DataTimestamp: ts, ActivatedAt: activatedAt(rel)},
+		Freshness: mf,
 	}, true)
 }
 

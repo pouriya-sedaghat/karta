@@ -1,9 +1,10 @@
 // Command karta runs the Karta map and place-search service.
 //
 //	karta serve                 serve the public HTTP API (configured by KARTA_* environment variables)
-//	karta publisher             watch the inbox, publish releases and serve the operator API
+//	karta publisher             watch the inbox (and online deliveries), publish releases and serve the operator API
+//	karta fetcher               poll the configured online source and deliver verified snapshots (opt-in)
 //	karta import [flags]        publish an OSM snapshot file through the same path as the inbox
-//	karta operator COMMAND      call the operator API (status, audit, authorize, revoke, activate, rollback, cleanup)
+//	karta operator COMMAND      call the operator API (status, audit, metrics, authorize, revoke, activate, rollback, cleanup, online-*)
 //	karta healthcheck [--live]  exit 0 if the local server is ready (or live)
 //	karta version               print the build version
 package main
@@ -29,8 +30,10 @@ import (
 	"github.com/pouriya-sedaghat/karta/internal/failpoint"
 	"github.com/pouriya-sedaghat/karta/internal/glyphs"
 	"github.com/pouriya-sedaghat/karta/internal/importer"
+	"github.com/pouriya-sedaghat/karta/internal/online"
 	"github.com/pouriya-sedaghat/karta/internal/operator"
 	"github.com/pouriya-sedaghat/karta/internal/publish"
+	"github.com/pouriya-sedaghat/karta/internal/region"
 	"github.com/pouriya-sedaghat/karta/internal/registry"
 	"github.com/pouriya-sedaghat/karta/internal/release"
 )
@@ -61,6 +64,8 @@ func main() {
 		os.Exit(serve())
 	case "publisher":
 		os.Exit(publisher())
+	case "fetcher":
+		os.Exit(fetcher())
 	case "import":
 		os.Exit(runImport(os.Args[2:]))
 	case "operator":
@@ -76,7 +81,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: karta serve | publisher | import --snapshot FILE --region FILE [flags] | operator COMMAND [flags] | healthcheck [--live] [--url URL] | version")
+	fmt.Fprintln(os.Stderr, "usage: karta serve | publisher | fetcher | import --snapshot FILE --region FILE [flags] | operator COMMAND [flags] | healthcheck [--live] [--url URL] | version")
 }
 
 func logger(level string) *slog.Logger {
@@ -229,6 +234,16 @@ func publisher() int {
 	pc := publicationConfig(cfg.Import, cfg.RegionFile, cfg.InboxDir)
 	pc.InboxPoll, pc.InboxSettle, pc.InboxMaxEntries, pc.AutoActivate = cfg.InboxPoll, cfg.InboxSettle, cfg.InboxMaxEntries, cfg.AutoActivate
 	pc.Fontstacks = g.Fontstacks()
+	pc.OnlineSourcePath, pc.OnlineDir, pc.StaleAfter = cfg.OnlineSourceFile, cfg.OnlineDir, cfg.StaleAfter
+	if cfg.OnlineSourceFile != "" {
+		src, err := checkSource(cfg.OnlineSourceFile, cfg.RegionFile)
+		if err != nil {
+			log.Error("online source", "file", cfg.OnlineSourceFile, "err", err)
+			return exitUsage
+		}
+		log.Info("online updates enabled", "source", cfg.OnlineSourceFile, "outbox", cfg.OnlineDir, "trusted_keys", src.KeyIDs(),
+			"require_operator_authorization", src.RequireOperatorAuthorization)
+	}
 	var svc *publish.Service
 	if err := retry(ctx, log, "connect and migrate the registry", func() (err error) {
 		svc, err = publish.New(ctx, pc, log)
@@ -241,6 +256,9 @@ func publisher() int {
 		_, err := svc.Recover(ctx, true)
 		return err
 	}); err != nil {
+		return exitOK
+	}
+	if err := retry(ctx, log, "record the update mode", func() error { return svc.Announce(ctx) }); err != nil {
 		return exitOK
 	}
 
@@ -278,6 +296,61 @@ func publisher() int {
 	_ = srv.Shutdown(shutdownCtx)
 	<-done
 	<-done
+	return exitOK
+}
+
+// checkSource loads the online source file and checks it belongs to the
+// region the process serves.
+func checkSource(sourceFile, regionFile string) (*online.Source, error) {
+	src, err := online.LoadSource(sourceFile)
+	if err != nil {
+		return nil, err
+	}
+	reg, err := region.Load(regionFile)
+	if err != nil {
+		return nil, err
+	}
+	if src.RegionID != reg.ID {
+		return nil, fmt.Errorf("the source is for region %q, but %s is region %q", src.RegionID, regionFile, reg.ID)
+	}
+	return src, nil
+}
+
+// fetcher runs the online source poller. It has no database credential and
+// no listener: it writes verified deliveries into its outbox, which the
+// publisher reads.
+func fetcher() int {
+	cfg, err := config.LoadFetcher(os.Getenv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "karta fetcher: invalid configuration:\n%v\n", err)
+		return exitUsage
+	}
+	log := logger(cfg.LogLevel).With("service", "karta-fetcher", "version", version)
+	logFailpoints(log)
+	src, err := checkSource(cfg.SourceFile, cfg.RegionFile)
+	if err != nil {
+		log.Error("online source", "file", cfg.SourceFile, "err", err)
+		return exitUsage
+	}
+	lock, err := online.LockOutbox(cfg.Dir)
+	if err != nil {
+		log.Error("outbox", "err", err)
+		return exitFailure
+	}
+	defer lock.Close()
+	f, err := online.NewFetcher(online.FetcherConfig{SourcePath: cfg.SourceFile, RegionPath: cfg.RegionFile, Dir: cfg.Dir,
+		MaxInputBytes: cfg.MaxInputBytes, ReserveBytes: cfg.ReserveBytes, MaxFutureSkew: cfg.MaxFutureSkew, Version: version}, log)
+	if err != nil {
+		log.Error("prepare outbox", "dir", cfg.Dir, "err", err)
+		return exitFailure
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	u := src.ManifestURLParsed()
+	log.Info("fetcher ready", "manifest", u.Scheme+"://"+u.Host+u.EscapedPath(), "region", src.RegionID, "outbox", cfg.Dir,
+		"trusted_keys", src.KeyIDs(), "poll_interval", src.PollInterval.D().String(), "allowed_networks", src.AllowedNetworks)
+	f.Run(ctx)
+	log.Info("fetcher stopped; a download in progress resumes at the next start")
 	return exitOK
 }
 
@@ -389,7 +462,8 @@ func runOperator(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: karta operator status | audit [--limit N] [--before-id N] | authorize --sha256 HEX [--size N] [--expires RFC3339] --reason TEXT |\n"+
 			"  revoke --sha256 HEX --reason TEXT | activate --release ID --reason TEXT [--expected ID|none] |\n"+
-			"  rollback [--release ID] --reason TEXT [--expected ID|none] | cleanup --reason TEXT [--dry-run]")
+			"  rollback [--release ID] --reason TEXT [--expected ID|none] | cleanup --reason TEXT [--dry-run] | metrics |\n"+
+			"  online-pause --reason TEXT | online-resume --reason TEXT | online-retry --reason TEXT")
 		return exitUsage
 	}
 	cmd := args[0]
@@ -472,6 +546,10 @@ func runOperator(args []string) int {
 		method, path, body = http.MethodPost, "/v1/operator/rollback", b
 	case "cleanup":
 		method, path, body = http.MethodPost, "/v1/operator/cleanup", map[string]any{"reason": *reason, "dry_run": *dryRun}
+	case "metrics":
+		method, path = http.MethodGet, "/v1/operator/metrics"
+	case "online-pause", "online-resume", "online-retry":
+		method, path, body = http.MethodPost, "/v1/operator/online/"+cmd[len("online-"):], map[string]any{"reason": *reason}
 	default:
 		fmt.Fprintf(os.Stderr, "karta operator: unknown command %q\n", cmd)
 		return exitUsage

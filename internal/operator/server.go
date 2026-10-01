@@ -35,6 +35,10 @@ type Service interface {
 	Activate(ctx context.Context, p publish.Principal, a publish.ActionRequest) (registry.ActivateResult, error)
 	Rollback(ctx context.Context, p publish.Principal, a publish.ActionRequest) (registry.ActivateResult, error)
 	Cleanup(ctx context.Context, p publish.Principal, reason string, dryRun bool) (publish.CleanupResult, error)
+	OnlinePause(ctx context.Context, p publish.Principal, reason string) (publish.OnlinePolicyResult, error)
+	OnlineResume(ctx context.Context, p publish.Principal, reason string) (publish.OnlinePolicyResult, error)
+	OnlineRetry(ctx context.Context, p publish.Principal, reason string) (publish.OnlineRetryResult, error)
+	Metrics(ctx context.Context) ([]byte, error)
 	AuditDenied(ctx context.Context, p publish.Principal, action, reason string)
 	Ping(ctx context.Context) error
 }
@@ -69,6 +73,8 @@ const (
 	CodeTimeout            = "timeout"
 	CodeServiceUnavailable = "service_unavailable"
 	CodeInternal           = "internal_error"
+	CodeOnlineDisabled     = "online_disabled"
+	CodeNothingToRetry     = "nothing_to_retry"
 )
 
 // Server is the operator HTTP API.
@@ -101,6 +107,10 @@ func New(creds []Credential, svc Service, log *slog.Logger, timeout time.Duratio
 	mux.Handle("POST /v1/operator/releases/{release_id}/activate", s.auth(ScopePublish, "activate", s.activate))
 	mux.Handle("POST /v1/operator/rollback", s.auth(ScopeRollback, "rollback", s.rollback))
 	mux.Handle("POST /v1/operator/cleanup", s.auth(ScopeCleanup, "cleanup", s.cleanup))
+	mux.Handle("GET /v1/operator/metrics", s.auth(ScopeStatus, "metrics", s.metrics))
+	mux.Handle("POST /v1/operator/online/pause", s.auth(ScopePublish, "online_pause", s.onlinePolicy(false)))
+	mux.Handle("POST /v1/operator/online/resume", s.auth(ScopePublish, "online_resume", s.onlinePolicy(true)))
+	mux.Handle("POST /v1/operator/online/retry", s.auth(ScopePublish, "online_retry", s.onlineRetry))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, CodeNotFound, "no such operator resource")
 	})
@@ -285,6 +295,10 @@ func (s *Server) serviceError(w http.ResponseWriter, r *http.Request, err error)
 		writeError(w, r, http.StatusConflict, CodeBusy, err.Error())
 	case errors.Is(err, publish.ErrNoRollbackTarget):
 		writeError(w, r, http.StatusConflict, CodeNoRollbackTarget, err.Error())
+	case errors.Is(err, publish.ErrOnlineDisabled):
+		writeError(w, r, http.StatusConflict, CodeOnlineDisabled, err.Error())
+	case errors.Is(err, publish.ErrNothingToRetry):
+		writeError(w, r, http.StatusConflict, CodeNothingToRetry, err.Error())
 	case errors.Is(err, publish.ErrPolicy):
 		writeErrorReason(w, r, http.StatusConflict, CodePolicyRefused, publish.PolicyCode(err), err.Error())
 	case errors.Is(err, context.DeadlineExceeded):
@@ -558,4 +572,60 @@ func (s *Server) cleanup(w http.ResponseWriter, r *http.Request, c *Credential) 
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) metrics(w http.ResponseWriter, r *http.Request, _ *Credential) {
+	if r.URL.RawQuery != "" {
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "this endpoint takes no query parameters")
+		return
+	}
+	b, err := s.svc.Metrics(r.Context())
+	if err != nil {
+		s.serviceError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
+}
+
+func (s *Server) onlinePolicy(resume bool) handler {
+	return func(w http.ResponseWriter, r *http.Request, c *Credential) {
+		var b reasonBody
+		if !decode(w, r, &b) {
+			return
+		}
+		reason, ok := validReason(w, r, b.Reason)
+		if !ok {
+			return
+		}
+		f := s.svc.OnlinePause
+		if resume {
+			f = s.svc.OnlineResume
+		}
+		res, err := f(r.Context(), principal(r, c), reason)
+		if err != nil {
+			s.serviceError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	}
+}
+
+func (s *Server) onlineRetry(w http.ResponseWriter, r *http.Request, c *Credential) {
+	var b reasonBody
+	if !decode(w, r, &b) {
+		return
+	}
+	reason, ok := validReason(w, r, b.Reason)
+	if !ok {
+		return
+	}
+	res, err := s.svc.OnlineRetry(r.Context(), principal(r, c), reason)
+	if err != nil {
+		s.serviceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"queued": res})
 }

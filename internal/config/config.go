@@ -77,6 +77,25 @@ type Publisher struct {
 	OperatorListenAddr     string
 	OperatorTokensFile     string
 	OperatorRequestTimeout time.Duration
+	// OnlineSourceFile enables online updates: the source file whose
+	// trusted keys verify deliveries ("" = online updates off, the default).
+	OnlineSourceFile string
+	// OnlineDir is the fetcher's outbox, mounted read-only.
+	OnlineDir string
+	// StaleAfter is the data age after which the active release counts as
+	// stale (0 = no threshold configured).
+	StaleAfter time.Duration
+}
+
+// Fetcher configures `karta fetcher`, the online source poller.
+type Fetcher struct {
+	SourceFile    string
+	RegionFile    string
+	Dir           string
+	MaxInputBytes int64
+	ReserveBytes  int64
+	MaxFutureSkew time.Duration
+	LogLevel      string
 }
 
 // OperatorClient configures `karta operator`.
@@ -282,7 +301,53 @@ func LoadPublisher(getenv func(string) string) (Publisher, error) {
 	if c.InboxDir == "" {
 		r.errs = append(r.errs, errors.New("KARTA_INBOX_DIR is required"))
 	}
+	c.OnlineSourceFile = r.str("KARTA_ONLINE_SOURCE_FILE", "")
+	c.OnlineDir = r.str("KARTA_ONLINE_DIR", "")
+	if c.OnlineSourceFile != "" {
+		r.regular("KARTA_ONLINE_SOURCE_FILE", c.OnlineSourceFile)
+		if c.OnlineDir == "" {
+			r.errs = append(r.errs, errors.New("KARTA_ONLINE_DIR is required when KARTA_ONLINE_SOURCE_FILE is set (the fetcher's outbox)"))
+		} else {
+			r.dir("KARTA_ONLINE_DIR", c.OnlineDir)
+		}
+	}
+	c.StaleAfter = r.dur("KARTA_DATA_STALE_AFTER", 0, 0, 366*24*time.Hour)
 	return c, errors.Join(r.errs...)
+}
+
+// LoadFetcher reads the fetcher configuration.
+func LoadFetcher(getenv func(string) string) (Fetcher, error) {
+	r := &reader{getenv: getenv}
+	c := Fetcher{
+		SourceFile:    r.str("KARTA_ONLINE_SOURCE_FILE", ""),
+		RegionFile:    r.str("KARTA_REGION_FILE", ""),
+		Dir:           r.dir("KARTA_ONLINE_DIR", ""),
+		MaxInputBytes: int64(r.int("KARTA_MAX_INPUT_MB", 4096, 1, 1<<22)) << 20,
+		ReserveBytes:  int64(r.int("KARTA_ONLINE_RESERVE_MB", 64, 0, 1<<22)) << 20,
+		MaxFutureSkew: r.dur("KARTA_MAX_FUTURE_SKEW", 10*time.Minute, 0, 24*time.Hour),
+		LogLevel:      r.logLevel(),
+	}
+	for _, v := range []struct{ key, val string }{
+		{"KARTA_ONLINE_SOURCE_FILE", c.SourceFile}, {"KARTA_REGION_FILE", c.RegionFile}, {"KARTA_ONLINE_DIR", c.Dir},
+	} {
+		if v.val == "" {
+			r.errs = append(r.errs, fmt.Errorf("%s is required", v.key))
+		}
+	}
+	if c.SourceFile != "" {
+		r.regular("KARTA_ONLINE_SOURCE_FILE", c.SourceFile)
+	}
+	if c.RegionFile != "" {
+		r.regular("KARTA_REGION_FILE", c.RegionFile)
+	}
+	return c, errors.Join(r.errs...)
+}
+
+// regular checks that a configured path is a readable regular file.
+func (r *reader) regular(key, path string) {
+	if st, err := os.Stat(path); err != nil || !st.Mode().IsRegular() {
+		r.errs = append(r.errs, fmt.Errorf("%s=%q is not a readable file", key, path))
+	}
 }
 
 // LoadOperatorClient reads the operator client configuration.

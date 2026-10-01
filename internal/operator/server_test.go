@@ -66,6 +66,22 @@ func (f *fakeService) Cleanup(_ context.Context, p publish.Principal, reason str
 	f.record("cleanup")
 	return publish.CleanupResult{DryRun: dry}, f.err
 }
+func (f *fakeService) OnlinePause(_ context.Context, p publish.Principal, reason string) (publish.OnlinePolicyResult, error) {
+	f.record("online_pause " + p.Name + " " + reason)
+	return publish.OnlinePolicyResult{Changed: true, Policy: &registry.OnlinePolicy{RegionID: "fixture"}}, f.err
+}
+func (f *fakeService) OnlineResume(_ context.Context, p publish.Principal, reason string) (publish.OnlinePolicyResult, error) {
+	f.record("online_resume " + p.Name + " " + reason)
+	return publish.OnlinePolicyResult{Changed: true, Policy: &registry.OnlinePolicy{RegionID: "fixture", AutoActivate: true}}, f.err
+}
+func (f *fakeService) OnlineRetry(_ context.Context, p publish.Principal, reason string) (publish.OnlineRetryResult, error) {
+	f.record("online_retry " + p.Name + " " + reason)
+	return publish.OnlineRetryResult{SubmissionID: 7, Name: "fixture-s000000000001-0123456789ab", State: "failed"}, f.err
+}
+func (f *fakeService) Metrics(context.Context) ([]byte, error) {
+	f.record("metrics")
+	return []byte("# HELP karta_online_enabled x\n# TYPE karta_online_enabled gauge\nkarta_online_enabled 1\n"), f.err
+}
 func (f *fakeService) AuditDenied(_ context.Context, p publish.Principal, action, reason string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -276,5 +292,56 @@ func TestLiveNeedsNoToken(t *testing.T) {
 	h, _, _ := setup(t)
 	if rec := do(t, h, "GET", "/health/live", "", "", nil); rec.Code != 200 {
 		t.Fatalf("%d", rec.Code)
+	}
+}
+
+func TestOnlineEndpoints(t *testing.T) {
+	h, svc, _ := setup(t)
+	for _, c := range []struct {
+		name, method, path, token, body string
+		status                          int
+		code, call                      string
+	}{
+		{"monitor cannot pause", "POST", "/v1/operator/online/pause", monitorToken, `{"reason":"x"}`, 403, CodeForbidden, ""},
+		{"monitor cannot resume", "POST", "/v1/operator/online/resume", monitorToken, `{"reason":"x"}`, 403, CodeForbidden, ""},
+		{"monitor cannot retry", "POST", "/v1/operator/online/retry", monitorToken, `{"reason":"x"}`, 403, CodeForbidden, ""},
+		{"pause needs a reason", "POST", "/v1/operator/online/pause", adminToken, `{}`, 400, CodeInvalidRequest, ""},
+		{"pause rejects unknown fields", "POST", "/v1/operator/online/pause", adminToken, `{"reason":"x","force":true}`, 400, CodeInvalidRequest, ""},
+		{"pause", "POST", "/v1/operator/online/pause", adminToken, `{"reason":"provider incident"}`, 200, "", "online_pause operator provider incident"},
+		{"resume", "POST", "/v1/operator/online/resume", adminToken, `{"reason":"fixed"}`, 200, "", "online_resume operator fixed"},
+		{"retry", "POST", "/v1/operator/online/retry", adminToken, `{"reason":"disk freed"}`, 200, "", "online_retry operator disk freed"},
+		{"metrics need a token", "GET", "/v1/operator/metrics", "", "", 401, CodeUnauthenticated, ""},
+		{"metrics take no query", "GET", "/v1/operator/metrics?x=1", monitorToken, "", 400, CodeInvalidRequest, ""},
+		{"monitor reads metrics", "GET", "/v1/operator/metrics", monitorToken, "", 200, "", "metrics"},
+	} {
+		svc.calls = nil
+		rec := do(t, h, c.method, c.path, c.token, c.body, nil)
+		if rec.Code != c.status || (c.code != "" && code(t, rec) != c.code) {
+			t.Errorf("%s: %d %s", c.name, rec.Code, rec.Body)
+		}
+		if c.call != "" && (len(svc.calls) != 1 || svc.calls[0] != c.call) {
+			t.Errorf("%s: calls %v", c.name, svc.calls)
+		}
+		if c.call == "" && len(svc.calls) != 0 {
+			t.Errorf("%s: the service was called: %v", c.name, svc.calls)
+		}
+	}
+	rec := do(t, h, "GET", "/v1/operator/metrics", monitorToken, "", nil)
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; version=0.0.4; charset=utf-8" || !strings.Contains(rec.Body.String(), "karta_online_enabled 1") {
+		t.Errorf("metrics: %q %s", ct, rec.Body)
+	}
+	for _, c := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{publish.ErrOnlineDisabled, 409, CodeOnlineDisabled},
+		{publish.ErrNothingToRetry, 409, CodeNothingToRetry},
+	} {
+		svc.err = c.err
+		rec := do(t, h, "POST", "/v1/operator/online/retry", adminToken, `{"reason":"x"}`, nil)
+		if rec.Code != c.status || code(t, rec) != c.code {
+			t.Errorf("%v: %d %s", c.err, rec.Code, rec.Body)
+		}
 	}
 }
