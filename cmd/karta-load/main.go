@@ -358,7 +358,9 @@ func run(ctx context.Context, o options) (Summary, error) {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			r := rand.New(rand.NewPCG(o.seed, uint64(w)))
+			// A seeded generator makes the request pattern repeatable; it is
+			// not used for anything secret.
+			r := rand.New(rand.NewPCG(o.seed, uint64(w))) // #nosec G115 G404 -- w is a worker index >= 0; repeatable load, not security
 			for {
 				if tokens != nil {
 					select {
@@ -386,7 +388,7 @@ func run(ctx context.Context, o options) (Summary, error) {
 						_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body)
 					}
 					_, _ = io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
+					_ = resp.Body.Close()
 					if body.ReleaseID != "" {
 						rec.mu.Lock()
 						rec.releases[body.ReleaseID] = true

@@ -1,4 +1,4 @@
-# Data flow, trust boundaries and security assumptions (Stage 3)
+# Data flow, trust boundaries and security assumptions (Stage 4)
 
 ```mermaid
 flowchart LR
@@ -22,6 +22,11 @@ flowchart LR
         API["API (distroless, UID 65532, read-only FS)"]
     end
     STG[("staging volume<br/>0700, publisher only")]
+    subgraph "Docker network: monitoring (opt-in, no NAT)"
+        PROM["Prometheus (nobody, read-only FS)<br/>scrapes with the monitoring token"]
+        EXP["postgres-exporter (nobody)<br/>role karta_monitor: statistics only"]
+    end
+    BK[("backups (host, 0700)<br/>cluster base backup, outbox, config;<br/>no secrets")]
     Client["Browser / core / apps"]
     INBOX --> PUB
     FET -- "HTTPS, TLS verified, no redirects,<br/>public or allowed addresses only" --> SRC
@@ -35,6 +40,9 @@ flowchart LR
     PUB & IMP -- "karta_importer: CREATE DATABASE, candidates, registry" --> DB
     API -- "karta_api: read-only, 3 s statements" --> DB
     Client -- "HTTP GET only, 127.0.0.1:8080 by default" --> API
+    PROM -- "bearer, scope status: API :9464 /metrics, operator /v1/operator/metrics" --> API & PUB
+    PROM --> EXP -- "karta_monitor: pg_monitor, read-only" --> DB
+    DB -. "scripts/backup.sh (host, Docker access): pg_basebackup" .-> BK
 ```
 
 ## Trust boundaries
@@ -52,6 +60,10 @@ flowchart LR
 | Publisher/importer → database | importer role | not a superuser: `CREATEDB` only; it owns the registry and the release databases it creates; PostGIS comes from a template created at initialisation; the audit table rejects updates, deletes and truncation by trigger (the owner could drop the trigger: this protects against mistakes and application bugs, not against a compromised publisher) |
 | API → database | nobody: API input is untrusted | `karta_api` is a member of `karta_reader` with `CONNECT` + `SELECT`/`EXECUTE` only (registry: releases, active pointer and schema version; not submissions, authorizations or audit); sessions default read-only at the role, the release database and the connection; `statement_timeout` 3 s (connection) and 5 s (role); only parameterized SQL; release databases are frozen `default_transaction_read_only = on` after import; a release is served only while the serving toolchain equals the recorded one (checked on every new connection) |
 | Client → API | untrusted | `GET`/`HEAD`/`OPTIONS` only, bodies rejected, 16 KiB header limit, 5 s header / 10 s read / request deadline, strict parameter validation (unknown or repeated parameters rejected, UTF-8 and control characters checked, bounded lengths and numbers), LIKE metacharacters removed by normalization and escaped again, errors without internal details, access logs without query strings |
+| Monitoring → metrics | holders of the monitoring credential (scope `status`) | API metrics on a separate listener (`KARTA_METRICS_LISTEN_ADDR`), never the public one (`/metrics` there is 404); bearer token checked against hashes in `metrics_tokens`, re-read when the file changes (old token refused at once); refusals logged at most once a minute; bounded labels only (fixed route names, status classes, release ids, error codes: no paths, queries, client addresses or search terms); loopback by default, TLS proxy otherwise |
+| Exporter → database | the exporter is trusted with statistics only | role `karta_monitor`: `pg_monitor`, `CONNECT` to `postgres` only, read-only sessions, 5 s statements, 3 connections; no table data; no route out (`monitoring` has no NAT) |
+| Backups → their storage | whoever can read the backup directory | 0700 directory, 0600 files; secrets excluded (fingerprints only); `SHA256SUMS` and `pg_verifybackup` checked before a restore changes anything; the backup still holds password verifiers, the audit log and all data, so it must be encrypted and access-limited like the secrets |
+| Backup → restored registry | the backup, after verification | restore order fixed (verify, secrets, refuse to overwrite without `--replace`, database, passwords from current secrets, outbox, `restore-check`, serving); `restore-check` verifies schema, release databases (present, read-only), the active release, the append-only audit table, and the pointer, releases, audit history and anti-replay floor against the summaries taken at backup time; only then it pauses automatic online activation and audits the restored pointer (`restore`) in one transaction |
 | Browser → demo | untrusted page context | CSP `default-src 'none'` with `script-src`/`connect-src` `'self'`, `frame-ancestors 'none'`; MapLibre and fonts served locally; no CDN, OSM tile or Nominatim access |
 
 ## Network exposure
@@ -79,6 +91,13 @@ flowchart LR
   default routes (`scripts/check-isolated.sh`, with a negative control on a
   frontend-like network), and checks the result from the browser's point of
   view too.
+* The API's metrics listener (`:9464`) and the opt-in monitoring profile
+  (exporter `:9187`, Prometheus `:9090`) publish on `KARTA_METRICS_BIND`
+  (127.0.0.1 by default). Metrics need the monitoring credential; the
+  exporter exposes statistics without authentication and Prometheus has
+  no authentication of its own, so keep both on loopback or behind an
+  authenticating TLS proxy. The `monitoring` network has IP masquerading
+  disabled: neither container has a route out.
 * CORS is off unless origins are listed in `KARTA_CORS_ALLOWED_ORIGINS`;
   credentials are never allowed.
 
@@ -100,7 +119,13 @@ receives). See docs/runbook.md, "Credentials", for adding credentials and
 rotation. The secret files
 are 0644 inside a 0700 directory so the non-root container users can read the
 bind-mounted files; on shared hosts or in production use the orchestrator's
-secret store with per-service ownership. The database uses SCRAM-SHA-256.
+secret store with per-service ownership (docs/operations.md, "Production
+secret distribution"). The database uses SCRAM-SHA-256. Every service reads
+its database password file for each new connection, so
+`scripts/rotate-db-password.sh` rotates a role's password without a restart
+(the file is rewritten in place, as a bind mount keeps the original inode).
+`metrics_tokens` holds only the monitoring credential's hash. Backups never
+contain a secret value, only SHA-256 fingerprints.
 
 ## Containers
 
@@ -114,7 +139,13 @@ limited to 4 GiB / 2 CPUs / 256 PIDs. Fetcher (opt-in): the distroless API
 image, UID 65532, read-only root filesystem, all capabilities dropped,
 `no-new-privileges`, 256 MiB / 0.5 CPU / 64 PIDs, writes only its outbox
 volume. PostgreSQL: official PostGIS image (drops to the `postgres` user),
-`no-new-privileges`, memory/CPU/PID limits. All images are pinned by digest.
+`no-new-privileges`, memory/CPU/PID limits. Monitoring (opt-in): the
+upstream exporter and Prometheus images, as `nobody`, read-only root, all
+capabilities dropped, `no-new-privileges`, 128 MiB / 0.25 CPU / 32 PIDs and
+512 MiB / 0.5 CPU / 64 PIDs. All images are pinned by digest. The publisher
+and the importer run `docker-init` as PID 1 (Compose `init: true`), which
+reaps any orphaned process. Karta also stops osm2pgsql's whole process group
+at a publication's deadline or cancellation (Stage 4).
 
 ## Threat model: publication (Stage 2)
 
@@ -153,6 +184,20 @@ volume. PostgreSQL: official PostGIS image (drops to the `postgres` user),
 | Source credentials leak | bearer token only from a secret file, only in the `Authorization` header to allowed hosts, never in URLs (queries and userinfo refused), logs, status or the public API (tested) | the token file on the host |
 | Source outages block manual publication or serving | the fetcher is a separate process; the inbox, the CLI importer and serving do not depend on it (tested with the network cut and the source stopped) | — |
 
+## Threat model: operations (Stage 4)
+
+| Threat | Mitigation | Residual risk |
+| --- | --- | --- |
+| A hung or endlessly slow import (crafted input, stuck SQL, a descendant holding the output pipe) blocks publication forever | whole-publication deadline (`KARTA_PUBLISH_TIMEOUT`): statements cancelled, osm2pgsql's process group killed, output reading bounded, orphans reaped by `docker-init`; final `publication_timeout`, not retried automatically; overrun alert | a deadline set too high delays the next publication by that long; serving is never affected |
+| Metrics disclose sensitive data | separate listener and scoped credential; labels bounded and free of paths, queries, client addresses and search terms | the monitoring credential also reads operator status (digests, submission names, audit reasons; no secrets) |
+| A monitoring token leaks | it has scope `status` only (no publish, rollback, authorization or cleanup); rotation without restarting the API | until rotated it can read status and metrics |
+| Monitoring goes silent (publisher stopped, target removed) | alerts on a down target and on a missing target (`absent`); data age, not check success, drives freshness | alert delivery is not configured (owner decision); a stopped Prometheus alerts nobody |
+| Backup stolen | no secret values in it; 0700/0600; documented requirement to encrypt and restrict | it contains password verifiers (SCRAM, salted), the audit log and all data: its storage must be protected like the secrets |
+| Tampered or corrupted backup restored | `SHA256SUMS` and `pg_verifybackup` before anything changes (tested with a damaged file and with rewritten sums); restore-check after | an attacker who can rewrite both the archive and its sums *consistently* (a valid but altered cluster) is caught only by restore-check's comparisons with the summaries, which are in the same backup: protect backups' integrity |
+| Restoring an older registry replays an older pointer or lowers the online anti-replay floor | the restored pointer is audited (`restore`); automatic online activation is paused until an operator checks the producer's serial; a fetcher serial above the registry's is reported, never reset silently | an operator who resumes without checking |
+| A restore runs over live data by mistake | refused without `--replace` | — |
+| Rotation outage or lockout | passwords verified by a TCP login after the change; in-place writes; the old password is refused at once and the new one is used for every new connection | a failure between `ALTER ROLE` and the file write needs the superuser to set it again (`rotate-db-password.sh --current`) |
+
 ## Known limitations
 
 * No TLS inside the Docker network (`KARTA_DB_SSLMODE=disable`); set
@@ -169,3 +214,12 @@ volume. PostgreSQL: official PostGIS image (drops to the `postgres` user),
 * The operator API has no TLS and no per-client rate limiting of its own;
   bind it to loopback (the default) or put a TLS proxy with access control in
   front.
+* Operator tokens are read by the publisher at start: rotating them
+  recreates the publisher (a running publication is recorded `interrupted`
+  and retried). The API's metrics credential rotates without a restart.
+* Backups, restores and rotations run on the host with Docker access, which
+  is root-equivalent; a separate backup identity (a replication-only role
+  on a backup host) belongs with the owner's choice of backup destination.
+* Prometheus and the exporter have no authentication of their own, and no
+  alert destination is configured: both are deployment decisions
+  (docs/operations.md, "Owner inputs").

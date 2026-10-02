@@ -17,7 +17,17 @@ The contract is [`openapi/openapi.yaml`](../openapi/openapi.yaml) (also served a
 Publication, rollback and cleanup are **not** part of this API: they are the
 operator API ([`openapi/operator.yaml`](../openapi/operator.yaml)), served by
 the publisher on its own port with bearer-token authentication
-(`docs/runbook.md`, "Operator API").
+(`docs/runbook.md`, "Operator API"). Metrics are not part of it either: the
+API process exports them on a separate listener (`KARTA_METRICS_LISTEN_ADDR`,
+`:9464` in Compose), and only to the monitoring credential
+(`docs/operations.md`, "Monitoring"). The public listener answers
+`/metrics` with `404`.
+
+**Attribution.** The data is OpenStreetMap data under the ODbL. Show the
+manifest's `attribution` (`html` or `text`, linking to `license_url`) with
+every map or search result you display. The style's source carries the same
+attribution, so MapLibre's attribution control shows it by default
+(`docs/licenses.md`).
 
 ## Releases and pinning
 

@@ -539,6 +539,12 @@ func TestOperations(t *testing.T) {
 		// rotate-operator-tokens recreates it).
 		restartPublisher(t, nil)
 		status(t)
+		if r := op(t, http.MethodGet, "/v1/operator/status", newMon, nil); r.status != 200 {
+			t.Errorf("the publisher refuses the new monitoring token: %d", r.status)
+		}
+		if r := op(t, http.MethodGet, "/v1/operator/status", oldMon, nil); r.status != 401 {
+			t.Errorf("the publisher accepts the revoked monitoring token: %d", r.status)
+		}
 	})
 
 	t.Run("a backup restores the registry, every retained release, the audit history, the anti-replay state and the outbox", func(t *testing.T) {
@@ -719,6 +725,37 @@ func TestOperations(t *testing.T) {
 				time.Sleep(time.Second)
 			}
 			expectStatus(t, get(t, "/v1/releases/"+active+lakeTile), http.StatusOK)
+
+			// Refused before anything changes: a restore over a database
+			// without --replace, a damaged file, and a damaged base backup
+			// whose SHA256SUMS was rewritten to match.
+			if out, code := script(t, "restore.sh", pre); code == 0 || !strings.Contains(out, "holds a database; add --replace") {
+				t.Errorf("restore over a database without --replace: %d %s", code, out)
+			}
+			damaged := filepath.Join(t.TempDir(), "damaged")
+			if out, err := exec.Command("cp", "-a", pre, damaged).CombinedOutput(); err != nil {
+				t.Fatalf("copy backup: %v %s", err, out)
+			}
+			base := filepath.Join(damaged, "db", "base.tar.gz")
+			b, err := os.ReadFile(base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b[len(b)/2] ^= 0xff
+			if err := os.WriteFile(base, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if out, code := script(t, "restore.sh", damaged, "--replace"); code == 0 || !strings.Contains(out, "do not match SHA256SUMS") {
+				t.Errorf("restore of a damaged backup: %d %s", code, out)
+			}
+			if out, err := exec.Command("sh", "-c", `cd "$1" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS`, "sh", damaged).CombinedOutput(); err != nil {
+				t.Fatalf("rewrite SHA256SUMS: %v %s", err, out)
+			}
+			if out, code := script(t, "restore.sh", damaged, "--replace"); code == 0 || !strings.Contains(out, "pg_verifybackup refused") {
+				t.Errorf("restore of a damaged base backup: %d %s", code, out)
+			}
+			expectStatus(t, get(t, "/v1/releases/"+active+lakeTile), http.StatusOK)
+
 			if out, code := script(t, "restore.sh", pre, "--replace"); code != 0 {
 				t.Fatalf("restore: %s", out)
 			}

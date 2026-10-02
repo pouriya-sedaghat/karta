@@ -311,7 +311,18 @@ paths:
         (only with a staleness threshold), `karta_online_last_success_timestamp_seconds`,
         `karta_online_next_attempt_timestamp_seconds`,
         `karta_online_consecutive_failures`, `karta_online_fetcher_state_age_seconds`,
-        `karta_online_verified_serial`, `karta_submissions{source,state}`.
+        `karta_online_verified_serial`, `karta_submissions{source,state}`,
+        `karta_staging_free_bytes`, `karta_db_volume_free_bytes`; the
+        publication deadline and the running publication
+        (`karta_publication_timeout_seconds`, `karta_publication_running_seconds`);
+        and, since this process started, publication outcomes
+        (`karta_publications_total{source,state}`), timeouts
+        (`karta_publication_timeouts_total`) and a duration histogram
+        (`karta_publication_duration_seconds{source}`), plus
+        `karta_publisher_start_time_seconds`. Labels are bounded (source,
+        state, release id, error code); the alert rules and their responses are
+        in deploy/monitoring and docs/operations.md. The API process exports
+        its own request metrics on a separate listener, not here.
       responses:
         "200":
           description: Metrics.
@@ -532,7 +543,15 @@ components:
         size_bytes: { type: integer, format: int64, nullable: true }
         data_timestamp: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
         state: { type: string, enum: [processing, published, ready, duplicate, rejected, failed, interrupted] }
-        reason_code: { type: string, nullable: true }
+        reason_code:
+          type: string
+          nullable: true
+          description: |
+            Why the submission ended as it did, for example `unauthorized_digest`,
+            `insufficient_storage`, `policy_refused` or `publication_timeout` (the
+            whole publication exceeded `KARTA_PUBLISH_TIMEOUT` and was stopped; it
+            is final and not retried automatically: submit it again after raising
+            the deadline or fixing the cause). See docs/runbook.md for the list.
         reason: { type: string, nullable: true }
         release_id: { type: string, nullable: true }
         attempts: { type: integer }

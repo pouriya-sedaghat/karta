@@ -1,4 +1,4 @@
-# Karta runbook (Stage 3)
+# Karta runbook (Stage 4)
 
 Karta serves one **active release** of one region: vector tiles, a MapLibre
 style with local glyphs, named-place/POI search and a demo page, all from the
@@ -11,6 +11,16 @@ grace period and are kept for rollback; old ones are cleaned up. Optionally
 snapshot manifests and delivers newer verified snapshots to the publisher,
 which publishes them through the same path ("Online updates" below).
 
+Stage 4 adds the operational layer: a deadline for every publication,
+metrics on a separate API listener, Prometheus alert rules with documented
+responses, backup and restore, credential rotation that keeps data, and
+capacity tooling. Commands are in "Operations" below; the reasoning, the
+trust inventory and the response to every alert are in
+[docs/operations.md](operations.md). Nothing here claims production
+readiness: the target host, the Iran snapshot source and the service
+objectives are owner decisions still open (docs/operations.md, "Owner
+inputs").
+
 Requirements: Docker Engine with Compose v2.24+ (for `!reset`/`!override` in
 the overlay files), GNU make, `curl`. Go 1.27+ only for tests and
 development. Images are built locally; after `make build` nothing is fetched
@@ -21,16 +31,18 @@ from the network by any service.
 | Service | Image, user | Role | Network, port |
 | --- | --- | --- | --- |
 | `db` | PostGIS 18-3.6 | registry + one database per release | `backend` (internal), no port |
-| `api` | distroless, UID 65532, read-only DB role | public read API, `/demo/` | `backend` + `frontend`, 127.0.0.1:8080 |
-| `publisher` | importer image, UID 10001 | inbox watcher, builds, activation, cleanup, **operator API** | `backend` + `operator` (no NAT), 127.0.0.1:8081 |
+| `api` | distroless, UID 65532, read-only DB role | public read API, `/demo/`; metrics on a separate listener | `backend` + `frontend`, 127.0.0.1:8080 (API), 127.0.0.1:9464 (metrics, monitoring credential only) |
+| `publisher` | importer image, UID 10001, `docker-init` as PID 1 | inbox watcher, builds, activation, cleanup, **operator API** | `backend` + `operator` (no NAT), 127.0.0.1:8081 |
 | `fetcher` | api image, UID 65532 | **opt-in** (`make up-online`): polls the online source, verifies signed manifests, downloads, delivers to the `online` volume; no database access | `egress` only, no port |
 | `operator-cli` | api image, UID 65532 | one-off operator API client (`make op`), holds the raw operator token | `operator` |
-| `importer` | importer image, UID 10001 | one-off command-line publication (`make import-*`) | `backend` |
+| `importer` | importer image, UID 10001, `docker-init` | one-off command-line publication (`make import-*`), `restore-check`, `registry-summary`, `region-draft`, `karta-load` | `backend` |
+| `postgres-exporter` | pinned upstream image | **opt-in** (`make up-monitoring`): PostgreSQL statistics as role `karta_monitor` | `backend` + `monitoring` (no NAT), 127.0.0.1:9187 |
+| `prometheus` | pinned upstream image | **opt-in** (`make up-monitoring`): scrapes the three targets, evaluates the Karta alert rules | `backend` + `monitoring` (no NAT), 127.0.0.1:9090 |
 
 ## Bootstrap
 
 ```bash
-make secrets        # random DB passwords and operator tokens in ./secrets (0700), never overwritten
+make secrets        # random DB passwords, operator and monitoring tokens in ./secrets (0700), never overwritten
 make build          # karta-api:local (distroless, 25 MB) and karta-importer:local
 make up             # PostgreSQL (waits until healthy), then the API and the publisher
 curl -s http://localhost:8080/health/ready
@@ -112,6 +124,10 @@ them when their outcome is recorded.
 | `failed` | the build or validation failed (the candidate was dropped), or the active release's row counts could not be read (`counts_unavailable`: nothing was built) |
 | `interrupted` | the process or database stopped during it; retried automatically up to `KARTA_PUBLISH_MAX_ATTEMPTS` (3) times |
 
+A `failed` submission with `publication_timeout` ran longer than
+`KARTA_PUBLISH_TIMEOUT` and was stopped. It is final, not `interrupted`: it is
+not retried automatically and does not use up attempts.
+
 | Reason code | Cause |
 | --- | --- |
 | `symlink`, `not_regular_file`, `invalid_name` | the submission's files are not plain regular files with a valid name |
@@ -124,6 +140,7 @@ them when their outcome is recorded.
 | `unauthorized_digest` | the SHA-256 is neither pinned in the region file nor authorized by an operator |
 | `older_than_active`, `not_newer`, `region_changed` | the rules below |
 | `insufficient_storage` | not enough space for staging, the storage budget or the database volume, or the disk filled during the build |
+| `publication_timeout` | the whole publication (staging through validation) exceeded `KARTA_PUBLISH_TIMEOUT`; osm2pgsql and every process it started were stopped, every statement cancelled, the candidate dropped. The reason names the phase. Find the cause, raise the deadline if the build needs longer, then touch the marker (docs/operations.md, "Bounded publication") |
 | `validation_failed`, `build_failed` | the candidate failed a region check (counts, relative drop, tiles, searches) or osm2pgsql/SQL failed |
 | `counts_unavailable` | `validation.max_drop_fraction` is set and the active release of the region has no readable row counts (not in the registry, and not decodable from the import report in its database, as for a damaged Stage 1 release); the relative gate is never skipped, so nothing is built. Check the active release's database, or roll back to a release with counts, then touch the marker |
 | `excessive_data_loss` | activating the release would drop more rows than `validation.max_drop_fraction` allows relative to the release active at the switch |
@@ -400,14 +417,15 @@ import never blocks a rollback.
 
 ### Credentials
 
-`make secrets` creates two random 256-bit tokens and the file the publisher
-reads:
+`make secrets` creates two random 256-bit tokens, the file the publisher
+reads and the file the API's metrics listener reads:
 
 | File | Holder | Scopes |
 | --- | --- | --- |
 | `secrets/operator_token` | operators (`operator-cli`, curl) | `status`, `publish`, `rollback`, `cleanup` |
 | `secrets/operator_monitor_token` | monitoring | `status` |
 | `secrets/operator_tokens` | publisher | `NAME SCOPES SHA256(token)` per line: hashes only |
+| `secrets/metrics_tokens` | API metrics listener | the monitoring credential's hash only; rewritten in place, re-read when it changes |
 
 To add a credential (for example a second operator with only `rollback`),
 generate a token (`od -An -N32 -tx1 /dev/urandom | tr -d ' \n'`), append
@@ -549,6 +567,7 @@ inbox submission and is audited as actor `cli`. Flags: `--no-activate`
 | 5 | release validation failed (counts, relative drop, tile contract, style, search or tile checks) | unchanged |
 | 6 | insufficient storage (budget, staging, database volume, or the disk filled) | unchanged |
 | 7 | another build holds the lock (`KARTA_IMPORT_LOCK_TIMEOUT`) | unchanged |
+| 8 | the import exceeded `KARTA_PUBLISH_TIMEOUT` and was stopped (`publication_timeout`) | unchanged |
 | 1 | other failure (database, osm2pgsql) | unchanged |
 | 130 | interrupted | unchanged |
 
@@ -594,8 +613,12 @@ upgrade that changes any of them, readiness reports `release_incompatible`
   requests return 503; the API recovers by itself when the database returns.
 * Resource limits (override in `.env`): db 2 GiB / 2 CPUs, api 512 MiB / 1 CPU,
   publisher 4 GiB / 2 CPUs, importer 4 GiB, fetcher (online updates only)
-  256 MiB / 0.5 CPU. Measured use is in the PR
-  descriptions (Stage 1 for the Chitgar import, Stage 2 for publication).
+  256 MiB / 0.5 CPU; monitoring (opt-in) exporter 128 MiB / 0.25 CPU,
+  Prometheus 512 MiB / 0.5 CPU. Measured use is in the PR descriptions
+  (Stage 1 for the Chitgar import, Stage 2 for publication, Stage 4 for
+  Chitgar load and resource figures, labeled tier B). All of these are
+  provisional until measured on the target host with the Iran snapshot
+  (docs/operations.md, "Capacity").
 * Upgrading the API image or changing `KARTA_PUBLIC_BASE_URL` needs no cache
   purge and no re-import: existing releases keep their ids and tile URLs, the
   style gets a new content-addressed URL (the manifest issues it), and style
@@ -615,6 +638,97 @@ upgrade that changes any of them, readiness reports `release_incompatible`
   See `docs/api.md`, "Transition from builds before content-addressed styles".
 * Upgrading the database image (PostgreSQL/PostGIS) is different: see
   "Upgrading the database image" above.
+
+## Operations
+
+The commands for running a deployment. Why each works the way it does, the
+trust inventory and the response to every alert are in
+[docs/operations.md](operations.md).
+
+### Publication deadline
+
+```bash
+KARTA_PUBLISH_TIMEOUT=10h make up   # in .env; default 6h (provisional: derive it from the measured publication time)
+```
+
+A publication still running at the deadline is stopped with every process
+it started, its candidate is dropped, and it ends `failed`
+(`publication_timeout`); `karta import` exits 8. It is not retried
+automatically: touch the marker (inbox), `online-retry` (online) or run
+the import again once the cause is fixed.
+
+### Monitoring
+
+```bash
+make up-monitoring       # karta_monitor role, PostgreSQL exporter, Prometheus with the Karta rules (profile monitoring)
+make test-alerts         # promtool: configuration check and rule unit tests
+curl -s -H "Authorization: Bearer $(cat secrets/operator_monitor_token)" http://127.0.0.1:9464/metrics             # API
+curl -s -H "Authorization: Bearer $(cat secrets/operator_monitor_token)" http://127.0.0.1:8081/v1/operator/metrics # publisher
+open http://127.0.0.1:9090/alerts
+```
+
+Set the acceptable data age (`KARTA_DATA_STALE_AFTER`) and, in
+`deploy/monitoring/thresholds.yml`, the API objectives once the owner has
+decided them; until then `KartaDataAgeThresholdUnset` and
+`KartaObjectivesUnset` say so. No alert destination is configured.
+
+### Backup and restore
+
+```bash
+make backup                                                     # backups/karta-<UTC time>: cluster base backup, outbox, registry summaries, config, MANIFEST
+make backup BACKUP_DEST=/mnt/backup                             # elsewhere (keep ./secrets offline, separately)
+make restore BACKUP=backups/karta-20261002T150153Z              # into an empty project or host
+make restore BACKUP=backups/karta-20261002T150153Z REPLACE=1    # deletes this project's database and outbox first
+make restore-check                                              # verify the registry and every retained release now (changes nothing)
+COMPOSE="docker compose -p karta-restore-test" KARTA_HTTP_PORT=18180 KARTA_OPERATOR_PORT=18181 \
+  KARTA_API_METRICS_PORT=18464 make restore BACKUP=...         # rehearse into an isolated project
+```
+
+A restore pauses automatic online activation and audits the restored
+pointer. Before `make up-online` and `online-resume`, confirm the
+producer's current manifest serial. Then resubmit anything published or
+authorized after the backup (docs/operations.md, "Backup and restore").
+
+### Rotating credentials
+
+```bash
+make rotate-db-password ROLE=api        # or importer, monitor, superuser: no restart, data kept
+make rotate-operator-tokens             # both operator tokens; recreates the publisher
+make monitoring-role                    # (re)create karta_monitor after a restore without it
+```
+
+Signing keys for online updates: "Rotate or revoke a signing key" above.
+
+### Upgrade
+
+```bash
+make backup
+git pull && make build
+make up                                  # and make up-monitoring / make up-online where used
+make op-status smoke
+# failed? check out the backup's karta_commit, make build, then:
+make restore BACKUP=backups/karta-... REPLACE=1
+```
+
+### Incidents
+
+| Situation | Commands |
+| --- | --- |
+| bad data went live | `make op CMD='rollback --reason "..."'` (pauses online activation); later `online-resume` |
+| online source misbehaves or a key may be compromised | `make op CMD='online-pause --reason "..."'`, then "Rotate or revoke a signing key" |
+| a publication hangs or overruns | `make op-status` (job phase), `make logs`; it stops at `KARTA_PUBLISH_TIMEOUT`; `docker compose restart publisher` records it interrupted |
+| disk full | `make op CMD='cleanup --dry-run --reason "disk"'`, then without `--dry-run`; serving continues, builds fail `insufficient_storage` |
+| database lost or corrupt | `make restore BACKUP=... REPLACE=1` |
+| host restart | nothing: services restart (`unless-stopped`) and the publisher recovers; check `make op-status` |
+
+### Capacity and the Iran region
+
+```bash
+scripts/capacity-run.sh tier-d-iran-closed-c64 -duration 10m -concurrency 64   # report in artifacts/capacity/
+scripts/capacity-run.sh tier-d-iran-rate200 -rate 200 -duration 10m -concurrency 64
+docker compose run --rm --no-deps -v "$PWD/data/local:/in:ro" --entrypoint /usr/local/bin/karta importer \
+  region-draft --snapshot /in/iran.osm.pbf --id iran --name "Iran"              # region file for the chosen snapshot
+```
 
 ## Behind a reverse proxy with a path prefix
 
@@ -650,10 +764,9 @@ make reset   # docker compose down -v: deletes ALL releases, the registry and it
 make clean   # reset + remove images, web/dist, web/node_modules and artifacts/
 ```
 
-Secrets in `./secrets` survive both; delete the directory to rotate the
-database passwords together with a `make reset` (the roles are created only
-at first initialisation). Operator tokens rotate without a reset
-(`make rotate-operator-tokens`).
+Secrets in `./secrets` survive both. Database passwords and tokens rotate
+without a reset and without losing data: `make rotate-db-password ROLE=...`
+and `make rotate-operator-tokens` ("Operations" below).
 
 ## Simulated disconnected run
 
@@ -685,7 +798,9 @@ make web                       # npm ci + copy MapLibre into web/dist (pinned, i
 KARTA_PUBLIC_BASE_URL=http://localhost:8080 KARTA_DB_HOST=… KARTA_DB_PASSWORD_FILE=… \
 KARTA_WEB_DIR=web/dist go run ./cmd/karta serve
 make lint test                 # gofmt, vet, staticcheck, govulncheck, gosec, fixture check; unit tests
-make test-integration          # isolated compose project on ports 18080/18081/18082/55433 (Stage 1, 2 and 3 suites; local controlled HTTPS source)
+make test-integration          # isolated compose project on ports 18080-18083/18087/18090/55433 (Stage 1-4 suites; local controlled HTTPS source)
+make test-integration RUN=TestOperations    # only Stage 4: deadlines, rotation, backup/restore, monitoring profile
+make test-alerts               # promtool: Prometheus configuration and alert rule unit tests
 make test-integration RUN=TestPublication   # only the publication suite (RUN=TestOnline: only Stage 3)
 make fixtures                  # regenerate testdata/fixture/snapshots/*.osm.pbf from their XML sources
 make test-browser              # browser tests against the running stack (BASE_URL)
@@ -706,6 +821,9 @@ make test-browser-prefix       # the same through a proxy serving Karta under /m
 | operator API `401` / `403` | wrong token file, or the credential lacks the scope; see `make op-status` with the operator token |
 | operator API `409 busy` | another switch holds the pointer lock; retry after a few seconds |
 | demo shows nothing, console CSP errors | open the demo at `KARTA_PUBLIC_BASE_URL` + `/demo/` (the page only talks to that origin) |
+| submission `publication_timeout` / import exit 8 | the build exceeded `KARTA_PUBLISH_TIMEOUT`; the reason names the phase. Fix the cause or raise the deadline, then touch the marker |
+| online submissions stay `ready` after a restore | a restore pauses automatic online activation: confirm the producer's serial, then `online-resume` |
+| `make restore` "holds a database; add --replace" | the project already has data: restore into another project, or `REPLACE=1` to delete it first |
 | `online.enabled` false | `KARTA_ONLINE_SOURCE_FILE` not set for the publisher; online updates are opt-in |
 | `online.fetcher.error` "has not written its state" / growing `state_age_seconds` | the fetcher is not running: `make up-online`, `docker compose --profile online logs fetcher` |
 | online submissions stay `ready` with `online_activation_paused` | automatic activation is paused (by an operator or a rollback): `online-resume`, or activate the release |
