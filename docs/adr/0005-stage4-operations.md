@@ -35,7 +35,11 @@ rotation (`make reset`) deleted all data.
 `KARTA_PUBLISH_TIMEOUT` (default 6h, provisional) bounds a whole
 publication: inbox, online and `karta import`, from staging through
 validation. The job context is `context.WithTimeoutCause(…,
-ErrPublicationTimeout)`, so every database statement is cancelled. osm2pgsql
+ErrPublicationTimeout)`, so every database statement is cancelled, and the
+staging copy and the snapshot's structural scan stop at their next read
+(both were uninterruptible before: bounded by the input size, but not by
+time). A copy stopped by a shutdown is `interrupted` and retried, like any
+interrupted publication. osm2pgsql
 starts in its own process group (`Setpgid`), and cancellation kills the
 group. `exec.Cmd.WaitDelay` bounds reading its output after it exits, and
 the group is killed again after `Wait`, so a stray descendant can neither

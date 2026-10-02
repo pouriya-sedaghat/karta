@@ -3,6 +3,7 @@ package publish
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -77,5 +78,28 @@ func TestSwitchContextIsDetachedAndBounded(t *testing.T) {
 	dl, ok := sw.Deadline()
 	if !ok || time.Until(dl) > time.Second+switchBound || time.Until(dl) < switchBound {
 		t.Fatalf("switch deadline %v", dl)
+	}
+}
+
+func TestStoppedStagingIsInterruptedNotFailed(t *testing.T) {
+	for _, cause := range []error{context.Canceled, ErrPublicationTimeout} {
+		out := stageOutcome(7, fmt.Errorf("staging a.osm.pbf stopped: %w", cause))
+		if out.State != registry.SubInterrupted || out.Code != CodeInterrupted {
+			t.Errorf("%v: %+v", cause, out)
+		}
+	}
+	// At the deadline, timeoutOutcome makes it a final publication_timeout.
+	s := &Service{cfg: Config{PublishTimeout: time.Millisecond}}
+	job, cancel := s.jobContext(context.Background())
+	defer cancel()
+	<-job.Done()
+	out := s.timeoutOutcome(job, context.Background(), "staging", "touch the ready marker to submit again",
+		stageOutcome(7, fmt.Errorf("staging a.osm.pbf stopped: %w", context.Cause(job))))
+	if out.State != registry.SubFailed || out.Code != CodePublicationTimeout || !strings.Contains(out.Reason, "while staging") {
+		t.Errorf("staging stopped at the deadline: %+v", out)
+	}
+	// An input fault while staging stays what it is.
+	if out := stageOutcome(7, errors.New("disk")); out.State != registry.SubFailed {
+		t.Errorf("an I/O failure: %+v", out)
 	}
 }

@@ -303,6 +303,9 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		MaxInputBytes: s.cfg.MaxInputBytes, MaxFutureSkew: s.cfg.MaxFutureSkew, Now: s.now, Authorize: authorize,
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return fail(registry.SubInterrupted, CodeInterrupted, err)
+		}
 		if code := importer.InputCode(err); code != "" {
 			return fail(registry.SubRejected, code, err)
 		}
@@ -682,7 +685,7 @@ func (s *Service) ImportFile(ctx context.Context, o ImportOptions) Outcome {
 	defer s.setJob(nil)
 	job, cancel := s.jobContext(ctx)
 	defer cancel()
-	staged, err := inbox.StageFile(o.SnapshotPath, prov, s.cfg.StagingDir, newJobID("cli-"),
+	staged, err := inbox.StageFileContext(job, o.SnapshotPath, prov, s.cfg.StagingDir, newJobID("cli-"),
 		inbox.Options{MaxSnapshotBytes: s.cfg.MaxInputBytes, ReserveBytes: s.cfg.StagingReserveBytes})
 	var out Outcome
 	if err != nil {
@@ -702,6 +705,11 @@ func (s *Service) ImportFile(ctx context.Context, o ImportOptions) Outcome {
 }
 
 func stageOutcome(subID int64, err error) Outcome {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrPublicationTimeout) {
+		// Stopped while copying: retried after a shutdown, or turned into
+		// publication_timeout by timeoutOutcome at the deadline.
+		return Outcome{SubmissionID: subID, State: registry.SubInterrupted, Code: CodeInterrupted, Reason: err.Error(), Err: err}
+	}
 	code := inbox.CodeOf(err)
 	out := Outcome{SubmissionID: subID, State: registry.SubRejected, Code: code, Reason: err.Error(), Err: fmt.Errorf("%w: %v", importer.ErrInput, err)}
 	switch code {
@@ -853,7 +861,7 @@ func (s *Service) processEntry(ctx context.Context, f feed, e inbox.Entry) {
 	defer s.setJob(nil)
 	job, cancel := s.jobContext(ctx)
 	defer cancel()
-	staged, err := inbox.Stage(f.dir, e, s.cfg.StagingDir, f.source+"-"+strconv.FormatInt(sub.ID, 10)+"-"+strconv.Itoa(sub.Attempts),
+	staged, err := inbox.StageContext(job, f.dir, e, s.cfg.StagingDir, f.source+"-"+strconv.FormatInt(sub.ID, 10)+"-"+strconv.Itoa(sub.Attempts),
 		inbox.Options{MaxSnapshotBytes: s.cfg.MaxInputBytes, ReserveBytes: s.cfg.StagingReserveBytes, RequireManifest: f.online})
 	var out Outcome
 	marker := ""

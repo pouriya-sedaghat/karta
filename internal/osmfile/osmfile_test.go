@@ -3,7 +3,9 @@ package osmfile
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -301,4 +303,15 @@ func FuzzInspectPBF(f *testing.F) {
 		}
 		_, _ = Inspect(p, 1<<20) // must not panic
 	})
+}
+
+func TestInspectStopsWhenTheContextEnds(t *testing.T) {
+	stop := errors.New("publication deadline")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(stop)
+	for _, path := range []string{"../../testdata/fixture/snapshots/karta-fixture-a.osm.pbf", "../../testdata/fixture/karta-fixture.osm"} {
+		if _, err := InspectContext(ctx, path, 1<<20); !errors.Is(err, stop) {
+			t.Errorf("%s: %v", path, err)
+		}
+	}
 }

@@ -1,8 +1,10 @@
 package inbox
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -346,5 +348,24 @@ func TestSignedManifestsOnlyInOnlineScans(t *testing.T) {
 	entries, _ = ScanWith(dir, 100, ScanOptions{Manifests: true})
 	if _, err := Stage(dir, entries[0], t.TempDir(), "job3", Options{MaxSnapshotBytes: 1 << 20, RequireManifest: true}); CodeOf(err) != CodeTooLarge {
 		t.Errorf("oversized manifest: %v", err)
+	}
+}
+
+func TestStageStopsWhenTheContextEnds(t *testing.T) {
+	dir, staging := t.TempDir(), t.TempDir()
+	data := []byte("snapshot bytes")
+	put(t, dir, "a.osm.pbf", data)
+	put(t, dir, "a.osm.pbf.ready", []byte(digest(data)+"  a.osm.pbf\n"))
+	stop := errors.New("publication deadline")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(stop)
+	if _, err := StageContext(ctx, dir, scanOne(t, dir, "a"), staging, "job1", opts); !errors.Is(err, stop) || CodeOf(err) != "" {
+		t.Fatalf("staging after the context ended: %v (code %q)", err, CodeOf(err))
+	}
+	if entries, _ := os.ReadDir(staging); len(entries) != 0 {
+		t.Errorf("the stopped staging left %v", entries)
+	}
+	if _, err := StageFileContext(ctx, filepath.Join(dir, "a.osm.pbf"), "", staging, "cli1", opts); !errors.Is(err, stop) {
+		t.Fatalf("command-line staging after the context ended: %v", err)
 	}
 }

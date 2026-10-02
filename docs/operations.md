@@ -170,11 +170,12 @@ the tier D publication time plus a recorded margin). The deadline covers
 staging, verification, osm2pgsql, the post-import SQL and validation. When
 it passes:
 
-* every database statement of the job is cancelled. osm2pgsql is killed
-  together with every process it started (its own process group), and the
-  build stops waiting for its output even if a stray descendant still holds
-  the pipe (`exec.Cmd.WaitDelay`). The publisher and importer run under
-  `docker-init`, which reaps orphans;
+* the staging copy and the snapshot's structural scan stop at their next
+  read, and every database statement of the job is cancelled. osm2pgsql is
+  killed together with every process it started (its own process group),
+  and the build stops waiting for its output even if a stray descendant
+  still holds the pipe (`exec.Cmd.WaitDelay`). The publisher and importer
+  run under `docker-init`, which reaps orphans;
 * the candidate database is dropped, the active release keeps serving, and
   the submission ends `failed` with reason code **`publication_timeout`**
   (audited). The reason names the phase it was in;
@@ -201,7 +202,8 @@ while a stray child kept the pipe open (12.7 s); a blocked post-import SQL
 statement cancelled at the deadline; a shutdown during a build recorded
 `interrupted` and retried after restart; `karta import` exit code 8.
 Unit tests cover process-group cancellation, a `setsid`-escaped child and
-bounded output reading. Tier B: the Chitgar publication ran under a
+bounded output reading, and a staging copy and a snapshot scan stopping
+when their context ends. Tier B: the Chitgar publication ran under a
 configured 10-minute deadline (see the PR). Tier D (the full Iran
 publication time, and the budget derived from it) is open.
 

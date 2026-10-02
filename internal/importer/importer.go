@@ -156,8 +156,12 @@ func Verify(ctx context.Context, o VerifyOptions) (*Verified, error) {
 	if o.Now != nil {
 		now = o.Now
 	}
-	info, err := osmfile.Inspect(o.SnapshotPath, o.MaxInputBytes)
+	info, err := osmfile.InspectContext(ctx, o.SnapshotPath, o.MaxInputBytes)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Stopped (deadline or shutdown), not a fault of the input.
+			return nil, fmt.Errorf("verifying the snapshot was stopped: %w", context.Cause(ctx))
+		}
 		return nil, inputErr(CodeMalformed, "%v", err)
 	}
 	src := SourceReport{File: filepath.Base(info.Path), Format: string(info.Format), Size: info.Size, SHA256: info.SHA256,
