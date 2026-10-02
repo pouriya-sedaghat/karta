@@ -257,6 +257,50 @@ func script(t *testing.T, name string, args ...string) (string, int) {
 	return string(out), code
 }
 
+// keepSecrets puts the checkout's secret files back as they were when the
+// test started, and applies them to the test stack, when the test ends. The
+// rotation drills change ./secrets, which a development stack in the same
+// checkout uses too: left rotated, its roles would no longer match its files.
+func keepSecrets(t *testing.T) {
+	t.Helper()
+	saved := map[string][]byte{}
+	for _, n := range []string{"db_superuser_password", "db_importer_password", "db_api_password", "db_monitor_password", "operator_token", "operator_monitor_token"} {
+		if b, err := os.ReadFile(filepath.Join(repoRoot, "secrets", n)); err == nil {
+			saved[n] = b
+		}
+	}
+	t.Cleanup(func() {
+		changed := false
+		for n, b := range saved {
+			p := filepath.Join(repoRoot, "secrets", n)
+			if cur, err := os.ReadFile(p); err == nil && string(cur) == string(b) {
+				continue
+			}
+			// In place, like the rotation itself: bind mounts keep the inode.
+			if err := os.WriteFile(p, b, 0o644); err != nil {
+				t.Errorf("restore secrets/%s: %v", n, err)
+				continue
+			}
+			changed = true
+		}
+		if !changed {
+			return
+		}
+		for _, role := range []string{"superuser", "importer", "api", "monitor"} {
+			// Exit 3: the role does not exist (the monitor role is optional).
+			if out, code := script(t, "rotate-db-password.sh", "--current", role); code != 0 && (role != "monitor" || code != 3) {
+				t.Errorf("apply the restored %s password: %s", role, out)
+			}
+		}
+		gen := exec.Command("./scripts/gen-secrets.sh")
+		gen.Dir = repoRoot
+		if out, err := gen.CombinedOutput(); err != nil {
+			t.Errorf("gen-secrets: %v %s", err, out)
+		}
+		restartPublisher(t, nil)
+	})
+}
+
 // containerStart identifies a container's current process (id and start
 // time), to prove it was not restarted.
 func containerStart(t *testing.T, service string) string {
@@ -288,6 +332,7 @@ func TestOperations(t *testing.T) {
 	}
 	resetAll(t)
 	t.Cleanup(func() { resetAll(t) })
+	keepSecrets(t)
 	submit(t, "a", readRepo(t, snapA), nil, "")
 	if s := waitSubmission(t, "a", 90*time.Second); s.State != "published" {
 		t.Fatalf("A: %+v", s)
