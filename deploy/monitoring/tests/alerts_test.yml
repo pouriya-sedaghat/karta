@@ -1,0 +1,484 @@
+# promtool unit tests for alerts.yml (make test-alerts). Synthetic series
+# only (tier A): they prove the rule logic, not that a deployment scrapes
+# the series; the live Prometheus check in the integration suite does that.
+rule_files:
+  - ../alerts.yml
+  - ../thresholds.yml
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------- freshness
+  - name: stale data alerts after 5 minutes and clears when fresh data is active again
+    interval: 1m
+    input_series:
+      - series: 'karta_active_release{job="karta-publisher",instance="p"}'
+        values: '1x60'
+      - series: 'karta_data_stale_after_seconds{job="karta-publisher",instance="p"}'
+        values: '172800x60'
+      # fresh until 10m, stale from 11m to 30m, fresh from 31m
+      - series: 'karta_data_stale{job="karta-publisher",instance="p"}'
+        values: '0x10 1x19 0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KartaDataStale
+        exp_alerts: []
+      - eval_time: 14m # pending, not yet 5 minutes
+        alertname: KartaDataStale
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: KartaDataStale
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: The active release's OSM data is older than the acceptable age (KARTA_DATA_STALE_AFTER)
+              runbook: docs/operations.md#kartadatastale
+      - eval_time: 35m
+        alertname: KartaDataStale
+        exp_alerts: []
+      - eval_time: 59m # a threshold is configured
+        alertname: KartaDataAgeThresholdUnset
+        exp_alerts: []
+
+  - name: a recent successful source check does not make old data fresh
+    interval: 1m
+    input_series:
+      - series: 'karta_active_release{job="karta-publisher",instance="p"}'
+        values: '1x20'
+      - series: 'karta_data_stale_after_seconds{job="karta-publisher",instance="p"}'
+        values: '86400x20'
+      - series: 'karta_data_stale{job="karta-publisher",instance="p"}'
+        values: '1x20'
+      - series: 'karta_online_enabled{job="karta-publisher",instance="p"}'
+        values: '1x20'
+      # the source answers every minute, with nothing new
+      - series: 'karta_online_last_success_timestamp_seconds{job="karta-publisher",instance="p"}'
+        values: '0+60x20'
+      - series: 'karta_online_next_attempt_timestamp_seconds{job="karta-publisher",instance="p"}'
+        values: '60+60x20'
+      - series: 'karta_online_fetcher_state_age_seconds{job="karta-publisher",instance="p"}'
+        values: '5x20'
+      - series: 'karta_online_auto_activation{job="karta-publisher",instance="p"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KartaDataStale
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: The active release's OSM data is older than the acceptable age (KARTA_DATA_STALE_AFTER)
+              runbook: docs/operations.md#kartadatastale
+      - eval_time: 10m
+        alertname: KartaFetcherOverdue
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: KartaOnlineSourceFailing
+        exp_alerts: []
+
+  - name: without an acceptable data age, staleness cannot alert and that is reported
+    interval: 1m
+    input_series:
+      - series: 'karta_active_release{job="karta-publisher",instance="p"}'
+        values: '1x90'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: KartaDataAgeThresholdUnset
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: KartaDataAgeThresholdUnset
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: No acceptable data age is configured (KARTA_DATA_STALE_AFTER), so stale data cannot alert
+              runbook: docs/operations.md#kartadataagethresholdunset
+      - eval_time: 65m
+        alertname: KartaDataStale
+        exp_alerts: []
+
+  # ------------------------------------------------------------------ online
+  - name: paused automatic activation is reported after an hour and clears on resume
+    interval: 5m
+    input_series:
+      - series: 'karta_online_enabled{job="karta-publisher",instance="p"}'
+        values: '1x40'
+      # paused from 0 to 95m, resumed from 100m
+      - series: 'karta_online_auto_activation{job="karta-publisher",instance="p"}'
+        values: '0x19 1x20'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: KartaOnlineActivationPaused
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: KartaOnlineActivationPaused
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: Automatic activation of online snapshots is paused (operator, rollback or restore)
+              runbook: docs/operations.md#kartaonlineactivationpaused
+      - eval_time: 105m
+        alertname: KartaOnlineActivationPaused
+        exp_alerts: []
+
+  - name: a failing source warns after two hours; a trust failure warns at once
+    interval: 5m
+    input_series:
+      - series: 'karta_online_last_error{job="karta-publisher",instance="p",code="network_error"}'
+        values: '1x30'
+      - series: 'karta_online_last_error{job="karta-publisher",instance="q",code="signature_untrusted"}'
+        values: '0 1x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KartaOnlineSourceRefused
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: q, code: signature_untrusted}
+            exp_annotations:
+              summary: "The online source failed a trust check: signature_untrusted"
+              runbook: docs/operations.md#kartaonlinesourcerefused
+      - eval_time: 100m
+        alertname: KartaOnlineSourceFailing
+        exp_alerts: []
+      - eval_time: 125m
+        alertname: KartaOnlineSourceFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p, code: network_error}
+            exp_annotations:
+              summary: "Online source checks keep failing: network_error"
+              runbook: docs/operations.md#kartaonlinesourcefailing
+
+  - name: a stopped fetcher is observable through its missed scheduled check
+    interval: 1m
+    input_series:
+      - series: 'karta_online_enabled{job="karta-publisher",instance="p"}'
+        values: '1x60'
+      # it last reported at 10m that it would check again at 10m; then it stopped
+      - series: 'karta_online_next_attempt_timestamp_seconds{job="karta-publisher",instance="p"}'
+        values: '600x60'
+      - series: 'karta_online_fetcher_state_age_seconds{job="karta-publisher",instance="p"}'
+        values: '0+60x60'
+    alert_rule_test:
+      - eval_time: 24m # 14 minutes late: within the guard
+        alertname: KartaFetcherOverdue
+        exp_alerts: []
+      - eval_time: 32m
+        alertname: KartaFetcherOverdue
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: The online fetcher missed its scheduled check; it is stopped or stuck
+              runbook: docs/operations.md#kartafetcheroverdue
+
+  - name: a fetcher that never reported is observable
+    interval: 1m
+    input_series:
+      - series: 'karta_online_enabled{job="karta-publisher",instance="p"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KartaFetcherNoState
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: Online updates are enabled but the fetcher has never reported
+              runbook: docs/operations.md#kartafetchernostate
+
+  # ------------------------------------------------------------ availability
+  - name: a down publisher and a missing scrape target are reported
+    interval: 1m
+    input_series:
+      - series: 'up{job="karta-api",instance="a"}'
+        values: '1x20'
+      - series: 'up{job="karta-publisher",instance="p"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: KartaPublisherDown
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: KartaPublisherDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: The Karta publisher does not answer its metrics scrape; publication and its alerts are blind
+              runbook: docs/operations.md#kartapublisherdown
+      - eval_time: 15m
+        alertname: KartaScrapeTargetMissing
+        exp_alerts: []
+
+  - name: a scrape target missing from the configuration is reported
+    interval: 1m
+    input_series:
+      - series: 'up{job="karta-api",instance="a"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: KartaScrapeTargetMissing
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-publisher}
+            exp_annotations:
+              summary: "Scrape target karta-publisher is missing: its alerts cannot fire"
+              runbook: docs/operations.md#kartascrapetargetmissing
+
+  - name: an unready API reports its reason; a dead one is down
+    interval: 1m
+    input_series:
+      - series: 'karta_api_readiness_info{job="karta-api",instance="a",reason="database_unavailable"}'
+        values: '1x10'
+      - series: 'up{job="karta-api",instance="b"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KartaAPINotReady
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-api, instance: a, reason: database_unavailable}
+            exp_annotations:
+              summary: "The Karta API is not ready: database_unavailable"
+              runbook: docs/operations.md#kartaapinotready
+      - eval_time: 5m
+        alertname: KartaAPIDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-api, instance: b}
+            exp_annotations:
+              summary: The Karta API does not answer its metrics scrape
+              runbook: docs/operations.md#kartaapidown
+
+  - name: no active release and a restart loop are reported
+    interval: 5m
+    input_series:
+      - series: 'karta_active_release{job="karta-publisher",instance="p"}'
+        values: '0x5'
+      - series: 'karta_api_start_time_seconds{job="karta-api",instance="a"}'
+        values: '100 400 700 1000 1000 1000'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: KartaNoActiveRelease
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: No release is active
+              runbook: docs/operations.md#kartanoactiverelease
+      - eval_time: 25m
+        alertname: KartaRestartLoop
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-api, instance: a}
+            exp_annotations:
+              summary: "karta-api restarted repeatedly in the last hour"
+              runbook: docs/operations.md#kartarestartloop
+
+  # ------------------------------------------------------------- publication
+  - name: a publication stopped at its deadline is reported for 30 minutes
+    interval: 1m
+    input_series:
+      - series: 'karta_publication_timeouts_total{job="karta-publisher",instance="p"}'
+        values: '0x9 1x60'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: KartaPublicationTimedOut
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: KartaPublicationTimedOut
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: A publication was stopped at its deadline (KARTA_PUBLISH_TIMEOUT)
+              runbook: docs/operations.md#kartapublicationtimedout
+      - eval_time: 45m
+        alertname: KartaPublicationTimedOut
+        exp_alerts: []
+
+  - name: the first failed submission of a kind is reported, then clears after an hour
+    interval: 5m
+    input_series:
+      - series: 'karta_submissions{job="karta-publisher",instance="p",source="inbox",state="published"}'
+        values: '1x20'
+      # the first failure appears at 10m
+      - series: 'karta_submissions{job="karta-publisher",instance="p",source="inbox",state="failed"}'
+        values: '_x2 1x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KartaPublicationFailed
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: KartaPublicationFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p, source: inbox, state: failed}
+            exp_annotations:
+              summary: "A inbox submission ended failed"
+              runbook: docs/operations.md#kartapublicationfailed
+      - eval_time: 80m
+        alertname: KartaPublicationFailed
+        exp_alerts: []
+
+  - name: a further failure of a kind seen before is reported too
+    interval: 5m
+    input_series:
+      - series: 'karta_submissions{job="karta-publisher",instance="p",source="online",state="rejected"}'
+        values: '2x14 3x10'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: KartaPublicationFailed
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: KartaPublicationFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p, source: online, state: rejected}
+            exp_annotations:
+              summary: "A online submission ended rejected"
+              runbook: docs/operations.md#kartapublicationfailed
+
+  - name: a publication running far beyond its deadline is critical
+    interval: 1m
+    input_series:
+      - series: 'karta_publication_timeout_seconds{job="karta-publisher",instance="p"}'
+        values: '3600x90'
+      - series: 'karta_publication_running_seconds{job="karta-publisher",instance="p"}'
+        values: '0+60x90'
+    alert_rule_test:
+      - eval_time: 69m # 4140 s: within deadline + guard
+        alertname: KartaPublicationOverrun
+        exp_alerts: []
+      - eval_time: 71m
+        alertname: KartaPublicationOverrun
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: A publication runs far beyond its deadline; the deadline did not stop it
+              runbook: docs/operations.md#kartapublicationoverrun
+
+  - name: release storage near its budget warns; no budget means no alert
+    interval: 1m
+    input_series:
+      - series: 'karta_release_storage_bytes{job="karta-publisher",instance="p"}'
+        values: '900x20'
+      - series: 'karta_release_storage_budget_bytes{job="karta-publisher",instance="p"}'
+        values: '1000x20'
+      - series: 'karta_release_storage_bytes{job="karta-publisher",instance="q"}'
+        values: '900x20'
+      - series: 'karta_release_storage_budget_bytes{job="karta-publisher",instance="q"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: KartaReleaseStorageNearBudget
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: Release databases approach KARTA_RELEASE_STORAGE_BUDGET_MB; the next build may be refused
+              runbook: docs/operations.md#kartareleasestoragenearbudget
+
+  # -------------------------------------------------------------- objectives
+  - name: without owner objectives, API errors do not alert and the gap is reported
+    interval: 1m
+    input_series:
+      - series: 'karta_api_requests_total{job="karta-api",instance="a",route="tile",code="2xx"}'
+        values: '0+100x90'
+      - series: 'karta_api_requests_total{job="karta-api",instance="a",route="tile",code="5xx"}'
+        values: '0+100x90'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KartaAPIErrorRatioHigh
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: KartaObjectivesUnset
+        exp_alerts:
+          - exp_labels: {severity: info}
+            exp_annotations:
+              summary: No API service objectives are configured; error and latency alerts are inactive
+              runbook: docs/operations.md#kartaobjectivesunset
+
+  - name: with owner objectives, errors and latency above them alert (synthetic objective values)
+    interval: 1m
+    input_series:
+      - series: 'karta:objective_api_error_ratio'
+        values: '0.05x40'
+      - series: 'karta:objective_api_latency_quantile'
+        values: '0.99x40'
+      - series: 'karta:objective_api_latency_seconds'
+        values: '0.5x40'
+      # 10 % of answers fail
+      - series: 'karta_api_requests_total{job="karta-api",instance="a",route="tile",code="2xx"}'
+        values: '0+90x40'
+      - series: 'karta_api_requests_total{job="karta-api",instance="a",route="tile",code="5xx"}'
+        values: '0+10x40'
+      # every tile takes between 1 and 2.5 s
+      - series: 'karta_api_request_duration_seconds_bucket{job="karta-api",instance="a",route="tile",le="1"}'
+        values: '0x40'
+      - series: 'karta_api_request_duration_seconds_bucket{job="karta-api",instance="a",route="tile",le="2.5"}'
+        values: '0+100x40'
+      - series: 'karta_api_request_duration_seconds_bucket{job="karta-api",instance="a",route="tile",le="+Inf"}'
+        values: '0+100x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KartaAPIErrorRatioHigh
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-api, instance: a}
+            exp_annotations:
+              summary: The share of failed API answers is above the owner's objective
+              runbook: docs/operations.md#kartaapierrorratiohigh
+      - eval_time: 20m
+        alertname: KartaAPILatencyHigh
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-api, instance: a}
+            exp_annotations:
+              summary: API latency is above the owner's objective
+              runbook: docs/operations.md#kartaapilatencyhigh
+      - eval_time: 20m
+        alertname: KartaObjectivesUnset
+        exp_alerts: []
+
+  # --------------------------------------------------------------- resources
+  - name: disk, memory and WAL guards
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node",instance="h",mountpoint="/var/lib/docker",fstype="ext4"}'
+        values: '5x20'
+      - series: 'node_filesystem_size_bytes{job="node",instance="h",mountpoint="/var/lib/docker",fstype="ext4"}'
+        values: '100x20'
+      - series: 'node_filesystem_avail_bytes{job="node",instance="h",mountpoint="/run",fstype="tmpfs"}'
+        values: '1x20'
+      - series: 'node_filesystem_size_bytes{job="node",instance="h",mountpoint="/run",fstype="tmpfs"}'
+        values: '100x20'
+      - series: 'container_memory_working_set_bytes{job="cadvisor",instance="h",name="karta-publisher-1"}'
+        values: '950x20'
+      - series: 'container_spec_memory_limit_bytes{job="cadvisor",instance="h",name="karta-publisher-1"}'
+        values: '1000x20'
+      - series: 'pg_wal_size_bytes{job="karta-postgres",instance="e"}'
+        values: '3e9x40'
+      - series: 'pg_settings_max_wal_size_bytes{job="karta-postgres",instance="e"}'
+        values: '1e9x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: KartaDiskLow
+        exp_alerts:
+          - exp_labels: {severity: critical, job: node, instance: h, mountpoint: /var/lib/docker, fstype: ext4}
+            exp_annotations:
+              summary: "Filesystem /var/lib/docker is nearly full"
+              runbook: docs/operations.md#kartadisklow
+      - eval_time: 18m
+        alertname: KartaContainerMemoryHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, job: cadvisor, instance: h, name: karta-publisher-1}
+            exp_annotations:
+              summary: "Container karta-publisher-1 is close to its memory limit"
+              runbook: docs/operations.md#kartacontainermemoryhigh
+      - eval_time: 35m
+        alertname: KartaPostgresWALGrowing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-postgres, instance: e}
+            exp_annotations:
+              summary: PostgreSQL WAL is over twice max_wal_size and not being recycled
+              runbook: docs/operations.md#kartapostgreswalgrowing
+
+  - name: a disk filling up is predicted a day ahead
+    interval: 10m
+    input_series:
+      # 100 GB free, losing 1 GB every 10 minutes: empty in under a day
+      - series: 'node_filesystem_avail_bytes{job="node",instance="h",mountpoint="/data",fstype="xfs"}'
+        values: '100e9-1e9x60'
+      - series: 'node_filesystem_size_bytes{job="node",instance="h",mountpoint="/data",fstype="xfs"}'
+        values: '200e9x60'
+    alert_rule_test:
+      - eval_time: 8h
+        alertname: KartaDiskFillingUp
+        exp_alerts:
+          - exp_labels: {severity: warning, job: node, instance: h, mountpoint: /data, fstype: xfs}
+            exp_annotations:
+              summary: "Filesystem /data fills up within a day at the current rate"
+              runbook: docs/operations.md#kartadiskfillingup

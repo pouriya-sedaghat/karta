@@ -1,0 +1,230 @@
+# Karta alert rules (Prometheus 3). Load with thresholds.yml. Scrape jobs
+# and their names are in prometheus.yml: karta-api, karta-publisher,
+# karta-postgres; node (node_exporter) and cadvisor are host agents the
+# operator provides. Every rule names its response in docs/operations.md
+# ("Alert responses"). Tests: tests/alerts_test.yml (make test-alerts).
+#
+# Nothing here invents a service objective: the data-age rule uses the
+# publisher's own KARTA_DATA_STALE_AFTER; API error and latency rules
+# compare with owner objectives (thresholds.yml) and stay silent until they
+# are set; the remaining numbers are provisional engineering guards
+# (thresholds.yml) or alert delays.
+groups:
+  - name: karta-availability
+    rules:
+      - alert: KartaAPIDown
+        expr: up{job="karta-api"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: The Karta API does not answer its metrics scrape
+          runbook: docs/operations.md#kartaapidown
+      - alert: KartaAPINotReady
+        expr: karta_api_readiness_info{reason!="ready"} == 1
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "The Karta API is not ready: {{ $labels.reason }}"
+          runbook: docs/operations.md#kartaapinotready
+      - alert: KartaPublisherDown
+        expr: up{job="karta-publisher"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: The Karta publisher does not answer its metrics scrape; publication and its alerts are blind
+          runbook: docs/operations.md#kartapublisherdown
+      # A target missing from the scrape configuration silences every alert
+      # derived from it.
+      - alert: KartaScrapeTargetMissing
+        expr: absent(up{job="karta-api"}) or absent(up{job="karta-publisher"})
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "Scrape target {{ $labels.job }} is missing: its alerts cannot fire"
+          runbook: docs/operations.md#kartascrapetargetmissing
+      - alert: KartaNoActiveRelease
+        expr: karta_active_release == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: No release is active
+          runbook: docs/operations.md#kartanoactiverelease
+      # A process started more than twice in an hour (crash loop).
+      - alert: KartaRestartLoop
+        expr: changes(karta_api_start_time_seconds[1h]) > 2 or changes(karta_publisher_start_time_seconds[1h]) > 2
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.job }} restarted repeatedly in the last hour"
+          runbook: docs/operations.md#kartarestartloop
+
+  - name: karta-freshness
+    rules:
+      # Data age, never check success: an answering source with nothing new
+      # does not make old data fresh.
+      - alert: KartaDataStale
+        expr: karta_data_stale == 1
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: The active release's OSM data is older than the acceptable age (KARTA_DATA_STALE_AFTER)
+          runbook: docs/operations.md#kartadatastale
+      - alert: KartaDataAgeThresholdUnset
+        expr: karta_active_release == 1 unless on() karta_data_stale_after_seconds
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: No acceptable data age is configured (KARTA_DATA_STALE_AFTER), so stale data cannot alert
+          runbook: docs/operations.md#kartadataagethresholdunset
+      # The fetcher reports when it will check next; long past that time it
+      # is stopped or stuck (its reports are not authenticated: data age is
+      # the authoritative signal).
+      - alert: KartaFetcherOverdue
+        expr: (time() - karta_online_next_attempt_timestamp_seconds) > scalar(karta:guard_fetcher_overdue_seconds)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: The online fetcher missed its scheduled check; it is stopped or stuck
+          runbook: docs/operations.md#kartafetcheroverdue
+      - alert: KartaFetcherNoState
+        expr: karta_online_enabled == 1 unless on() karta_online_fetcher_state_age_seconds
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: Online updates are enabled but the fetcher has never reported
+          runbook: docs/operations.md#kartafetchernostate
+      - alert: KartaOnlineSourceRefused
+        expr: karta_online_last_error{code=~"signature_invalid|signature_untrusted|manifest_replayed|manifest_conflict|manifest_region_mismatch|digest_mismatch|size_mismatch|url_refused|destination_refused|redirect_refused"} == 1
+        labels: {severity: warning}
+        annotations:
+          summary: "The online source failed a trust check: {{ $labels.code }}"
+          runbook: docs/operations.md#kartaonlinesourcerefused
+      - alert: KartaOnlineSourceFailing
+        expr: karta_online_last_error == 1
+        for: 2h
+        labels: {severity: warning}
+        annotations:
+          summary: "Online source checks keep failing: {{ $labels.code }}"
+          runbook: docs/operations.md#kartaonlinesourcefailing
+      - alert: KartaOnlineActivationPaused
+        expr: karta_online_enabled == 1 and karta_online_auto_activation == 0
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: Automatic activation of online snapshots is paused (operator, rollback or restore)
+          runbook: docs/operations.md#kartaonlineactivationpaused
+
+  - name: karta-publication
+    rules:
+      - alert: KartaPublicationTimedOut
+        expr: increase(karta_publication_timeouts_total[30m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: A publication was stopped at its deadline (KARTA_PUBLISH_TIMEOUT)
+          runbook: docs/operations.md#kartapublicationtimedout
+      # New failed or rejected submissions in the last hour, including the
+      # first one of a kind (a series that did not exist an hour ago).
+      - alert: KartaPublicationFailed
+        expr: |
+          (karta_submissions{state=~"failed|rejected"} - karta_submissions{state=~"failed|rejected"} offset 1h > 0)
+          or
+          (karta_submissions{state=~"failed|rejected"} unless karta_submissions{state=~"failed|rejected"} offset 1h)
+        labels: {severity: warning}
+        annotations:
+          summary: "A {{ $labels.source }} submission ended {{ $labels.state }}"
+          runbook: docs/operations.md#kartapublicationfailed
+      - alert: KartaPublicationOverrun
+        expr: karta_publication_running_seconds - karta_publication_timeout_seconds > scalar(karta:guard_publication_overrun_seconds)
+        labels: {severity: critical}
+        annotations:
+          summary: A publication runs far beyond its deadline; the deadline did not stop it
+          runbook: docs/operations.md#kartapublicationoverrun
+      - alert: KartaReleaseStorageNearBudget
+        expr: karta_release_storage_bytes / (karta_release_storage_budget_bytes > 0) > scalar(karta:guard_release_storage_ratio)
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Release databases approach KARTA_RELEASE_STORAGE_BUDGET_MB; the next build may be refused
+          runbook: docs/operations.md#kartareleasestoragenearbudget
+
+  - name: karta-objectives
+    rules:
+      - alert: KartaAPIErrorRatioHigh
+        expr: |
+          sum without (route, code) (rate(karta_api_requests_total{code="5xx"}[5m]))
+            / sum without (route, code) (rate(karta_api_requests_total[5m]))
+          > scalar(karta:objective_api_error_ratio)
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: The share of failed API answers is above the owner's objective
+          runbook: docs/operations.md#kartaapierrorratiohigh
+      - alert: KartaAPILatencyHigh
+        expr: |
+          histogram_quantile(scalar(karta:objective_api_latency_quantile),
+            sum by (job, instance, le) (rate(karta_api_request_duration_seconds_bucket{route=~"manifest|search|tile|style|font"}[5m])))
+          > scalar(karta:objective_api_latency_seconds)
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: API latency is above the owner's objective
+          runbook: docs/operations.md#kartaapilatencyhigh
+      - alert: KartaObjectivesUnset
+        expr: absent(karta:objective_api_error_ratio) or absent(karta:objective_api_latency_quantile) or absent(karta:objective_api_latency_seconds)
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: No API service objectives are configured; error and latency alerts are inactive
+          runbook: docs/operations.md#kartaobjectivesunset
+
+  - name: karta-resources
+    rules:
+      - alert: KartaPostgresExporterDown
+        expr: up{job="karta-postgres"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: The PostgreSQL exporter does not answer; database alerts are blind
+          runbook: docs/operations.md#kartapostgresexporterdown
+      - alert: KartaPostgresDown
+        expr: pg_up == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: PostgreSQL does not answer the exporter
+          runbook: docs/operations.md#kartapostgresdown
+      # Without archiving or replication slots, WAL stays near max_wal_size;
+      # far above it, checkpoints are not recycling it.
+      - alert: KartaPostgresWALGrowing
+        expr: pg_wal_size_bytes > 2 * pg_settings_max_wal_size_bytes
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: PostgreSQL WAL is over twice max_wal_size and not being recycled
+          runbook: docs/operations.md#kartapostgreswalgrowing
+      - alert: KartaDiskLow
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|nsfs"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|nsfs"}
+          < scalar(karta:guard_disk_free_ratio)
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "Filesystem {{ $labels.mountpoint }} is nearly full"
+          runbook: docs/operations.md#kartadisklow
+      - alert: KartaDiskFillingUp
+        expr: predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|nsfs"}[6h], 24 * 3600) < 0
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Filesystem {{ $labels.mountpoint }} fills up within a day at the current rate"
+          runbook: docs/operations.md#kartadiskfillingup
+      - alert: KartaContainerMemoryHigh
+        expr: |
+          container_memory_working_set_bytes{name=~"karta.*"}
+            / (container_spec_memory_limit_bytes{name=~"karta.*"} > 0)
+          > scalar(karta:guard_memory_ratio)
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Container {{ $labels.name }} is close to its memory limit"
+          runbook: docs/operations.md#kartacontainermemoryhigh

@@ -5,7 +5,8 @@
 #                    (also `karta operator`, the operator API client, and
 #                    `karta fetcher`, the opt-in online source poller)
 #   target importer  Ubuntu 24.04 + osm2pgsql 1.11.0, non-root: `karta import`
-#                    and `karta publisher` (entrypoint overridden in compose)
+#                    and `karta publisher` (entrypoint overridden in compose);
+#                    also karta-load, the capacity measuring tool
 #
 # Optional build secret `build_ca`: a PEM bundle for networks that intercept
 # TLS (corporate proxies). Without it the default trust stores are used.
@@ -38,6 +39,7 @@ COPY internal/ internal/
 COPY openapi/ openapi/
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/karta ./cmd/karta \
+ && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/karta-load ./cmd/karta-load \
  && mkdir -p /out/online
 
 FROM ${RUNTIME_IMAGE} AS api
@@ -60,7 +62,7 @@ RUN apt-get update \
  && install -d -o 10001 -g 10001 -m 0700 /var/lib/karta/staging \
  && install -d -o root -g root -m 0755 /data/inbox \
  && install -d -o 65532 -g 65532 -m 0755 /data/online
-COPY --from=build /out/karta /usr/local/bin/karta
+COPY --from=build /out/karta /out/karta-load /usr/local/bin/
 USER 10001:10001
 WORKDIR /tmp
 ENTRYPOINT ["/usr/local/bin/karta", "import"]

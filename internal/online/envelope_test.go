@@ -125,6 +125,41 @@ func TestVerifyKeyRotation(t *testing.T) {
 	}
 }
 
+// Revocation and loss of a key (docs/operations.md, "Signing keys"): a
+// removed key's signatures stop authorizing at once, also on a manifest a
+// still-trusted key signed too; after the private key is lost the producer
+// signs with a new key, which authorizes nothing until the source file
+// lists it.
+func TestVerifyKeyLossAndRevocation(t *testing.T) {
+	old, next := testKey("old"), testKey("new")
+	opts := func(s *Source) VerifyOptions {
+		return VerifyOptions{Source: s, Region: testRegion, Now: testNow, Skew: time.Minute}
+	}
+	oldOnly := mustSource(t, sourceJSON("https://source.test/m.json", "", map[string]ed25519.PrivateKey{"old": old}))
+	newOnly := mustSource(t, sourceJSON("https://source.test/m.json", "", map[string]ed25519.PrivateKey{"new": next}))
+	oldSigned := signed(t, testManifest(), Signer{"old", old})
+	newSigned := signed(t, testManifest(), Signer{"new", next})
+
+	// Revoked (removed from the source file): refused.
+	if _, err := Verify(oldSigned, opts(newOnly)); CodeOf(err) != CodeSignatureUntrusted {
+		t.Errorf("a revoked key's manifest: %v", err)
+	}
+	// Lost: the replacement key signs; refused until the reviewed source
+	// file trusts it, accepted after.
+	if _, err := Verify(newSigned, opts(oldOnly)); CodeOf(err) != CodeSignatureUntrusted {
+		t.Errorf("an untrusted replacement key: %v", err)
+	}
+	if _, err := Verify(newSigned, opts(newOnly)); err != nil {
+		t.Errorf("the trusted replacement key: %v", err)
+	}
+	// An attacker holding the revoked key cannot borrow trust by adding a
+	// signature that claims the current key's id.
+	forged := signed(t, testManifest(), Signer{"old", old}, Signer{"new", old})
+	if _, err := Verify(forged, opts(newOnly)); CodeOf(err) != CodeSignatureInvalid {
+		t.Errorf("a forged signature under the trusted id: %v", err)
+	}
+}
+
 func TestVerifyRejects(t *testing.T) {
 	a, b := testKey("a"), testKey("b")
 	src := mustSource(t, sourceJSON("https://source.test/karta/manifest.json", `,"allowed_hosts":["mirror.test"]`, map[string]ed25519.PrivateKey{"a": a}))

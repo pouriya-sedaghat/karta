@@ -1,0 +1,44 @@
+# Prometheus configuration for the stack's optional `monitoring` profile
+# (make up-monitoring): it scrapes the API's metrics listener, the
+# publisher's operator metrics and the PostgreSQL exporter over the Docker
+# networks with the monitoring credential (scope status only), and loads the
+# Karta alert rules. A Prometheus elsewhere scrapes the same endpoints on the
+# host's loopback ports instead (docs/operations.md, "Monitoring").
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/karta/alerts.yml
+  - /etc/karta/thresholds.yml
+
+# Where alerts go (Alertmanager, routing, on-call) is an owner decision and
+# is not configured here: firing alerts are visible in this Prometheus and
+# its API until an alert destination is chosen (docs/operations.md).
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager.example:9093"]
+
+scrape_configs:
+  - job_name: karta-api
+    metrics_path: /metrics
+    authorization:
+      credentials_file: /run/secrets/operator_monitor_token
+    static_configs:
+      - targets: ["api:9464"]
+  - job_name: karta-publisher
+    metrics_path: /v1/operator/metrics
+    authorization:
+      credentials_file: /run/secrets/operator_monitor_token
+    static_configs:
+      - targets: ["publisher:8081"]
+  - job_name: karta-postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+  # Host agents provided by the operator, not by this stack (the disk and
+  # container-memory alerts need them):
+  # - job_name: node        # node_exporter: filesystems of the Docker data root and volumes
+  #   static_configs: [{targets: ["host.example:9100"]}]
+  # - job_name: cadvisor    # cAdvisor: container memory against the Compose limits
+  #   static_configs: [{targets: ["host.example:8080"]}]

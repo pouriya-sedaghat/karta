@@ -26,6 +26,11 @@ type Serve struct {
 	CORSAllowedOrigins  []string
 	WebDir              string
 	LogLevel            string
+	// MetricsListenAddr serves the request metrics on a separate listener
+	// ("" = off); MetricsTokensFile holds the hashes of the credentials
+	// allowed to read them (scope status).
+	MetricsListenAddr string
+	MetricsTokensFile string
 }
 
 // Import configures `karta import` (and is the build part of Publisher).
@@ -50,11 +55,14 @@ type Import struct {
 // Publication is the release lifecycle policy shared by the publisher and
 // the command-line import.
 type Publication struct {
-	PinGrace            time.Duration
-	RetainReleases      int
-	CleanupMargin       time.Duration
-	CleanupInterval     time.Duration
-	MaxAttempts         int
+	PinGrace        time.Duration
+	RetainReleases  int
+	CleanupMargin   time.Duration
+	CleanupInterval time.Duration
+	MaxAttempts     int
+	// PublishTimeout bounds one whole publication, from staging through
+	// validation (the switch has its own bounds).
+	PublishTimeout      time.Duration
 	PointerLockTimeout  time.Duration
 	MaxFutureSkew       time.Duration
 	StagingReserveBytes int64
@@ -201,6 +209,14 @@ func LoadServe(getenv func(string) string) (Serve, error) {
 		ReleasePollInterval: r.dur("KARTA_RELEASE_POLL_INTERVAL", 5*time.Second, time.Second, 10*time.Minute),
 		WebDir:              r.str("KARTA_WEB_DIR", ""),
 		LogLevel:            r.logLevel(),
+		MetricsListenAddr:   r.str("KARTA_METRICS_LISTEN_ADDR", ""),
+		MetricsTokensFile:   r.str("KARTA_METRICS_TOKENS_FILE", "/run/secrets/metrics_tokens"),
+	}
+	if c.MetricsListenAddr != "" {
+		if c.MetricsListenAddr == c.ListenAddr {
+			r.errs = append(r.errs, errors.New("KARTA_METRICS_LISTEN_ADDR must differ from KARTA_LISTEN_ADDR: metrics are never served on the public listener"))
+		}
+		r.regular("KARTA_METRICS_TOKENS_FILE", c.MetricsTokensFile)
 	}
 	c.DB.StatementTimeout = r.dur("KARTA_DB_STATEMENT_TIMEOUT", 3*time.Second, 100*time.Millisecond, time.Minute)
 	c.DB.MaxConns = int32(r.int("KARTA_DB_MAX_CONNS", 8, 1, 200)) // #nosec G115 -- bounded to 1..200
@@ -257,11 +273,15 @@ func loadImport(r *reader) Import {
 	}
 	c.StagingDir = r.dir("KARTA_STAGING_DIR", os.TempDir())
 	c.Publication = Publication{
-		PinGrace:            r.dur("KARTA_RELEASE_PIN_GRACE", 24*time.Hour, 0, 30*24*time.Hour),
-		RetainReleases:      r.int("KARTA_RETAIN_RELEASES", 2, 0, 50),
-		CleanupMargin:       r.dur("KARTA_CLEANUP_MARGIN", 5*time.Minute, 30*time.Second, 24*time.Hour),
-		CleanupInterval:     r.dur("KARTA_CLEANUP_INTERVAL", 15*time.Minute, 10*time.Second, 24*time.Hour),
-		MaxAttempts:         r.int("KARTA_PUBLISH_MAX_ATTEMPTS", 3, 1, 20),
+		PinGrace:        r.dur("KARTA_RELEASE_PIN_GRACE", 24*time.Hour, 0, 30*24*time.Hour),
+		RetainReleases:  r.int("KARTA_RETAIN_RELEASES", 2, 0, 50),
+		CleanupMargin:   r.dur("KARTA_CLEANUP_MARGIN", 5*time.Minute, 30*time.Second, 24*time.Hour),
+		CleanupInterval: r.dur("KARTA_CLEANUP_INTERVAL", 15*time.Minute, 10*time.Second, 24*time.Hour),
+		MaxAttempts:     r.int("KARTA_PUBLISH_MAX_ATTEMPTS", 3, 1, 20),
+		// Provisional default: it bounds a hung build, far above every
+		// measured build (Chitgar: seconds); set it from measured full-region
+		// publication times on the target host (docs/operations.md).
+		PublishTimeout:      r.dur("KARTA_PUBLISH_TIMEOUT", 6*time.Hour, time.Second, 7*24*time.Hour),
 		PointerLockTimeout:  r.dur("KARTA_POINTER_LOCK_TIMEOUT", 5*time.Second, 100*time.Millisecond, time.Minute),
 		MaxFutureSkew:       r.dur("KARTA_MAX_FUTURE_SKEW", 10*time.Minute, 0, 24*time.Hour),
 		StagingReserveBytes: int64(r.int("KARTA_STAGING_RESERVE_MB", 64, 0, 1<<22)) << 20,

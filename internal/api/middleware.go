@@ -61,6 +61,9 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		defer cancel()
 		r = r.WithContext(ctx)
 		rec := &statusRecorder{ResponseWriter: w}
+		if m := s.cfg.Metrics; m != nil {
+			m.inFlight.Add(1)
+		}
 		h := rec.Header()
 		h.Set("X-Request-ID", id)
 		h.Set("X-Content-Type-Options", "nosniff")
@@ -75,6 +78,12 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			}
 			s.log.Info("request", "request_id", id, "method", r.Method, "path", r.URL.Path,
 				"status", rec.status, "bytes", rec.bytes, "ms", time.Since(start).Milliseconds())
+			if m := s.cfg.Metrics; m != nil {
+				// r.Pattern is the route the mux matched ("" if the
+				// middleware answered first).
+				m.inFlight.Add(-1)
+				m.observe(r.Pattern, rec.status, time.Since(start))
+			}
 		}()
 
 		s.cors(rec, r)

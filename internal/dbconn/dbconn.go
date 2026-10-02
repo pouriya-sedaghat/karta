@@ -152,6 +152,17 @@ func (p Params) PoolAfterConnect(ctx context.Context, database string, check fun
 	}
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second
+	// The password file is read again for every new connection, so a
+	// rotated password (scripts/rotate-db-password.sh) takes effect without
+	// a restart; connections already open stay authenticated.
+	cfg.BeforeConnect = func(_ context.Context, cc *pgx.ConnConfig) error {
+		pw, err := p.Password()
+		if err != nil {
+			return err
+		}
+		cc.Password = pw
+		return nil
+	}
 	cfg.AfterConnect = check
 	return pgxpool.NewWithConfig(ctx, cfg)
 }

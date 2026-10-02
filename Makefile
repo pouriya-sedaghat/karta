@@ -20,6 +20,9 @@ BASE_URL       ?= http://localhost:8080
 PREFIX_BASE_URL ?= http://127.0.0.1:18091/maps
 ARTIFACTS      ?= artifacts
 
+# Prometheus (promtool) for the alert-rule checks; the same pinned image as compose.yaml.
+PROMETHEUS_IMAGE := prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+
 # Tool versions for static and security checks (run with `go run`, no global installs).
 STATICCHECK := honnef.co/go/tools/cmd/staticcheck@v0.8.1
 GOVULNCHECK := golang.org/x/vuln/cmd/govulncheck@v1.8.0
@@ -111,6 +114,37 @@ rotate-operator-tokens: data-dirs ## Replace both operator tokens and restart th
 	./scripts/gen-secrets.sh
 	$(COMPOSE) up -d --no-deps --force-recreate publisher
 
+# Backup destination for `make backup` (git-ignored by default).
+BACKUP_DEST ?= backups
+
+.PHONY: backup
+backup: ## Back up the running deployment into BACKUP_DEST (database, outbox, config, never secrets; scripts/backup.sh)
+	@COMPOSE="$(COMPOSE)" ./scripts/backup.sh $(BACKUP_DEST)
+
+.PHONY: restore
+restore: ## Restore BACKUP=backups/karta-... into this project (REPLACE=1 deletes its existing data first; scripts/restore.sh)
+	@test -n "$(BACKUP)" || { echo "set BACKUP=backups/karta-<time>" >&2; exit 2; }
+	@COMPOSE="$(COMPOSE)" ./scripts/restore.sh $(BACKUP) $(if $(REPLACE),--replace)
+
+.PHONY: restore-check
+restore-check: ## Verify the registry and every retained release database (changes nothing)
+	@$(COMPOSE) run --rm -T --no-deps --entrypoint /usr/local/bin/karta importer restore-check
+
+.PHONY: rotate-db-password
+rotate-db-password: ## Rotate a database role password without a restart: ROLE=api|importer|monitor|superuser
+	@test -n "$(ROLE)" || { echo "set ROLE=api|importer|monitor|superuser" >&2; exit 2; }
+	@COMPOSE="$(COMPOSE)" ./scripts/rotate-db-password.sh $(ROLE)
+
+.PHONY: monitoring-role
+monitoring-role: ## Create or update the PostgreSQL role of the metrics exporter (karta_monitor, pg_monitor; idempotent)
+	@COMPOSE="$(COMPOSE)" ./scripts/create-monitor-role.sh
+
+.PHONY: up-monitoring
+up-monitoring: secrets data-dirs ## Start the optional monitoring profile: PostgreSQL exporter and Prometheus with the Karta alert rules
+	$(COMPOSE) up -d --wait db
+	@$(MAKE) -s monitoring-role
+	$(COMPOSE) --profile monitoring up -d postgres-exporter prometheus
+
 .PHONY: smoke
 smoke: ## Query the manifest, a Persian search and a tile
 	@curl -fsS $(BASE_URL)/v1/manifest | head -c 600; echo
@@ -158,6 +192,13 @@ lint: ## gofmt, go vet, staticcheck, govulncheck, gosec, committed fixture check
 	go run $(STATICCHECK) -tags integration,browser ./tests/...
 	go run $(GOVULNCHECK) ./...
 	go run $(GOSEC) -quiet -exclude-generated ./...
+
+.PHONY: test-alerts
+test-alerts: ## Check the Prometheus configuration and alert rules, and run the rule unit tests (promtool; needs Docker)
+	@tok=$$(mktemp) && chmod 644 $$tok && echo 0000000000000000000000000000000000000000000000000000000000000000 > $$tok && \
+	  docker run --rm -v "$(CURDIR)/deploy/monitoring:/etc/karta:ro" -v "$$tok:/run/secrets/operator_monitor_token:ro" \
+	    --entrypoint /bin/promtool $(PROMETHEUS_IMAGE) check config /etc/karta/prometheus.yml; status=$$?; rm -f $$tok; exit $$status
+	docker run --rm -v "$(CURDIR)/deploy/monitoring:/etc/karta:ro" -w /etc/karta/tests --entrypoint /bin/promtool $(PROMETHEUS_IMAGE) test rules alerts_test.yml
 
 .PHONY: test
 test: ## Unit tests (no Docker needed)
