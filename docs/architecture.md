@@ -8,7 +8,7 @@ Status: proposed baseline, 2026-09-28. This document is a contract for implement
 - `apps -> core -> karta`: Karta owns geographic data and APIs. It must not know application-specific types, user accounts, or upstream project packages. `core` calls a versioned Karta API and can expose an adapter to apps.
 - A *successful update* means a complete new release is validated and activated without stopping serving traffic. Internet failure must not prevent requests against the active release. A failed import never changes the active release.
 - Address-level geocoding, routing, live editing, and planet-scale capacity are not MVP commitments. Place/POI search includes Unicode names and `name:fa`; ranking and language behavior require evaluation on the chosen region.
-- Production geography, runtime host, hardware budget, QPS, acceptable staleness, and deployment topology remain configurable/open. For development, use a deterministic committed fixture in CI and a real Chitgar Lake area extract from an Iran PBF for acceptance; see [development data](development-data.md). Neither the Tehran selection nor its raw data is hard-coded into production APIs.
+- Runtime host, hardware budget, QPS, acceptable staleness, and deployment topology remain configurable/open. Production geography is Iran from raw OSM data (owner decision, see [delivery plan](delivery-plan.md)), still configured per region rather than hard-coded. For development, use a deterministic committed fixture in CI and a real Chitgar Lake area extract from an Iran PBF for acceptance; see [development data](development-data.md). Neither the Tehran selection nor its raw data is hard-coded into production APIs.
 
 ## Feature completeness and evolution
 
