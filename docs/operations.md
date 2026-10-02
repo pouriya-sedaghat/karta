@@ -197,8 +197,8 @@ build (Compose stop grace period 30 s) records the publication
 
 Tier A evidence (`TestOperations`): a hung import stopped at a 20 s
 deadline together with a child holding the output pipe (stopped after
-21.8 s, no importer process left); the same snapshot published afterwards
-while a stray child kept the pipe open (12.7 s); a blocked post-import SQL
+22.0 s, no importer process left); the same snapshot published afterwards
+while a stray child kept the pipe open (12.2 s); a blocked post-import SQL
 statement cancelled at the deadline; a shutdown during a build recorded
 `interrupted` and retried after restart; `karta import` exit code 8.
 Unit tests cover process-group cancellation, a `setsid`-escaped child and
@@ -584,7 +584,7 @@ the tablespace's volume, owned by `postgres` with mode 0700, and point
 
 | Drill | Tier | Evidence |
 | --- | --- | --- |
-| Backup while serving; restore into the same project after the database and outbox volumes are deleted (database loss): pointer, retained releases, audit history, anti-replay serial and fetcher state, read-only release databases, every credential | A | `TestOperations` "a backup restores …": backup 7.4 s, restore 17.2 s |
+| Backup while serving; restore into the same project after the database and outbox volumes are deleted (database loss): pointer, retained releases, audit history, anti-replay serial and fetcher state, read-only release databases, every credential | A | `TestOperations` "a backup restores …": backup 4.9 s, restore 13.1 s |
 | A publication after the backup is absent after the restore (recovery point = backup time) | A | same test |
 | Failed upgrade (registry schema newer than the build) undone by restoring with `--replace` | A | same test, "a failed upgrade is undone …" |
 | A damaged backup, and a restore over a database without `--replace`, refused before anything changes | A | same test |
@@ -601,7 +601,8 @@ frequency follows from the owner's data-loss objective.
 
 ## Credentials and signing keys
 
-Rotation that keeps data. Rehearsed with throwaway material in tier A.
+Rotation that keeps data. Rehearsed with throwaway material in tier A and
+on the Chitgar deployment in tier B.
 
 ### Database passwords
 
@@ -615,8 +616,11 @@ into `secrets/db_<role>_password` (the bind mount keeps seeing the same
 file), then verified with a TCP login. Every service reads its password
 file for each new connection, so **no restart** is needed: open connections
 keep working and new ones use the new password. Tested in tier A under load
-(3,480 requests, 0 errors, no container restarted), with the old password
-refused afterwards. This replaces "delete `./secrets` and `make reset`",
+(2,995 requests, 0 errors, no container restarted), with the old password
+refused afterwards. Tier B, on the Chitgar deployment: `api`, `importer`
+and `monitor` rotated under load (12,825 requests, 0 errors). Then the
+roles' sessions were ended to force new connections, which used the new
+passwords; the old ones were refused and nothing restarted. This replaces "delete `./secrets` and `make reset`",
 which deleted all data.
 
 ### Operator and monitoring tokens
@@ -630,7 +634,9 @@ it. A publication running at that moment is recorded `interrupted` and
 retried. The API's metrics listener re-reads `metrics_tokens` when it
 changes, so it needs no restart. After the rotation the old monitoring
 token is refused by both, and Prometheus reads the new one from its file at
-the next scrape. Tested in tier A.
+the next scrape. Tested in tiers A and B (on Chitgar: old tokens 401 on the
+operator API, the publisher metrics and the API metrics; the API was not
+restarted).
 
 **Overlap, for other credentials.** Add the new credential's line
 (`NAME SCOPES SHA256`) to `operator_tokens` and restart the publisher, move
