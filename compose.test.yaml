@@ -45,6 +45,10 @@ services:
       # Online updates are off unless the Stage 3 suite turns them on.
       KARTA_ONLINE_SOURCE_FILE: ${KARTA_TEST_ONLINE_SOURCE_FILE:-}
       KARTA_DATA_STALE_AFTER: ${KARTA_TEST_STALE_AFTER:-}
+      # The local intake is off unless the Stage 5 suite turns it on.
+      KARTA_INTAKE_DIR: ${KARTA_TEST_INTAKE_DIR:-}
+      KARTA_INTAKE_AUTHORIZATION_MAX_AGE: ${KARTA_TEST_INTAKE_MAX_AGE:-}
+      KARTA_INTAKE_MAX_OPEN: ${KARTA_TEST_INTAKE_MAX_OPEN:-2}
     volumes: !override
       - ${KARTA_INBOX_HOST_DIR:?set by make test-integration}:/data/inbox:ro
       - ./config/regions:/config/regions:ro
@@ -54,6 +58,8 @@ services:
       # fetcher's outbox, both host directories the tests control.
       - ${KARTA_TEST_SOURCE_CONFIG_DIR:?set by make test-integration}:/config/sources:ro
       - ${KARTA_ONLINE_HOST_DIR:?set by make test-integration}:/data/online:ro
+      # The Stage 5 intake handoff directory, a host directory the tests control.
+      - ${KARTA_INTAKE_HOST_DIR:?set by make test-integration}:/data/intake:ro
     tmpfs: !override
       - /tmp:size=1g,mode=1777
       - /var/lib/karta/staging:size=${KARTA_TEST_STAGING_SIZE:-64m},uid=10001,gid=10001,mode=0700
@@ -96,6 +102,34 @@ services:
       - "metadata.test:169.254.169.254"
       - "lan.test:10.232.0.1"
     restart: "no"
+  # The intake watcher and command (Stage 5 suite) run as the test user on
+  # host directories the tests control: the landing area (owned by the test
+  # user, its landing owner) and the handoff directory.
+  intake-watch:
+    user: "${KARTA_TEST_UID:-65532}:${KARTA_TEST_GID:-65532}"
+    environment:
+      KARTA_REGION_FILE: /config/regions/fixture.json
+      KARTA_INTAKE_LANDING_UID: ${KARTA_TEST_UID:-65532}
+      KARTA_INTAKE_SETTLE: 1s
+      KARTA_INTAKE_POLL_INTERVAL: 1s
+      KARTA_INTAKE_RESERVE_MB: "1"
+      KARTA_MAX_INPUT_MB: "64"
+      KARTA_FAILPOINTS: ${KARTA_TEST_INTAKE_FAILPOINTS:-}
+    volumes: !override
+      - ${KARTA_INTAKE_HOST_DIR:?set by make test-integration}:/data/intake
+      - ${KARTA_INTAKE_LANDING_HOST_DIR:?set by make test-integration}:/landing:ro
+      - ./config/regions:/config/regions:ro
+    restart: "no"
+  intake-cli:
+    user: "${KARTA_TEST_UID:-65532}:${KARTA_TEST_GID:-65532}"
+    environment:
+      KARTA_REGION_FILE: /config/regions/fixture.json
+      KARTA_INTAKE_RESERVE_MB: "1"
+      KARTA_MAX_INPUT_MB: "64"
+      KARTA_FAILPOINTS: ${KARTA_TEST_INTAKE_FAILPOINTS:-}
+    volumes: !override
+      - ${KARTA_INTAKE_HOST_DIR:?set by make test-integration}:/data/intake
+      - ./config/regions:/config/regions:ro
   # The controlled HTTPS source (tests/integration/sourceserver), test-only.
   source:
     image: karta-testsource:local
