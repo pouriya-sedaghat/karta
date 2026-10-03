@@ -410,11 +410,18 @@ func (s *Service) FinalizeRestore(ctx context.Context, p Principal, backupID, re
 		"paused by a restore: confirm the producer's current manifest serial, then resume ("+reason+")", p.RequestID, detail); err != nil {
 		return err
 	}
+	// The restored pointer is an operator decision like a rollback: the
+	// unattended intake watcher does not override it either (Stage 5).
+	if _, err := registry.SetIntakeWatcherAutoActivate(ctx, tx, regionID, false, p.Name, p.Source,
+		"paused by a restore: check the restored release, then resume ("+reason+")", p.RequestID,
+		map[string]any{"cause": "restore", "backup_id": backupID}); err != nil {
+		return err
+	}
 	if err := registry.Audit(ctx, tx, registry.AuditEntry{Actor: p.Name, Source: p.Source, Action: "restore", Target: rep.Summary.ActiveRelease,
 		Outcome: registry.OutcomeSucceeded, Reason: reason, RequestID: p.RequestID, Detail: map[string]any{
 			"backup_id": backupID, "active_release_id": rep.Summary.ActiveRelease, "source_serials": rep.Summary.SourceSerials,
 			"fetcher_serial": fetcherSerial, "releases": len(rep.Summary.Releases), "notes": rep.Notes,
-			"online_activation": "paused",
+			"online_activation": "paused", "intake_watcher_activation": "paused",
 		}}); err != nil {
 		return err
 	}

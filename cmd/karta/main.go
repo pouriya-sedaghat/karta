@@ -260,11 +260,14 @@ func publisher() int {
 	}
 	log := logger(cfg.LogLevel).With("service", "karta-publisher", "version", version)
 	logFailpoints(log)
-	creds, err := operator.LoadCredentials(cfg.OperatorTokensFile)
+	// Reloaded when the file changes, failing closed while it is broken: a
+	// removed credential stops working without a restart (ADR 0006).
+	credFile, err := operator.OpenStrictCredentialFile(cfg.OperatorTokensFile, log)
 	if err != nil {
 		log.Error("operator credentials", "file", cfg.OperatorTokensFile, "err", err)
 		return exitUsage
 	}
+	creds, _ := credFile.Credentials()
 	names := make([]string, 0, len(creds))
 	for _, c := range creds {
 		names = append(names, c.Name+"("+fmt.Sprint(c.ScopeList())+")")
@@ -287,6 +290,19 @@ func publisher() int {
 	pc.InboxPoll, pc.InboxSettle, pc.InboxMaxEntries, pc.AutoActivate = cfg.InboxPoll, cfg.InboxSettle, cfg.InboxMaxEntries, cfg.AutoActivate
 	pc.Fontstacks = g.Fontstacks()
 	pc.OnlineSourcePath, pc.OnlineDir, pc.StaleAfter = cfg.OnlineSourceFile, cfg.OnlineDir, cfg.StaleAfter
+	pc.IntakeDir, pc.IntakeMaxOpen = cfg.IntakeDir, cfg.IntakeMaxOpen
+	derived := publish.DefaultIntakeMaxAge(cfg.IntakeMaxOpen, cfg.MaxAttempts, cfg.PublishTimeout)
+	pc.IntakeMaxAge = cfg.IntakeMaxAge
+	if pc.IntakeMaxAge == 0 {
+		pc.IntakeMaxAge = derived
+	} else if pc.IntakeMaxAge < derived && cfg.IntakeDir != "" {
+		log.Warn("KARTA_INTAKE_AUTHORIZATION_MAX_AGE is below the derived bound: an intake delivery queued behind a long build, or retried "+
+			"after interruptions, can expire before it is activated (it is then reported as authorization_expired)",
+			"configured", pc.IntakeMaxAge.String(), "derived", derived.String())
+	}
+	if cfg.IntakeDir != "" {
+		log.Info("local intake enabled", "handoff", cfg.IntakeDir, "authorization_max_age", pc.IntakeMaxAge.String(), "max_open", pc.IntakeMaxOpen)
+	}
 	if cfg.OnlineSourceFile != "" {
 		src, err := checkSource(cfg.OnlineSourceFile, cfg.RegionFile)
 		if err != nil {
@@ -316,7 +332,7 @@ func publisher() int {
 
 	srv := &http.Server{
 		Addr:              cfg.OperatorListenAddr,
-		Handler:           operator.New(creds, svc, log, cfg.OperatorRequestTimeout),
+		Handler:           operator.New(credFile, svc, log, cfg.OperatorRequestTimeout),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      cfg.OperatorRequestTimeout + 5*time.Second,
@@ -517,7 +533,8 @@ func runOperator(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: karta operator status | audit [--limit N] [--before-id N] | authorize --sha256 HEX [--size N] [--expires RFC3339] --reason TEXT |\n"+
 			"  revoke --sha256 HEX --reason TEXT | activate --release ID --reason TEXT [--expected ID|none] |\n"+
 			"  rollback [--release ID] --reason TEXT [--expected ID|none] | cleanup --reason TEXT [--dry-run] | metrics |\n"+
-			"  online-pause --reason TEXT | online-resume --reason TEXT | online-retry --reason TEXT")
+			"  online-pause --reason TEXT | online-resume --reason TEXT | online-retry --reason TEXT |\n"+
+			"  intake-pause --reason TEXT | intake-resume --reason TEXT")
 		return exitUsage
 	}
 	cmd := args[0]
@@ -604,6 +621,8 @@ func runOperator(args []string) int {
 		method, path = http.MethodGet, "/v1/operator/metrics"
 	case "online-pause", "online-resume", "online-retry":
 		method, path, body = http.MethodPost, "/v1/operator/online/"+cmd[len("online-"):], map[string]any{"reason": *reason}
+	case "intake-pause", "intake-resume":
+		method, path, body = http.MethodPost, "/v1/operator/intake/"+cmd[len("intake-"):], map[string]any{"reason": *reason}
 	default:
 		fmt.Fprintf(os.Stderr, "karta operator: unknown command %q\n", cmd)
 		return exitUsage

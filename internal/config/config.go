@@ -93,6 +93,14 @@ type Publisher struct {
 	// StaleAfter is the data age after which the active release counts as
 	// stale (0 = no threshold configured).
 	StaleAfter time.Duration
+	// IntakeDir is the local intake's handoff directory, mounted read-only
+	// ("" = the intake is off, the default; intake credentials are refused).
+	IntakeDir string
+	// IntakeMaxAge caps the validity of an intake authorization; 0 means
+	// the derived default (publish.DefaultIntakeMaxAge).
+	IntakeMaxAge time.Duration
+	// IntakeMaxOpen bounds the open intake authorizations per credential.
+	IntakeMaxOpen int
 }
 
 // Fetcher configures `karta fetcher`, the online source poller.
@@ -332,6 +340,12 @@ func LoadPublisher(getenv func(string) string) (Publisher, error) {
 		}
 	}
 	c.StaleAfter = r.dur("KARTA_DATA_STALE_AFTER", 0, 0, 366*24*time.Hour)
+	c.IntakeDir = r.dir("KARTA_INTAKE_DIR", "")
+	c.IntakeMaxAge = r.dur("KARTA_INTAKE_AUTHORIZATION_MAX_AGE", 0, 0, 366*24*time.Hour)
+	if c.IntakeMaxAge != 0 && c.IntakeMaxAge < time.Minute {
+		r.errs = append(r.errs, errors.New("KARTA_INTAKE_AUTHORIZATION_MAX_AGE must be at least 1m"))
+	}
+	c.IntakeMaxOpen = r.int("KARTA_INTAKE_MAX_OPEN", 2, 1, 20)
 	return c, errors.Join(r.errs...)
 }
 
