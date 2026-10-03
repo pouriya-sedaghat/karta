@@ -67,7 +67,7 @@ func NewHandoffer(cfg HandoffConfig) (*Handoffer, error) {
 		now = time.Now
 	}
 	d := filepath.Join(cfg.Dir, StateDirName)
-	if err := os.Mkdir(d, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.Mkdir(d, 0o750); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, err
 	}
 	if fi, err := os.Lstat(d); err != nil || !fi.IsDir() {

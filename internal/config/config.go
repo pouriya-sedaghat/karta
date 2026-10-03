@@ -488,3 +488,66 @@ func LoadIntake(getenv func(string) string, watch bool) (Intake, error) {
 	}
 	return c, errors.Join(r.errs...)
 }
+
+// Bridge configures `karta bridge` (Stage 5): the acquire, sign and serve
+// processes of the controlled source bridge.
+type Bridge struct {
+	SourceFile    string
+	SignerFile    string
+	RegionFile    string
+	SpoolDir      string
+	PublishDir    string
+	StateDir      string
+	MaxInputBytes int64
+	ReserveBytes  int64
+	MaxFutureSkew time.Duration
+	SignPoll      time.Duration
+	ListenAddr    string
+	TLSCert       string
+	TLSKey        string
+	// MetricsListenAddr serves the bridge's own metrics ("" = off) to the
+	// credentials in MetricsTokensFile (scope status).
+	MetricsListenAddr string
+	MetricsTokensFile string
+	LogLevel          string
+}
+
+// LoadBridge reads the configuration of one bridge role (acquire, sign,
+// serve or status).
+func LoadBridge(getenv func(string) string, role string) (Bridge, error) {
+	r := &reader{getenv: getenv}
+	c := Bridge{
+		SourceFile:        r.str("KARTA_BRIDGE_SOURCE_FILE", ""),
+		SignerFile:        r.str("KARTA_BRIDGE_SIGNER_FILE", ""),
+		RegionFile:        r.str("KARTA_REGION_FILE", ""),
+		SpoolDir:          r.str("KARTA_BRIDGE_SPOOL_DIR", ""),
+		PublishDir:        r.str("KARTA_BRIDGE_PUBLISH_DIR", ""),
+		StateDir:          r.str("KARTA_BRIDGE_STATE_DIR", ""),
+		MaxInputBytes:     int64(r.int("KARTA_MAX_INPUT_MB", 4096, 1, 1<<22)) << 20,
+		ReserveBytes:      int64(r.int("KARTA_BRIDGE_RESERVE_MB", 64, 0, 1<<22)) << 20,
+		MaxFutureSkew:     r.dur("KARTA_MAX_FUTURE_SKEW", 10*time.Minute, 0, 24*time.Hour),
+		SignPoll:          r.dur("KARTA_BRIDGE_SIGN_POLL", 5*time.Second, time.Second, time.Hour),
+		ListenAddr:        r.str("KARTA_BRIDGE_LISTEN_ADDR", ":8443"),
+		TLSCert:           r.str("KARTA_BRIDGE_TLS_CERT", ""),
+		TLSKey:            r.str("KARTA_BRIDGE_TLS_KEY", ""),
+		MetricsListenAddr: r.str("KARTA_BRIDGE_METRICS_LISTEN_ADDR", ""),
+		MetricsTokensFile: r.str("KARTA_BRIDGE_METRICS_TOKENS_FILE", ""),
+		LogLevel:          r.logLevel(),
+	}
+	need := map[string][]struct{ key, val string }{
+		"acquire": {{"KARTA_BRIDGE_SOURCE_FILE", c.SourceFile}, {"KARTA_BRIDGE_SPOOL_DIR", c.SpoolDir}},
+		"sign": {{"KARTA_BRIDGE_SIGNER_FILE", c.SignerFile}, {"KARTA_REGION_FILE", c.RegionFile}, {"KARTA_BRIDGE_SPOOL_DIR", c.SpoolDir},
+			{"KARTA_BRIDGE_PUBLISH_DIR", c.PublishDir}, {"KARTA_BRIDGE_STATE_DIR", c.StateDir}},
+		"serve":  {{"KARTA_BRIDGE_PUBLISH_DIR", c.PublishDir}, {"KARTA_BRIDGE_TLS_CERT", c.TLSCert}, {"KARTA_BRIDGE_TLS_KEY", c.TLSKey}},
+		"status": {{"KARTA_BRIDGE_SPOOL_DIR", c.SpoolDir}, {"KARTA_BRIDGE_PUBLISH_DIR", c.PublishDir}},
+	}
+	for _, v := range need[role] {
+		if v.val == "" {
+			r.errs = append(r.errs, fmt.Errorf("%s is required", v.key))
+		}
+	}
+	if role == "serve" && c.MetricsListenAddr != "" && c.MetricsTokensFile == "" {
+		r.errs = append(r.errs, errors.New("KARTA_BRIDGE_METRICS_TOKENS_FILE is required with KARTA_BRIDGE_METRICS_LISTEN_ADDR"))
+	}
+	return c, errors.Join(r.errs...)
+}

@@ -17,7 +17,7 @@ const (
 	ProblemNotDirectory   = "not_a_directory"
 	ProblemOwner          = "wrong_owner"
 	ProblemWorldWritable  = "writable_by_others"
-	ProblemGroupWritable  = "writable_by_group"
+	ProblemGroupWritable  = "writable_by_group" // #nosec G101 -- a problem code, not a credential
 	ProblemFilesystem     = "unsupported_filesystem"
 	ProblemParentOwner    = "parent_wrong_owner"
 	ProblemParentWritable = "parent_writable"

@@ -77,6 +77,8 @@ func main() {
 		os.Exit(fetcher())
 	case "intake":
 		os.Exit(runIntake(os.Args[2:]))
+	case "bridge":
+		os.Exit(runBridge(os.Args[2:]))
 	case "import":
 		os.Exit(runImport(os.Args[2:]))
 	case "operator":
