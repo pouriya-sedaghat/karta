@@ -571,9 +571,12 @@ What the implementation settled within the decisions above, for review:
   so the downloader cannot change the bytes between verification and
   publication; the content-addressed asset is that copy.
 * **Recovery after a raise.** After an older signer state is restored and
-  the high-water serial raised, the signer may sign a snapshot again that
-  the restored state never recorded (same bytes, a new serial). No serial
-  is reused or lowered (tested end to end).
+  the high-water serial raised, the signer adopts the published manifest
+  as its current one when it is newer than the state (the publish volume is
+  written only by the signer), so it renews what Karta sees and does not
+  sign published bytes again; a restored pending envelope is published only
+  if newer than the published manifest. No serial is reused or lowered
+  (tested in unit tests and end to end).
 * **Review fixes (before the PR).** An independent adversarial review of the
   code found, and this PR fixes, with regression tests:
   an intake authorization admitted the same digest through every feed (now

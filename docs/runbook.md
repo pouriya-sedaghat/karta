@@ -672,8 +672,11 @@ than the last `issued_at` (`clock_behind`). For a state problem:
    ```
 
 The raise is recorded in the signer state and never lowers the serial; the
-next manifest uses the following serial. A snapshot the old state never
-recorded is signed again under a new serial (same bytes). For the clock,
+next manifest uses the following serial. At start the signer reconciles
+with the published manifest: an envelope the restored state had not yet
+published is published only if it is newer, and a newer published manifest
+becomes the signer's current one, so renewal continues from what Karta can
+see and nothing already published is signed again. For the clock,
 fix the time; nothing is signed meanwhile and the current manifest stays
 valid until it expires.
 

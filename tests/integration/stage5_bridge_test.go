@@ -361,11 +361,11 @@ func TestBridge(t *testing.T) {
 		if sub := waitOnlineDigest(t, digestOf(dataX), 120*time.Second); sub.State != "published" {
 			t.Fatalf("X after the raise: %+v", sub)
 		}
-		// The restored state did not know it signed W as serial 3: it signs
-		// W again (same bytes, serial 4) and then X (serial 5). No serial is
-		// reused, none is lowered.
-		if v := onlineStatus(t); v.Online.Verified == nil || v.Online.Verified.Serial != 5 || v.Online.Verified.SnapshotSHA256 != digestOf(dataX) {
-			t.Errorf("verified %+v, want X under serial 5", v.Online.Verified)
+		// The restored state did not know W (serial 3); at start the signer
+		// adopted the published manifest, so W is not signed again and X
+		// gets the next serial. No serial is reused, none is lowered.
+		if v := onlineStatus(t); v.Online.Verified == nil || v.Online.Verified.Serial != 4 || v.Online.Verified.SnapshotSHA256 != digestOf(dataX) {
+			t.Errorf("verified %+v, want X under serial 4", v.Online.Verified)
 		}
 		var hist []int64
 		for _, h := range signerStatus(t).History {
