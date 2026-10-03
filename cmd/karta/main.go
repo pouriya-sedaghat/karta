@@ -711,15 +711,6 @@ func readSummary(path string) (*publish.RegistrySummary, error) {
 	return &s, nil
 }
 
-// sameSummary compares two summaries, ignoring when they were taken.
-func sameSummary(a, b *publish.RegistrySummary) bool {
-	x, y := *a, *b
-	x.TakenAt, y.TakenAt = time.Time{}, time.Time{}
-	bx, _ := json.Marshal(x)
-	by, _ := json.Marshal(y)
-	return string(bx) == string(by)
-}
-
 // restoreCheck verifies a restored registry and its release databases
 // against what the backup recorded and, with --finalize, records the
 // restore: automatic online activation is paused and the restored active
@@ -741,20 +732,24 @@ func restoreCheck(args []string) int {
 		return exitUsage
 	}
 	exp := publish.RestoreExpect{}
+	if *before != "" && *after == "" {
+		fmt.Fprintln(os.Stderr, "karta restore-check: --expect-before needs --expect-after")
+		return exitUsage
+	}
 	if *after != "" {
 		a, err := readSummary(*after)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "karta restore-check:", err)
 			return exitUsage
 		}
-		exp.Summary = a
+		exp.After = a
 		if *before != "" {
 			b, err := readSummary(*before)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "karta restore-check:", err)
 				return exitUsage
 			}
-			exp.ChangedDuringBackup = !sameSummary(a, b)
+			exp.Before = b
 		}
 	}
 	if *outbox != "" {

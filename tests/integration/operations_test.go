@@ -7,6 +7,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -255,6 +257,184 @@ func script(t *testing.T, name string, args ...string) (string, int) {
 		t.Fatalf("%s: %v", name, err)
 	}
 	return string(out), code
+}
+
+// pgdataHasCluster reports whether the test stack's database volume holds a
+// PostgreSQL cluster.
+func pgdataHasCluster(t *testing.T) bool {
+	t.Helper()
+	id, _, _ := compose(t, "ps", "-a", "-q", "db")
+	image, err := exec.Command("docker", "inspect", "-f", "{{.Config.Image}}", strings.TrimSpace(id)).Output()
+	if err != nil {
+		t.Fatalf("db image: %v", err)
+	}
+	err = exec.Command("docker", "run", "--rm", "-v", "karta-test_pgdata:/var/lib/postgresql:ro", "--entrypoint", "sh",
+		strings.TrimSpace(string(image)), "-c", `[ -f "$PGDATA/PG_VERSION" ]`).Run()
+	return err == nil
+}
+
+// testSwitchAroundBackup takes two backups while the active release
+// switches: once while pg_basebackup streams the files (the restore must
+// hold the switch) and once after the base backup and its WAL stream ended
+// but before the backup's second registry summary (the restore must not
+// hold it, although the second summary does). Both restores must pass
+// restore-check and serve the release the base backup ended with.
+func testSwitchAroundBackup(t *testing.T) {
+	ctx := context.Background()
+	pg := superuser(t, "postgres")
+	defer pg.Close(ctx)
+	var size int64
+	if err := pg.QueryRow(ctx, `SELECT sum(pg_database_size(oid))::bigint FROM pg_database`).Scan(&size); err != nil {
+		t.Fatal(err)
+	}
+	// About 12 s of file streaming, so that a switch fits inside it.
+	rate := strconv.FormatInt(max(32, size/1024/12), 10)
+	type progress struct{ running, walsenders int }
+	poll := func(streaming bool) progress {
+		var p progress
+		phase := "%"
+		if streaming {
+			phase = "streaming database files"
+		}
+		if err := pg.QueryRow(ctx, `SELECT (SELECT count(*) FROM pg_stat_progress_basebackup WHERE phase LIKE $1),
+		    (SELECT count(*) FROM pg_stat_replication)`, phase).Scan(&p.running, &p.walsenders); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	waitUntil := func(what string, ok func() bool) {
+		deadline := time.Now().Add(90 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	other := func(not string) string {
+		for _, r := range status(t).Releases {
+			if r.ID != not && r.RollbackEligible {
+				return r.ID
+			}
+		}
+		t.Fatal("no retained release to switch to")
+		return ""
+	}
+	switchTo := func(from, to string) {
+		r := op(t, http.MethodPost, "/v1/operator/rollback", secret(t, "operator_token"),
+			map[string]any{"reason": "integration test: a switch around a backup", "release_id": to, "expected_active_release_id": from})
+		expectStatus(t, r, http.StatusOK)
+	}
+	type summary struct {
+		ActiveRelease string `json:"active_release_id"`
+		AuditMaxID    int64  `json:"audit_max_id"`
+	}
+	backup := func(during func()) (dir string, before, after summary) {
+		dest := t.TempDir()
+		cmd := exec.Command("./scripts/backup.sh", dest)
+		cmd.Dir = repoRoot
+		cmd.Env = append(os.Environ(), "COMPOSE="+composeCmd, "KARTA_BACKUP_MAX_RATE="+rate)
+		var out bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &out
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		during()
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("backup: %v\n%s", err, out.String())
+		}
+		entries, _ := os.ReadDir(dest)
+		if len(entries) != 1 {
+			t.Fatalf("backup directory: %v", entries)
+		}
+		dir = filepath.Join(dest, entries[0].Name())
+		for name, s := range map[string]*summary{"registry.before.json": &before, "registry.after.json": &after} {
+			b, err := os.ReadFile(filepath.Join(dir, name))
+			if err == nil {
+				err = json.Unmarshal(b, s)
+			}
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+		}
+		return dir, before, after
+	}
+	restore := func(dir, want string) string {
+		out, code := script(t, "restore.sh", dir, "--replace")
+		if code != 0 {
+			t.Fatalf("restore across a switch: %s", out)
+		}
+		waitReady(t, true, "ready")
+		waitPublisher(t)
+		waitManifest(t, want)
+		if got := activeFromRegistry(t); got != want {
+			t.Fatalf("restored active release %s, want %s", got, want)
+		}
+		assertRegistryConsistent(t)
+		return out
+	}
+	auditedSwitch := func(to string, afterID int64) int {
+		reg := superuser(t, "karta_registry")
+		defer reg.Close(ctx)
+		var n int
+		if err := reg.QueryRow(ctx, `SELECT count(*) FROM registry.audit WHERE id > $1 AND action = 'rollback' AND target = $2
+		    AND outcome = 'succeeded'`, afterID, to).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	// 1. During the base backup: the restore holds the switch.
+	from := activeFromRegistry(t)
+	to := other(from)
+	dir, before, after := backup(func() {
+		waitUntil("pg_basebackup to stream files", func() bool { return poll(true).running > 0 })
+		switchTo(from, to)
+		if poll(true).running == 0 {
+			t.Fatal("the base backup ended before the switch committed: the test did not switch inside it")
+		}
+	})
+	if before.ActiveRelease != from || after.ActiveRelease != to {
+		t.Fatalf("summaries: before %s, after %s; want %s, %s", before.ActiveRelease, after.ActiveRelease, from, to)
+	}
+	out := restore(dir, to)
+	if auditedSwitch(to, before.AuditMaxID) != 1 {
+		t.Error("the restored audit log lacks the switch that the restored pointer reflects")
+	}
+	if !strings.Contains(out, "changed while the backup ran") {
+		t.Errorf("the restore report does not say the registry changed during the backup:\n%s", out)
+	}
+
+	// 2. After the base backup and its WAL stream ended, before the second
+	// summary: hold that summary back (it reads registry.schema_migrations,
+	// which a switch does not touch) until the switch has committed.
+	from, to = to, other(to)
+	dir, before, after = backup(func() {
+		waitUntil("pg_basebackup to start", func() bool { return poll(false).running > 0 })
+		waitUntil("the base backup and its WAL stream to end", func() bool { p := poll(false); return p.running == 0 && p.walsenders == 0 })
+		conn := superuser(t, "karta_registry")
+		defer conn.Close(ctx)
+		lock, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = lock.Rollback(ctx) }()
+		if _, err := lock.Exec(ctx, `LOCK TABLE registry.schema_migrations IN ACCESS EXCLUSIVE MODE`); err != nil {
+			t.Fatal(err)
+		}
+		switchTo(from, to)
+		if err := lock.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if before.ActiveRelease != from || after.ActiveRelease != to {
+		t.Fatalf("summaries: before %s, after %s; want %s, %s (the switch did not land between the base backup and the second summary)",
+			before.ActiveRelease, after.ActiveRelease, from, to)
+	}
+	restore(dir, from)
+	if auditedSwitch(to, before.AuditMaxID) != 0 {
+		t.Error("the restore holds a switch made after the base backup ended")
+	}
 }
 
 // keepSecrets puts the checkout's secret files back as they were when the
@@ -683,9 +863,17 @@ func TestOperations(t *testing.T) {
 		if out, err := exec.Command("docker", "volume", "rm", "karta-test_pgdata").CombinedOutput(); err != nil {
 			t.Fatalf("remove the database volume: %v %s", err, out)
 		}
+		t.Setenv("KARTA_RESTORE_REPORTS", t.TempDir())
+		// The outbox still holds fetcher state: without --replace the
+		// restore refuses before it touches the empty database volume.
+		if out, code := script(t, "restore.sh", dir); code == 0 || !strings.Contains(out, "holds files; nothing was changed") {
+			t.Fatalf("restore over an outbox with files, without --replace: %d %s", code, out)
+		}
+		if pgdataHasCluster(t) {
+			t.Fatal("the refused restore extracted the database")
+		}
 		_ = os.RemoveAll(stateDir)
 
-		t.Setenv("KARTA_RESTORE_REPORTS", t.TempDir())
 		start = time.Now()
 		out, code = script(t, "restore.sh", dir)
 		if code != 0 {
@@ -774,7 +962,7 @@ func TestOperations(t *testing.T) {
 			// Refused before anything changes: a restore over a database
 			// without --replace, a damaged file, and a damaged base backup
 			// whose SHA256SUMS was rewritten to match.
-			if out, code := script(t, "restore.sh", pre); code == 0 || !strings.Contains(out, "holds a database; add --replace") {
+			if out, code := script(t, "restore.sh", pre); code == 0 || !strings.Contains(out, "holds a database; nothing was changed") {
 				t.Errorf("restore over a database without --replace: %d %s", code, out)
 			}
 			damaged := filepath.Join(t.TempDir(), "damaged")
@@ -808,6 +996,10 @@ func TestOperations(t *testing.T) {
 			waitPublisher(t)
 			waitManifest(t, active)
 			assertRegistryConsistent(t)
+		})
+
+		t.Run("a release switch around the base backup is restored as the state the base backup ended with", func(t *testing.T) {
+			testSwitchAroundBackup(t)
 		})
 	})
 

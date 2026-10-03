@@ -485,14 +485,21 @@ limit or lower the cache from capacity measurements ("Capacity").
   database roles;
 * `online.tar`: the fetcher's outbox (its state, with the highest verified
   serial, and complete deliveries; partial downloads are excluded), copied
-  while the fetcher is paused;
+  while the fetcher is paused. A fetcher that was running is started again
+  however the backup ends: success, a failed copy or an interrupt
+  (Ctrl-C, `SIGTERM`, `SIGHUP`). The backup keeps its own exit status, and a
+  fetcher that was already stopped stays stopped;
 * `registry.before.json`, `registry.after.json`: what the registry held
-  before and after the base backup (`karta registry-summary`), which
-  `restore-check` compares against;
+  just before and just after the base backup (`karta registry-summary`, each
+  read from one consistent snapshot), which `restore-check` compares against;
 * `config/`: region and source files, `.env`, the Compose files and the
   monitoring thresholds;
 * `MANIFEST` (ids, Karta commit, image ids, PostgreSQL version, secret
   fingerprints, duration) and `SHA256SUMS`.
+
+`KARTA_BACKUP_MAX_RATE` (for example `20M`, in kB/s with an optional `k` or
+`M` suffix) limits how fast `pg_basebackup` reads, to spare a busy host's
+disks; the backup then takes longer.
 
 **Not in the backup:** secrets (keep `./secrets` offline, separately) and
 the snapshots themselves. The PBF files and their sidecars are the
@@ -536,19 +543,37 @@ failure:
    refused (see below);
 2. compare `./secrets` with the backup's fingerprints (a difference only
    warns: step 5 applies the current secrets);
-3. refuse to overwrite a database or a non-empty outbox without `--replace`;
+3. preflight, before anything is changed: if the database volume holds a
+   cluster or the fetcher's outbox holds files, refuse without `--replace`,
+   naming both, and change nothing. This includes a lost database with a
+   surviving outbox, and an outbox the backup cannot replace because it has
+   no `online.tar`. With `--replace`, the database volume is deleted;
 4. extract the base backup and its WAL into a new `pgdata` volume. PostgreSQL
    replays to the backup's consistent end when it starts;
 5. set every role's password to the current `./secrets`
    (`rotate-db-password.sh --current`), because a physical backup carries
    the old cluster's roles;
-6. restore the fetcher's outbox;
+6. restore the fetcher's outbox from the backup. If the backup has none,
+   `--replace` empties the outbox instead, so that no fetcher state or
+   delivery from another registry survives;
 7. `karta restore-check --finalize`. The checks: registry schema; every
    retained release database present and read-only; the active release
-   loadable; the audit table append-only; the active release, the
-   retained/pinned releases and the audit history as backed up; the
-   anti-replay floor not lowered. Notes report changes during the backup
-   and a fetcher serial above the registry's. Only if every check passes, it
+   loadable; the audit table append-only. Then the restore is checked
+   against the backup's two summaries. A base backup restores the registry
+   as it was when the base backup ended, so the restore must lie between
+   the summary taken before it and the one taken after:
+   * audit history and verified serials at least those before, and no
+     newer than those after;
+   * every release present in both summaries present in the restore;
+   * the anti-replay floor not lowered;
+   * the active release equal to the one the restored audit log's last
+     pointer move activated (every switch is audited in its own
+     transaction), or the first summary's if there was none.
+
+   When nothing changed during the backup, all of this means an exact
+   match. Notes report a registry that changed during the backup, a serial
+   verified after the base backup ended, and a fetcher serial above the
+   registry's. Only if every check passes, it
    **pauses automatic online activation** and **audits the restored active
    pointer** (action `restore`, like a rollback) in one transaction. The
    report is saved in `backups/restore-reports/`;
@@ -570,7 +595,9 @@ The fetcher is not started. After a restore:
   are exactly why activation stays paused until an operator has checked the
   producer.
 * **Publications after the backup** are not in it: the recovery point is
-  the backup's time. Submit their snapshots again (touch the ready
+  the end of the base backup. A switch, publication or authorization made
+  while the backup finished (after the base backup ended) is not in the
+  restore, even though `registry.after.json` shows it. Submit their snapshots again (touch the ready
   markers), and authorize again any digest authorized after the backup.
 * `make op-status`, `make smoke`.
 
@@ -588,6 +615,9 @@ the tablespace's volume, owned by `postgres` with mode 0700, and point
 | A publication after the backup is absent after the restore (recovery point = backup time) | A | same test |
 | Failed upgrade (registry schema newer than the build) undone by restoring with `--replace` | A | same test, "a failed upgrade is undone …" |
 | A damaged backup, and a restore over a database without `--replace`, refused before anything changes | A | same test |
+| A lost database with a surviving outbox, without `--replace`: refused, the database volume left unextracted | A | same test |
+| A release switch while `pg_basebackup` streams the files, and one after it ended but before the second summary: both restores pass, the first holds the switch and the second does not | A | `TestOperations` "a release switch around the base backup …"; `TestCompareWithBackup` |
+| The fetcher is started again after a failed or interrupted outbox copy, and a stopped fetcher stays stopped; the restore preflight changes nothing when it refuses, and `--replace` empties an outbox a backup without one cannot replace | A | `tests/scripts` (the scripts against stand-ins for Docker) |
 | Disk exhaustion before a build, in staging and in the database during an import | A | `TestPublication` "disk exhaustion fails safely" |
 | Rollback, pinned clients, cleanup, crash at every transition | A | `TestPublication`, `TestOnline` |
 | Chitgar: backup under load (8,301 requests, 0 errors), restore into an isolated project | B | backup 10 s (16 MB), restore 16.7 s, all checks passed |

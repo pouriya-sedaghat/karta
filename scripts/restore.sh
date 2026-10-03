@@ -6,13 +6,16 @@
 #   1. verify the backup (SHA256SUMS, pg_verifybackup)
 #   2. compare ./secrets, restored first from offline storage, with the
 #      backup's fingerprints (a mismatch only warns: step 5 applies ./secrets)
-#   3. refuse to overwrite a database or outbox that holds data (--replace
-#      deletes them first)
+#   3. preflight, before anything is changed: the database volume and the
+#      fetcher's outbox must both be empty, or --replace must be given (it
+#      deletes them); an outbox the backup cannot fill must be mountable
 #   4. database: a new pgdata volume, the base backup and its WAL; PostgreSQL
 #      replays to the backup's consistent end when it starts
 #   5. set the role passwords to ./secrets (scripts/rotate-db-password.sh
 #      --current): a physical backup carries the backed-up cluster's roles
-#   6. the fetcher's outbox (state and deliveries), if the backup has one
+#   6. the fetcher's outbox (state and deliveries) from the backup; with
+#      --replace and a backup without one, the outbox is emptied so that no
+#      stale fetcher state or delivery survives
 #   7. karta restore-check --finalize: the registry and every retained release
 #      are verified against the backup; automatic online activation is paused
 #      and the restored active pointer is audited
@@ -62,17 +65,28 @@ for s in db_superuser_password db_importer_password db_api_password db_monitor_p
     echo "restore: note: secrets/$s differs from the backup's; it is applied as the current secret" >&2
 done
 
-# 3. Where the data goes; nothing is overwritten without --replace.
+# 3. Preflight: where the data goes. Nothing has been changed so far, and
+# nothing is changed unless both destinations may be written.
 $COMPOSE create db publisher > /dev/null 2>&1 || fail "cannot create the db and publisher containers (images built? .env?)"
 dbc=$($COMPOSE ps -a -q db)
 pub=$($COMPOSE ps -a -q publisher)
 pgdata=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Name}}{{end}}{{end}}' "$dbc")
 online=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data/online"}}{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}' "$pub")
 [ -n "$pgdata" ] || fail "the db service has no pgdata volume"
+[ ! -f "$backup/online.tar" ] || [ -n "$online" ] || fail "the backup has a fetcher outbox but the publisher mounts none"
 has_db() { docker run --rm -v "$1:/var/lib/postgresql:ro" --entrypoint sh "$db_image" -c '[ -f "$PGDATA/PG_VERSION" ]'; }
 has_files() { docker run --rm -v "$1:/v:ro" --entrypoint sh "$db_image" -c '[ -n "$(ls -A /v 2>/dev/null)" ]'; }
-if has_db "$pgdata"; then
-  [ "$replace" = --replace ] || fail "volume $pgdata holds a database; add --replace to delete it and restore"
+db_in_use=""
+outbox_in_use=""
+! has_db "$pgdata" || db_in_use=1
+[ -z "$online" ] || ! has_files "$online" || outbox_in_use=1
+if [ "$replace" != --replace ]; then
+  refuse=""
+  [ -z "$db_in_use" ] || refuse="volume $pgdata holds a database"
+  [ -z "$outbox_in_use" ] || refuse="${refuse:+$refuse; }the outbox $online holds files$( [ -f "$backup/online.tar" ] || echo " (fetcher state or deliveries the backup would not replace)")"
+  [ -z "$refuse" ] || fail "$refuse; nothing was changed. Add --replace to delete them and restore"
+fi
+if [ -n "$db_in_use" ]; then
   echo "restore: --replace: deleting the current database volume $pgdata"
   $COMPOSE --profile online --profile monitoring --profile tools down > /dev/null 2>&1 || true
   docker volume rm "$pgdata" > /dev/null
@@ -105,10 +119,6 @@ chmod 755 "$tmp"
 cp "$backup/registry.before.json" "$backup/registry.after.json" "$tmp/"
 outbox_flag=""
 if [ -f "$backup/online.tar" ]; then
-  [ -n "$online" ] || fail "the backup has a fetcher outbox but the publisher mounts none"
-  if has_files "$online"; then
-    [ "$replace" = --replace ] || fail "the outbox $online holds files; add --replace to delete them and restore"
-  fi
   docker run --rm -v "$online:/dst" -v "$backup/online.tar:/online.tar:ro" --entrypoint sh "$db_image" -c '
     set -eu
     find /dst -mindepth 1 -delete
@@ -116,6 +126,13 @@ if [ -f "$backup/online.tar" ]; then
   mkdir "$tmp/online"
   tar -xf "$backup/online.tar" -C "$tmp/online" ./.fetcher 2>/dev/null || true
   outbox_flag="--fetcher-outbox /restore/online"
+elif [ -n "$outbox_in_use" ]; then
+  # --replace (checked in step 3): the backup has no outbox, so the
+  # current fetcher state and deliveries are removed rather than kept
+  # beside a registry they do not belong to.
+  echo "restore: --replace: the backup has no fetcher outbox; emptying $online"
+  docker run --rm -v "$online:/dst" --entrypoint sh "$db_image" -c 'find /dst -mindepth 1 -delete' ||
+    fail "emptying the outbox failed"
 fi
 chmod -R a+rX "$tmp"
 

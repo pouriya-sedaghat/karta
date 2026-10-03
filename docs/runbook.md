@@ -677,6 +677,7 @@ decided them; until then `KartaDataAgeThresholdUnset` and
 ```bash
 make backup                                                     # backups/karta-<UTC time>: cluster base backup, outbox, registry summaries, config, MANIFEST
 make backup BACKUP_DEST=/mnt/backup                             # elsewhere (keep ./secrets offline, separately)
+KARTA_BACKUP_MAX_RATE=20M make backup                           # limit pg_basebackup's read rate on a busy host
 make restore BACKUP=backups/karta-20261002T150153Z              # into an empty project or host
 make restore BACKUP=backups/karta-20261002T150153Z REPLACE=1    # deletes this project's database and outbox first
 make restore-check                                              # verify the registry and every retained release now (changes nothing)
@@ -684,8 +685,9 @@ COMPOSE="docker compose -p karta-restore-test" KARTA_HTTP_PORT=18180 KARTA_OPERA
   KARTA_API_METRICS_PORT=18464 make restore BACKUP=...         # rehearse into an isolated project
 ```
 
-A restore pauses automatic online activation and audits the restored
-pointer. Before `make up-online` and `online-resume`, confirm the
+A restore checks both destinations first and changes nothing unless the
+database volume and the fetcher's outbox are empty or `REPLACE=1` is given.
+It pauses automatic online activation and audits the restored pointer. Before `make up-online` and `online-resume`, confirm the
 producer's current manifest serial. Then resubmit anything published or
 authorized after the backup (docs/operations.md, "Backup and restore").
 

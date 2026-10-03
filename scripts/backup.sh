@@ -25,7 +25,14 @@
 # password verifiers, the audit log and the data: store it encrypted, with
 # access limited like the secrets. Files are 0600 in a 0700 directory.
 #
+# The fetcher is paused while its outbox is copied. If it was running, it is
+# started again however the backup ends (success, failure or an interrupt),
+# and the backup's own exit status is kept; a fetcher that was stopped
+# stays stopped.
+#
 #   scripts/backup.sh [DEST]          COMPOSE overrides `docker compose`
+#   KARTA_BACKUP_MAX_RATE=20M         limits pg_basebackup's read rate (kB/s,
+#                                     or with a k/M suffix) on a busy host
 set -eu
 cd "$(dirname "$0")/.."
 COMPOSE=${COMPOSE:-docker compose}
@@ -39,8 +46,32 @@ dest=$(cd "$dest" && pwd)
 work="$dest/.$id.partial"
 final="$dest/$id"
 [ ! -e "$final" ] || { echo "backup: $final exists" >&2; exit 1; }
+max_rate=${KARTA_BACKUP_MAX_RATE:-}
+case "$max_rate" in
+  *[!0-9kM]*|[!1-9]*|*[kM]?*) echo "backup: KARTA_BACKUP_MAX_RATE must be a number with an optional k or M suffix" >&2; exit 2 ;;
+esac
+
+# Cleanup on every exit: remove the unfinished backup and start the fetcher
+# again if this run stopped it. The exit status is the backup's own.
+fetcher_paused=""
+cleanup() {
+  status=$?
+  trap - EXIT INT TERM HUP
+  if [ -n "$fetcher_paused" ]; then
+    if $COMPOSE --profile online start fetcher > /dev/null 2>&1; then
+      echo "backup: the fetcher was started again" >&2
+    else
+      echo "backup: the fetcher could not be started again; start it with make up-online" >&2
+    fi
+  fi
+  rm -rf "$work"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir "$work"
-trap 'rm -rf "$work"' EXIT
 fail() { echo "backup: $*" >&2; exit 1; }
 
 db=$($COMPOSE ps -q db)
@@ -67,7 +98,7 @@ docker run --rm --network "container:$db" --user "$me" \
     umask 077
     printf "127.0.0.1:5432:*:postgres:%s\n" "$(cat /run/secrets/pw)" > /tmp/pgpass
     PGPASSFILE=/tmp/pgpass exec pg_basebackup -h 127.0.0.1 -U postgres -D /backup \
-      -Ft -z -X stream -c fast --manifest-checksums=SHA256 --label="$1"' sh "$id" ||
+      -Ft -z -X stream -c fast --manifest-checksums=SHA256 --label="$1" ${2:+--max-rate="$2"}' sh "$id" "$max_rate" ||
   fail "pg_basebackup failed"
 docker run --rm --user "$me" -v "$work/db:/backup:ro" --entrypoint pg_verifybackup "$db_image" -n -q /backup ||
   fail "pg_verifybackup refused the base backup"
@@ -94,13 +125,21 @@ if [ -n "$pub" ]; then
 fi
 if [ -n "$online" ]; then
   fetcher=$($COMPOSE --profile online ps -q --status running fetcher 2>/dev/null || true)
-  [ -z "$fetcher" ] || $COMPOSE --profile online stop fetcher > /dev/null
+  if [ -n "$fetcher" ]; then
+    # Set before stopping: a stop that fails or is interrupted half-way
+    # still gets the fetcher started again by cleanup.
+    fetcher_paused=1
+    $COMPOSE --profile online stop fetcher > /dev/null || fail "stopping the fetcher failed"
+  fi
   docker run --rm -v "$online:/src:ro" -v "$work:/dst" --entrypoint sh "$db_image" -c '
     set -eu
     cd /src
     tar --numeric-owner --exclude=./.partial --exclude="./.tmp-*" -cf /dst/online.tar .
     chown "$1" /dst/online.tar' sh "$me" || fail "copying the fetcher outbox failed"
-  [ -z "$fetcher" ] || $COMPOSE --profile online start fetcher > /dev/null
+  if [ -n "$fetcher_paused" ]; then
+    $COMPOSE --profile online start fetcher > /dev/null || fail "starting the fetcher again failed"
+    fetcher_paused=""
+  fi
 fi
 
 mkdir -p "$work/config"
@@ -135,5 +174,4 @@ image_id() { docker image inspect -f '{{.Id}}' "$1" 2>/dev/null || echo unknown;
 (cd "$work" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum) > "$work/SHA256SUMS"
 chmod -R go-rwx "$work"
 mv "$work" "$final"
-trap - EXIT
 echo "backup complete: $final ($(du -sh "$final" | cut -f1), $(( $(date +%s) - started )) s)"

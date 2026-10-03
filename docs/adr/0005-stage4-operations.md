@@ -143,13 +143,28 @@ re-decided with the tier D import time and backup size.
 
 ### Restore: verified, audited, anti-replay preserved
 
-`scripts/restore.sh` has a fixed order: verify, compare secrets, refuse to
-overwrite without `--replace`, database, role passwords from the current
-secrets, outbox, `karta restore-check --finalize`, then serving.
-`restore-check` compares the restored registry with the summaries taken at
-backup time: pointer, retained and pinned releases, audit history,
-anti-replay floor, release databases present and read-only, audit table
-append-only, active release loadable.
+`scripts/restore.sh` has a fixed order: verify, compare secrets, a
+preflight of both destinations, database, role passwords from the current
+secrets, outbox, `karta restore-check --finalize`, then serving. The
+preflight refuses before anything changes if the database volume or the
+fetcher's outbox holds data and `--replace` is not given. With `--replace`
+and a backup without an outbox, the outbox is emptied rather than left with
+another registry's fetcher state.
+
+`restore-check` verifies release databases present and read-only, the
+audit table append-only, and the active release loadable. It also checks
+the restore against the two summaries the backup takes around
+`pg_basebackup`, each read from one repeatable-read snapshot. A physical
+base backup restores the registry as it was when the base backup ended,
+which is any moment between the two summaries. So the restore is checked
+as an interval, not against either endpoint: the append-only audit log and
+the verified serials must lie between the two, releases present in both
+must be present, and the anti-replay floor must not drop. The active
+pointer is pinned down exactly, because every switch is audited in its own
+transaction: the restore's pointer must be the one its own audit log's
+last switch after the first summary activated, or the first summary's.
+Restoring the backup into a scratch cluster to summarize its exact state
+would be equally exact, but it doubles the backup's time and space.
 
 Restoring an older registry restores an older pointer and an older
 `registry.source_state` serial. So only after every check passes, one
