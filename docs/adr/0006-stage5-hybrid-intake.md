@@ -84,8 +84,9 @@ watcher token cannot present its deliveries as deliberate ones.
 **Capability.** Both scopes reach only `/v1/operator/intake/*`:
 
 * `POST /v1/operator/intake/authorizations` creates one authorization for an
-  exact SHA-256 with a **required** size, a **required** `expires_at` no later
-  than `KARTA_INTAKE_AUTHORIZATION_MAX_AGE` from now, the region the request
+  exact SHA-256 with a **required** size, a **required** lifetime
+  (`ttl_seconds`; the publisher sets `expires_at` from its own clock) no
+  longer than `KARTA_INTAKE_AUTHORIZATION_MAX_AGE`, the region the request
   names (refused unless it is the publisher's region), and the handoff name
   it will use. At most `KARTA_INTAKE_MAX_OPEN` (default 2) open, unexpired
   authorizations per credential. The same credential repeating the same
@@ -190,7 +191,7 @@ hypervisor or SMB shared folder is only an untrusted transfer space: from it,
 use the command with an expectation.
 
 **Command.** `karta intake submit FILE` requires an independent expectation
-(`--expect-sha256` and `--expect-size`, or `--expect-file` with a
+(`--expect-sha256`, optionally with `--expect-size`, or `--expect-file` with a
 `karta-delivery/1` marker) or an explicit `--attest-complete` with a reason
 (recorded as the named operator's attestation). It copies the file, hashing
 it, from wherever it is (also an untrusted share), refuses a mismatch before
@@ -470,8 +471,10 @@ Karta's own view of the bridge stays the fetcher's report plus data age
 directory, as it reads the fetcher's, and exports `karta_intake_*` gauges:
 enabled, watcher state age, preflight result, waiting landing entries,
 open intake authorizations, the watcher's activation policy and the last
-outcome. New alerts: `KartaIntakeWatcherOverdue`, `KartaIntakePreflightFailing`,
-`KartaIntakeActivationPaused`. A co-located bridge exposes its own metrics on
+outcome. New alerts: `KartaIntakeWatcherOverdue` (unless the watcher
+recorded a clean stop, `stopped_at`), `KartaIntakePreflightFailing`,
+`KartaIntakeDeliveryRefused`, `KartaIntakeActivationPaused` (only where a
+watcher runs). A co-located bridge exposes its own metrics on
 `bridge-serve` (separate listener, `status`-scoped credential) for a
 Prometheus that is told to scrape it; its alerts (`KartaBridge*`) are in their
 own rule group.
@@ -496,7 +499,9 @@ New scopes `intake_watch` and `intake_submit`; endpoints
 `/v1/operator/intake/authorizations` (`POST`, `GET`),
 `/v1/operator/intake/authorizations/{id}/close`, and `/v1/operator/intake/pause`
 and `/resume` (`publish`); error codes `intake_disabled`,
-`intake_limit_reached`, `credentials_unavailable`; reason codes
+`intake_limit_reached`, `intake_refused` (409, with reason codes
+`region_mismatch`, `too_large`, `validity_beyond_cap`) and
+`credentials_unavailable`; reason codes
 `authorization_revoked`, `authorization_expired`, `intake_activation_paused`;
 status gains `intake`. The public API is unchanged.
 
@@ -537,3 +542,41 @@ the production polling, validity, renewal and data-age values and the service
 objectives; the fixed Iran PBF (exact bytes, digest, provenance) for the
 region file and the VM rehearsal; authorization of a VM rehearsal plan; the
 production host and the other Stage 4 owner inputs (docs/operations.md).
+
+## Implementation notes (draft PR)
+
+What the implementation settled within the decisions above, for review:
+
+* **Packages.** `internal/intake` (preflight, landing scan, completion
+  marker, handoff with crash reconciliation, watcher, command),
+  `internal/bridge` (acquire, sign, serve, metrics), shared file helpers in
+  `internal/safefile`; `cmd/karta` gains `intake watch|submit|check` and
+  `bridge acquire|sign|serve|status`, with `operator intake-pause|intake-resume`.
+* **Deployment.** `compose.yaml` gains the `intake` volume (read-only in the
+  publisher, off unless `KARTA_INTAKE_DIR=/data/intake`), `intake-watch`
+  (profile `intake`) and `intake-cli`; `compose.bridge.yaml` runs the bridge
+  standalone or co-located (the fetcher then joins only `bridge`). Make
+  targets: `intake-check`, `up-intake`, `intake-off`, `intake-submit`,
+  `deliver`, `bridge-tls`, `up-bridge`, `bridge-status`,
+  `bridge-raise-high-water`, `bridge-off`. Scripts: `operator-credential.sh`,
+  `deliver.sh`, `gen-bridge-tls.sh`; `gen-secrets.sh` rewrites
+  `operator_tokens` in place and merges `operator_tokens.extra`; the restore
+  script also stops the watcher.
+* **Watcher clean stop.** The watcher records `stopped_at` when it stops on a
+  signal and clears it at its next scan, so a deliberately stopped watcher
+  does not raise the overdue alert while a crashed or hung one does
+  (`karta_intake_watcher_stopped`).
+* **Signer staging.** The signer copies each spooled delivery into a private
+  staging directory in its publish volume before it verifies and hashes it,
+  so the downloader cannot change the bytes between verification and
+  publication; the content-addressed asset is that copy.
+* **Recovery after a raise.** After an older signer state is restored and
+  the high-water serial raised, the signer may sign a snapshot again that
+  the restored state never recorded (same bytes, a new serial). No serial
+  is reused or lowered (tested end to end).
+* **Evidence.** Tier A only: unit tests with race detection for every new
+  package, script tests, promtool rule tests with negative controls, and
+  `TestIntake` and `TestBridge` against the Compose stack (fixtures, the
+  controlled HTTPS source as the distributor stand-in, keys generated per
+  run). No Iran PBF, VM or production host was used.
+

@@ -1,11 +1,13 @@
-# Karta operations (Stage 4)
+# Karta operations (Stages 4 and 5)
 
 This is the operator's reference for running Karta beyond a development
 host: what is deployed and who can reach what, how long a publication may
 run, what is monitored and how to respond to each alert, backup and
 restore, credential and key rotation, and how capacity is measured. The
 commands themselves are also listed in the [runbook](runbook.md);
-decisions are in [ADR 0005](adr/0005-stage4-operations.md).
+decisions are in [ADR 0005](adr/0005-stage4-operations.md) and, for the
+local intake and the controlled source bridge,
+[ADR 0006](adr/0006-stage5-hybrid-intake.md).
 
 **Status.** Everything here was exercised with the committed fixtures
 (evidence tier A) and the supplied Chitgar extract (tier B). Neither tier
@@ -15,12 +17,19 @@ made**. The open owner inputs are listed at the end ("Owner inputs"); until
 they are decided, every number below marked *provisional* is an
 engineering default, not an objective.
 
+**Stage 5** (the local intake and the controlled source bridge) is an
+**engineering feature implemented**: it was exercised with fixtures, a local
+controlled HTTPS stand-in for the distributor and throwaway keys only (tier
+A). No Iran PBF was obtained, it was **not measured on the owner's VM** (tier
+C) and it is **not validated on a production host** (tier D). Each of those
+needs its own reviewed plan and deployment inputs ("Owner inputs").
+
 | Tier | Where and with what | What it can establish |
 | --- | --- | --- |
 | A | CI fixtures, the local controlled HTTPS source, throwaway keys and tokens | correctness, failure handling, alert logic, restore and rotation mechanics |
 | B | the supplied Chitgar extract in the implementation environment | the real-data path and small-scale resource figures |
-| C | optional, owner's choice: the owner's VM under an approved plan | procedures on a real host |
-| D | the owner-selected Iran snapshot, host and objectives | capacity, limits, margins, publication, recovery time and data loss |
+| C | optional, owner's choice: the owner's Windows-hosted VM, only under an owner-approved test plan (backups and VM state, the fixed Iran PBF and digest, how files reach the VM, filesystem types, free disk inside the VM and on the Windows host, a clock check across suspend and resume) | procedures, and full-Iran measurements, **on that VM only**; never production-host acceptance |
+| D | the owner-selected Iran snapshot, production host and objectives | capacity, limits, margins, publication, recovery time and data loss; the only basis for a production-readiness claim |
 
 A result never counts toward a higher tier.
 
@@ -39,6 +48,11 @@ images, users and limits:
 | `fetcher` (opt-in, profile `online`) | `karta-api` | 65532 | `egress` only | none | 256 MiB / 0.5 / 64 |
 | `importer` (one-off) | `karta-importer` | 10001, `docker-init` | `backend` | none | 4 GiB / – / 256 |
 | `operator-cli` (one-off) | `karta-api` | 65532 | `operator` | none | – |
+| `intake-watch` (opt-in, profile `intake`) | `karta-api` | 65532 | `operator` (no NAT) | none | 256 MiB / 0.5 / 64 |
+| `intake-cli` (one-off) | `karta-api` | 65532 | `operator` (no NAT) | none | 256 MiB / 0.5 / 64 |
+| `bridge-acquire` (opt-in, `compose.bridge.yaml`) | `karta-api` | 65532 | `bridge-egress` only | none | 256 MiB / 0.5 / 64 |
+| `bridge-sign` (opt-in) | `karta-api` | 65532 | **none** (`network_mode: none`) | none | 512 MiB / 1 / 64 |
+| `bridge-serve` (opt-in) | `karta-api` | 65532 | `bridge` (no NAT) | 8443 (bridge HTTPS), 9465 (bridge metrics) | 128 MiB / 0.5 / 64 |
 | `postgres-exporter` (opt-in, profile `monitoring`) | `prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343…` | nobody | `backend`, `monitoring` (no NAT) | 9187 | 128 MiB / 0.25 / 32 |
 | `prometheus` (opt-in, profile `monitoring`) | `prom/prometheus:v3.15.0@sha256:efd719c9…` | nobody | `backend`, `monitoring` (no NAT) | 9090 | 512 MiB / 0.5 / 64 |
 
@@ -59,6 +73,8 @@ their base images pinned by digest (`deploy/Dockerfile`).
 | PostgreSQL exporter | :9187 | monitoring | statistics only (role `karta_monitor`), loopback by default; TLS proxy if exposed |
 | Prometheus | :9090 | operators | no authentication of its own: keep it on loopback or behind an authenticating proxy |
 | PostgreSQL | none | the stack's containers on `backend` | SCRAM-SHA-256; no published port |
+| Bridge manifest and assets (opt-in) | bridge-serve :8443 | the fetcher (co-located: over `bridge`; separate host: `KARTA_BRIDGE_BIND`) | TLS with the bridge's own CA (`make bridge-tls`); `GET`/`HEAD` of the manifest and content-addressed assets only; what it serves is signed and verified again by the fetcher |
+| Bridge metrics (opt-in) | bridge-serve :9465 (`KARTA_BRIDGE_METRICS_LISTEN_ADDR`) | monitoring | bearer credential with scope `status` (the `metrics_tokens` file); loopback by default |
 
 Only the fetcher has a route out of the host (network `egress`), and only
 when online updates are configured. The `operator` and `monitoring`
@@ -70,6 +86,14 @@ command-line import continue (tested: `TestOnline`, "a broken transfer
 resumes; network loss backs off; manual publication keeps working";
 `make test-offline`).
 
+With a **co-located bridge** (`compose.bridge.yaml`) the downloader
+`bridge-acquire` is the only container with a route out (`bridge-egress`);
+the fetcher leaves `egress` and joins only `bridge`, a no-NAT network with
+`bridge-serve`; `bridge-sign`, which holds the key, has no network at all
+(tested: `TestBridge`, "only the downloader has a route out"). The intake
+watcher and command are on `operator` only. Local intake needs no network
+and no bridge.
+
 ### Volumes, host paths and permissions
 
 | Data | Location | Writers | Readers |
@@ -78,6 +102,12 @@ resumes; network loss backs off; manual publication keeps working";
 | staging copies of snapshots | volume `staging` (0700) | publisher | publisher |
 | fetcher outbox (verified deliveries, fetcher state) | volume `online` | fetcher | publisher (read-only) |
 | inbox | `./data/inbox` (`KARTA_INBOX_HOST_DIR`) | **any host identity that can write the directory** | publisher (read-only) |
+| intake landing area (opt-in) | `KARTA_INTAKE_LANDING_HOST_DIR`, a local POSIX directory owned by the landing account (`KARTA_INTAKE_LANDING_UID`), 0755 or 0775 with `KARTA_INTAKE_WRITER_GID` | **the landing account only** (SFTP, per-person keys); checked by the preflight before every scan and by `make intake-check` | intake-watch (read-only) |
+| intake handoff (opt-in) | volume `intake` | intake-watch, intake-cli | publisher (read-only) |
+| bridge spool | volume `bridge-spool` | bridge-acquire | bridge-sign, bridge-serve (read-only) |
+| bridge publish (manifest, assets) | volume `bridge-publish` | bridge-sign | bridge-serve (read-only) |
+| bridge signer state (high-water serial, pending envelope) | volume `bridge-state` (0700) | bridge-sign | bridge-sign |
+| bridge configuration | `./config/bridge` | host identities with write access to the checkout | bridge-acquire, bridge-sign (read-only) |
 | region and source configuration | `./config/regions`, `./config/sources` | host identities with write access to the checkout | publisher, importer, fetcher (read-only) |
 | secrets | `./secrets` (0700, files 0644) | the host user that ran `make secrets` | each container gets only the secrets it needs (below) |
 | Prometheus data | volume `prometheus` | prometheus | prometheus |
@@ -89,6 +119,15 @@ imported. Writing `config/regions` *does* change what is authorized (the
 pinned digest), and writing `config/sources` changes which signing keys are
 trusted. Treat both as reviewed configuration owned by the same people who
 hold the operator token.
+
+**Stage 5 publication authority.** While the watcher runs, write access to
+the landing area is publication authority for any snapshot that passes the
+common checks (like the signing key); so is the watcher's token together
+with write access to the `intake` volume, and a person's `intake_submit`
+token together with a run of the command. Writing `config/bridge` changes
+what the bridge downloads and how it signs; the bridge's signing key is
+publication authority for online updates. Keep the landing account's keys,
+the intake tokens and the bridge key with named people.
 
 ### Who can read credentials
 
@@ -102,6 +141,11 @@ hold the operator token.
 | `operator_monitor_token` (raw, scope `status`) | prometheus | monitoring |
 | `operator_tokens`, `metrics_tokens` (hashes only) | publisher, api | – |
 | an online source's bearer token (optional) | fetcher | – |
+| `intake_watch_token` (raw, scope `intake_watch`) | intake-watch | – |
+| a person's `NAME.token` (raw, scope `intake_submit`) | intake-cli, for that person's run | that person |
+| `operator_tokens.extra` (hashes only) | – (host; merged into `operator_tokens`) | – |
+| bridge signing key | bridge-sign only | its custodian (owner decision) |
+| bridge TLS key / CA key | bridge-serve / none (host only) | – |
 
 **Root and the `docker` group on the host can read every secret and every
 volume.** Docker access is equivalent to root. Grant it only to the
@@ -117,6 +161,11 @@ rotation scripts need it.
 | fetcher | write its outbox; reach the configured source over HTTPS | reach the database (not on `backend`), publish anything (the publisher re-verifies every delivery) | tested: `TestOnline` "a compromised fetcher cannot publish …" |
 | operator token | every operator action, audited | anything outside the operator API | keep it with operators; the publisher holds only its hash |
 | monitoring token (`status`) | read operator status and both metrics endpoints | publish, roll back, authorize, clean up | status names submissions, digests and audit reasons, but no secret; a narrower metrics-only scope is a possible later refinement |
+| intake watcher (`intake_watch`) | create bounded exact-digest authorizations for its region; list and close its own; write the `intake` volume; read the landing area | read status or audit; revoke, supersede or extend others' authorizations; activate, roll back, clean up; change any policy; reach the database or the internet | tested: `TestIntake` "intake credentials reach nothing but their own authorizations"; a rollback pauses what only it admitted |
+| intake command (`intake_submit`, one per person) | the same, as a named person; its deliveries are not paused by a rollback | the same | tested as above |
+| bridge-acquire | reach the distributor over HTTPS; write the spool | sign, serve, reach Karta | the signer re-verifies everything it signs |
+| bridge-sign | read the spool, sign, write the publish volume and its state | any network | the only holder of the key |
+| bridge-serve | read the publish volume and serve it | sign, write, reach the internet | |
 | exporter, role `karta_monitor` | `pg_monitor` statistics and settings; 3 connections; read-only sessions; `CONNECT` to `postgres` only | read table data | `scripts/create-monitor-role.sh` |
 | backup and restore | the superuser password and Docker access on the host | – | a dedicated `REPLICATION`-only backup role would not narrow this while the scripts need Docker access, which is root-equivalent. Choose it with the backup destination if backups move to a separate backup host |
 
@@ -225,7 +274,21 @@ publication time, and the budget derived from it) is open.
   outcomes (`karta_publications_total{source,state}`), the duration
   histogram (`karta_publication_duration_seconds{source}`), timeouts
   (`karta_publication_timeouts_total`), the online source and fetcher state,
-  and the process start time.
+  the local intake (Stage 5: `karta_intake_enabled`,
+  `karta_intake_watcher_auto_activation`,
+  `karta_intake_open_authorizations{channel}`, and from the watcher's own
+  report `karta_intake_watcher_state_age_seconds`,
+  `karta_intake_watcher_stopped`, `karta_intake_preflight_ok`,
+  `karta_intake_last_scan_timestamp_seconds`, `karta_intake_landing_waiting`,
+  `karta_intake_landing_refused`), and the process start time.
+* **Bridge** (co-located, opt-in), `bridge-serve`'s metrics listener
+  (`KARTA_BRIDGE_METRICS_LISTEN_ADDR=:9465`, scope `status`): the acquire and
+  sign reports (`karta_bridge_*`: state ages, last check and success, next
+  attempt, consecutive failures and the last error code, the verified
+  download, the high-water and published serial, manifest expiry and data
+  timestamp, a held download, the signer's last error). Karta's own view of
+  the bridge stays the fetcher's report and the data age: Karta never
+  connects to the bridge for monitoring.
 * **API**, a separate metrics listener (`KARTA_METRICS_LISTEN_ADDR`, `:9464`
   in Compose, never the public listener): readiness and its reason, the
   loaded release, requests by route and status class, the request duration
@@ -253,7 +316,10 @@ A Prometheus elsewhere can scrape the same endpoints through the loopback
 ports (`127.0.0.1:9464/metrics` and `127.0.0.1:8081/v1/operator/metrics`
 with `Authorization: Bearer <operator_monitor_token>`; `127.0.0.1:9187`).
 Load `deploy/monitoring/alerts.yml` together with
-`deploy/monitoring/thresholds.yml`. Where alerts are delivered
+`deploy/monitoring/thresholds.yml`. With a co-located bridge,
+`compose.bridge.yaml` mounts `deploy/monitoring/bridge/scrape.yml` into the
+monitoring profile's Prometheus (job `karta-bridge`); a Prometheus elsewhere
+adds the same job for `127.0.0.1:9465`. Where alerts are delivered
 (Alertmanager, on-call) is an owner decision and is not configured.
 
 ### Thresholds
@@ -265,7 +331,10 @@ recording rules in one place:
   below 10 %, container memory above 90 % of its limit, release storage
   above 80 % of `KARTA_RELEASE_STORAGE_BUDGET_MB`, a publication running
   600 s past its deadline, and the fetcher 900 s late for its own next
-  check;
+  check; Stage 5: the intake watcher's state 900 s old, the bridge
+  downloader 3 h late for its next check (longer than a whole download),
+  the signer's state 30 min old, and a published bridge manifest expiring
+  within a day;
 * **owner objectives**: API error ratio and latency. None is set, so the
   error and latency alerts cannot fire and `KartaObjectivesUnset` says
   so.
@@ -282,7 +351,11 @@ Tier A evidence: `deploy/monitoring/tests/alerts_test.yml` (synthetic
 series: fresh to stale to fresh, an answering source with old data, an unset
 threshold, paused activation, refused and failing sources, a stopped
 fetcher, missing targets, publication timeouts, failures and overruns,
-objectives set and unset, disk, memory and WAL). The live check in
+objectives set and unset, disk, memory and WAL; Stage 5: a crashed versus a
+cleanly stopped watcher, a failing preflight, refused deliveries, paused
+watcher activation only where a watcher runs, and the bridge's down,
+overdue, refused, held, stalled, failing and expiring cases, each with a
+negative control). The live check in
 `TestOperations` runs the monitoring profile against the test stack: every
 target is up, the rules load, and `KartaAPINotReady` and `KartaPostgresDown`
 fire when the database stops and clear when it returns. Tier B: the profile
@@ -387,6 +460,103 @@ Validated online snapshots are kept `ready` instead of being activated:
 paused by an operator, by a rollback or by a restore. When the reason is
 resolved (for a restore: the producer's current serial checked, see
 "Backup and restore"), run `make op CMD='online-resume --reason "..."'`.
+
+#### KartaIntakeWatcherOverdue
+
+The intake watcher has not written its state for 15 minutes although it did
+not stop cleanly: it crashed, is restarting or hangs. Check
+`docker compose --profile intake ps intake-watch` and its logs; restart it
+with `make up-intake`. Deliveries wait in the landing area meanwhile; use the
+command (`make intake-submit`) for an urgent one.
+
+#### KartaIntakePreflightFailing
+
+The landing area fails the preflight (wrong owner, writable by others or by
+another group, a symlink, an unsupported filesystem): the watcher delivers
+nothing from it. `make op-status` (intake, watcher, preflight) and
+`make intake-check` name the problem. Fix the permissions or move the
+landing area to a local POSIX filesystem; use the command meanwhile. Never
+relax the check by mounting a shared folder.
+
+#### KartaIntakeDeliveryRefused
+
+The watcher refused a landing delivery: a size or digest mismatch with its
+completion marker (an incomplete or changed copy), a stale or invalid
+marker, an unsafe file (symlink, FIFO, hard link, another owner), a wrong
+region or an unreadable PBF. The entry and its code are in
+`make op-status` (intake, watcher, entries). Nothing was authorized. Have
+the producer deliver again under a new name with a marker computed from the
+source copy (runbook, "Local intake"), and remove the refused files.
+
+#### KartaIntakeActivationPaused
+
+Deliveries admitted only by the watcher are kept `ready` instead of being
+activated: paused by an operator, a rollback or a restore. Deliberate command
+deliveries are not paused. When the reason is resolved, run
+`make op CMD='intake-resume --reason "..."'`. A delivery kept `ready`
+meanwhile can be activated explicitly (`make op CMD='activate ...'`).
+
+#### KartaBridgeDown
+
+The bridge's metrics listener does not answer: `bridge-serve` is stopped,
+its metrics listener is off (`KARTA_BRIDGE_METRICS_LISTEN_ADDR`) or the
+scrape job cannot reach it. Its other alerts are blind. Check
+`make bridge-status` and the bridge's containers; Karta's own data age
+alerts still work.
+
+#### KartaBridgeStatusUnreadable
+
+`bridge-serve` cannot read the acquire or sign reports (a volume missing or
+damaged). Check the bridge volumes and `make bridge-status`.
+
+#### KartaBridgeAcquireOverdue
+
+The downloader is hours late for its next distributor check: stopped or
+stuck. Restart `bridge-acquire`; the signer keeps renewing the current
+manifest meanwhile.
+
+#### KartaBridgeSourceRefused
+
+The bridge refused the distributor's answer for a trust reason: the bytes
+did not match the distributor's `.md5`, TLS, a refused destination or
+redirect, an oversized file, or an invalid source file. Nothing was signed.
+Check the source file and the distributor; treat repeated checksum
+mismatches as a possible interception.
+
+#### KartaBridgeAcquireFailing
+
+Distributor checks have failed for 12 hours (the `code` label: network,
+rate limiting, HTTP errors, timeouts). Serving and local intake are
+unaffected; the current manifest is renewed until the distributor answers.
+Fix connectivity, or deliver a snapshot locally.
+
+#### KartaBridgeHeld
+
+The signer holds a download it did not sign: different bytes whose data are
+not newer than the last signed snapshot (`not_newer`), or bytes that failed
+Karta's checks. `make bridge-status` (sign, held) has the digest and reason.
+Inspect it; nothing needs undoing. The hold clears when newer data are
+signed.
+
+#### KartaBridgeSignerStalled
+
+The signer has not written its state for 30 minutes: stopped, failing
+closed at start (a lost or older state, a missing key, a clock behind its
+last signature) or stuck. Its logs name the reason. For a state problem
+follow the runbook ("The bridge signer refuses to start").
+
+#### KartaBridgeSignerFailing
+
+The signer's last run failed (the `code` label: `clock_behind`,
+`asset_missing`, `serial_exhausted`, a storage error). Fix the cause;
+manifests expire if it persists.
+
+#### KartaBridgeManifestExpiring
+
+The published bridge manifest expires within a day: renewal (due at half
+the validity) has failed for days. The fetcher refuses an expired manifest,
+after which the data age grows. Fix the signer now (see the two alerts
+above), or deliver locally.
 
 #### KartaPublicationTimedOut
 
@@ -516,8 +686,10 @@ limit or lower the cache from capacity measurements ("Capacity").
 `M` suffix) limits how fast `pg_basebackup` reads, to spare a busy host's
 disks; the backup then takes longer.
 
-**Not in the backup:** secrets (keep `./secrets` offline, separately) and
-the snapshots themselves. The PBF files and their sidecars are the
+**Not in the backup:** secrets (keep `./secrets` offline, separately), the
+intake handoff volume (it holds only deliveries in flight), the landing
+area, the bridge volumes (a co-located bridge's signer state is backed up
+separately, see below) and the snapshots themselves. The PBF files and their sidecars are the
 operator's input. Archive the active and retained snapshots where they came
 from or next to the backups.
 
@@ -531,6 +703,13 @@ release ids, and it loses the audit and anti-replay state unless the
 registry is backed up anyway. Rebuilding from archived snapshots remains
 the fallback if every backup is lost. Re-decide when the tier D import time
 and backup size are known.
+
+**The bridge's signer state.** Back up the `bridge-state` volume with the
+bridge's configuration (not its key, which its custodian keeps). Restoring
+an older copy is safe but not silent: the signer refuses to start while its
+high-water serial is below the published manifest, and an operator raises it
+to at least the serial Karta verified (`make bridge-raise-high-water`,
+runbook). The serial never goes back.
 
 ### Protection
 
@@ -694,21 +873,26 @@ deleted all data.
 ### Operator and monitoring tokens
 
 ```bash
-make rotate-operator-tokens     # new operator_token and operator_monitor_token, hashes rewritten, publisher recreated
+make rotate-operator-tokens     # new operator_token and operator_monitor_token, hashes rewritten in place
 ```
 
-The publisher reads `operator_tokens` at start, so the rotation recreates
-it. A publication running at that moment is recorded `interrupted` and
-retried. The API's metrics listener re-reads `metrics_tokens` when it
-changes, so it needs no restart. After the rotation the old monitoring
+The publisher re-reads `operator_tokens` when it changes (Stage 5), and the
+API's metrics listener re-reads `metrics_tokens`: neither restarts, so a
+running publication continues. `scripts/gen-secrets.sh` rewrites both files
+in place (the bind mounts keep their inode) and merges the narrow extra
+credentials of `secrets/operator_tokens.extra`
+(`scripts/operator-credential.sh add|remove|list`). A credentials file that
+does not parse refuses every operator request (`credentials_unavailable`)
+until it is fixed, so an edit can never keep a removed credential alive
+(tested: `TestIntake`, "a removed credential is refused at once"). After the rotation the old monitoring
 token is refused by both, and Prometheus reads the new one from its file at
 the next scrape. Tested in tiers A and B (on Chitgar: old tokens 401 on the
 operator API, the publisher metrics and the API metrics; the API was not
 restarted).
 
-**Overlap, for other credentials.** Add the new credential's line
-(`NAME SCOPES SHA256`) to `operator_tokens` and restart the publisher, move
-the clients over, then remove the old line and restart again. **Revocation**
+**Overlap, for other credentials.** Add the new credential
+(`scripts/operator-credential.sh add NAME SCOPE`), move the clients over,
+then remove the old one; no restart. **Revocation**
 is the second half alone. After a suspected leak, revoke first; actions
 taken with the token are in the audit log under its name.
 
@@ -738,6 +922,15 @@ distributor's checksum or a raw OSM download is not a signed manifest.
 When a production source is chosen, record whether the fetcher reaches it
 directly over HTTPS. The fetcher has no proxy support, so a proxy path
 would have to be implemented and tested first.
+
+**The bridge's key (Stage 5).** The bridge signs with keys listed in
+`config/bridge/signer.json`, mounted only into `bridge-sign`. Rotation: add
+the new key to the signer file (every manifest is then signed by both), add
+its public key to the fetcher's source file, then remove the old key from
+both (tested: two keys during a rotation). Its custodian generates it on the
+bridge host and keeps it out of Git and backups; a VM test key is generated
+on the VM, labelled as test material and never reused. No production key
+exists.
 
 ## Capacity
 
@@ -821,6 +1014,15 @@ mismatch). It pins the SHA-256, centres the default view, and leaves
    searches and tiles from places verified in the built release;
 3. review the file, set `KARTA_PUBLISH_REGION=iran`, and activate.
 
+With Geofabrik as the distributor, record the fixed file's exact bytes
+(download URL, observation time, `Last-Modified`, the `.md5` as distributor
+metadata, SHA-256, size, header timestamp and box) before drafting the
+region; never derive the box from the moving `iran-latest` alias. A raw
+Geofabrik file has no provenance sidecar: keep `require_provenance` off for
+local deliveries of it, or supply a reviewed sidecar. A boundary change at
+Geofabrik is then refused (`region_mismatch`) until a reviewed region-file
+update.
+
 Record the snapshot's provenance chain: distributor or extraction, file,
 digest, replication sequence and timestamp. Mark each claim that could not
 be verified. The Chitgar sidecar's claims about its source Iran file
@@ -830,10 +1032,24 @@ not available.
 
 ## Owner inputs
 
-Not decided by the implementation; each keeps a Stage 4 gate open:
+Not decided by the implementation; each keeps a Stage 4 or Stage 5 gate
+open:
 
-* **Iran snapshot source** (distributor or extraction process), which also
-  fixes the Iran region box;
+* **the fixed Iran PBF** (exact bytes, digest and provenance) for the region
+  file and any VM measurement, supplied out of band or through a separately
+  authorized, pinned download (Geofabrik is the selected distributor);
+* **the bridge**: the production signing-key custodian, separate host or
+  co-located, when a deployment enables online updates, and confirmation of
+  Geofabrik's current download terms and the contact in `user_agent`;
+* **the local intake**: which hosts may run the watcher, who may write their
+  landing areas (the landing account and its keys), whether every local
+  delivery needs named-person attribution (then use the command only), and
+  the intake credentials' holders;
+* **production polling, manifest validity, renewal and data-age values**
+  (initial engineering values in ADR 0006: poll 6 h, re-verify 7 d,
+  validity 7 d, renewal at 3.5 d, `KARTA_DATA_STALE_AFTER` 72 h proposed);
+* **a VM rehearsal plan** (tier C), authorized in a separate session before
+  the VM is accessed or the full Iran snapshot is obtained;
 * **trusted production online source**: provider, manifest signer and
   private-key custodian, and when to activate online updates in a
   deployment (off until then; manual delivery needs none of them);

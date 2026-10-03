@@ -47,6 +47,26 @@ Clients that need a consistent map and search session should pin `release_id` fr
 
 Both inputs feed the same publication protocol; neither contacts a remote service on request paths. In online mode, poll only a configured HTTPS extract source, compare trustworthy source metadata, download to a temporary file, verify, and atomically publish the completed file to the staging queue. Network errors should affect only update status. In offline mode, watch a configured directory (including a user-chosen path literally called `name`, if desired) and periodically rescan it to recover missed file events. A producer should copy to a temporary name and rename to `*.osm.pbf` when complete; a `.ready`/checksum sidecar is recommended. For direct copies into a final name, wait for stable size and successful full-file validation before ingesting. Keep source digests and status to avoid repeats. (Implemented in Stage 3 as an opt-in, separate fetcher process that trusts only manifests signed by a pinned key and hands verified files to the publisher with the inbox protocol: [ADR 0004](adr/0004-stage3-online-updates.md).)
 
+Stage 5 adds two opt-in intake paths in front of the same protocol ([ADR 0006](adr/0006-stage5-hybrid-intake.md)); neither builds, verifies or activates anything itself:
+
+```mermaid
+flowchart LR
+    Geofabrik["Distributor (Geofabrik)"] -->|HTTPS| Acquire["bridge-acquire<br/>only route out, no key"]
+    Acquire -->|spool| Sign["bridge-sign<br/>no network, key, re-verifies"]
+    Sign -->|publish volume| Serve["bridge-serve<br/>read-only HTTPS"]
+    Serve -->|"no-NAT bridge network"| Fetcher["fetcher (Stage 3)"]
+    Fetcher -->|online volume| Publisher["publisher: stage, verify, build, switch"]
+    Landing["Protected landing area<br/>producer completion marker"] -->|read-only| Watcher["intake-watch"]
+    Command["karta intake submit<br/>named person"] --> Handoff
+    Watcher --> Handoff["intake volume (scanned first)"]
+    Watcher -. "intake_watch: exact-digest authorization" .-> Operator["operator API"]
+    Command -. "intake_submit: exact-digest authorization" .-> Operator
+    Handoff -->|read-only| Publisher
+    Inbox["data/inbox (pin or operator authorization)"] -->|read-only| Publisher
+```
+
+The bridge signs only bytes that passed Karta's own structural, region and timestamp checks and only newer data, from a durable serial state; the fetcher and the publisher verify its manifests and bytes again. The local intake establishes completeness with an independent digest (a producer marker or the operator's expectation), copies the bytes into its own handoff directory and creates an authorization for exactly that digest and size; the publisher stages and verifies independently and re-checks the authorization (or pin) inside the switch transaction. Intake order is intake, inbox, online.
+
 The first implementation uses complete PBF snapshots and independent shadow imports. Incremental `.osc.gz` replication can follow after its sequence continuity, extract/source compatibility, recovery behavior, and shadow-update resource model are tested. Never apply a sequence diff from a different extract or use an arbitrary newer PBF as an append diff. Snapshot rebuilding has a substantial disk/time cost; validate operational feasibility for the chosen geographic scale before claiming production readiness.
 
 ## API and operations contract
