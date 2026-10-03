@@ -1,6 +1,7 @@
 # Karta alert rules (Prometheus 3). Load with thresholds.yml. Scrape jobs
 # and their names are in prometheus.yml: karta-api, karta-publisher,
-# karta-postgres; node (node_exporter) and cadvisor are host agents the
+# karta-postgres; karta-bridge (bridge/scrape.yml) only with a co-located
+# bridge; node (node_exporter) and cadvisor are host agents the
 # operator provides. Every rule names its response in docs/operations.md
 # ("Alert responses"). Tests: tests/alerts_test.yml (make test-alerts).
 #
@@ -114,6 +115,45 @@ groups:
         annotations:
           summary: Automatic activation of online snapshots is paused (operator, rollback or restore)
           runbook: docs/operations.md#kartaonlineactivationpaused
+
+  # Local intake (Stage 5). The watcher's series are its own report, read
+  # by the publisher from the handoff volume; the registry's submissions and
+  # authorizations are authoritative. A watcher that stopped cleanly
+  # (deliberately turned off) is not overdue; a crashed or hung one is.
+  - name: karta-intake
+    rules:
+      - alert: KartaIntakeWatcherOverdue
+        expr: |
+          karta_intake_watcher_state_age_seconds > scalar(karta:guard_intake_watcher_overdue_seconds)
+            unless karta_intake_watcher_stopped == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: The intake watcher has not scanned the landing area recently; it crashed or hangs
+          runbook: docs/operations.md#kartaintakewatcheroverdue
+      - alert: KartaIntakePreflightFailing
+        expr: karta_intake_preflight_ok == 0 unless karta_intake_watcher_stopped == 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: The landing area fails the intake preflight; the watcher delivers nothing from it
+          runbook: docs/operations.md#kartaintakepreflightfailing
+      - alert: KartaIntakeDeliveryRefused
+        expr: karta_intake_landing_refused > 0
+        labels: {severity: warning}
+        annotations:
+          summary: The intake watcher refused a landing delivery (incomplete, changed or unsafe files)
+          runbook: docs/operations.md#kartaintakedeliveryrefused
+      # Only where a watcher runs: deliberate command deliveries are never paused.
+      - alert: KartaIntakeActivationPaused
+        expr: |
+          karta_intake_watcher_auto_activation == 0 and karta_intake_watcher_state_age_seconds
+            unless karta_intake_watcher_stopped == 1
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: Automatic activation of watcher deliveries is paused (operator, rollback or restore)
+          runbook: docs/operations.md#kartaintakeactivationpaused
 
   - name: karta-publication
     rules:
@@ -231,3 +271,70 @@ groups:
         annotations:
           summary: "Container {{ $labels.name }} is close to its memory limit"
           runbook: docs/operations.md#kartacontainermemoryhigh
+
+  # Controlled source bridge (Stage 5), co-located deployments only: the
+  # bridge's own report on bridge-serve's metrics listener (job karta-bridge,
+  # bridge/scrape.yml). Karta's own view of the bridge is the fetcher's
+  # report and the data age above; nothing here makes old data fresh.
+  - name: karta-bridge
+    rules:
+      - alert: KartaBridgeDown
+        expr: up{job="karta-bridge"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: The bridge's metrics listener does not answer; its alerts are blind
+          runbook: docs/operations.md#kartabridgedown
+      - alert: KartaBridgeStatusUnreadable
+        expr: karta_bridge_status_readable == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: bridge-serve cannot read the acquire or sign reports
+          runbook: docs/operations.md#kartabridgestatusunreadable
+      - alert: KartaBridgeAcquireOverdue
+        expr: (time() - karta_bridge_acquire_next_attempt_timestamp_seconds) > scalar(karta:guard_bridge_acquire_overdue_seconds)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: The bridge downloader missed its scheduled distributor check; it is stopped or stuck
+          runbook: docs/operations.md#kartabridgeacquireoverdue
+      - alert: KartaBridgeSourceRefused
+        expr: karta_bridge_acquire_last_error{code=~"distributor_checksum_mismatch|tls_error|destination_refused|redirect_refused|url_refused|too_large|source_config"} == 1
+        labels: {severity: warning}
+        annotations:
+          summary: "The bridge refused the distributor's answer: {{ $labels.code }}"
+          runbook: docs/operations.md#kartabridgesourcerefused
+      - alert: KartaBridgeAcquireFailing
+        expr: karta_bridge_acquire_last_error == 1
+        for: 12h
+        labels: {severity: warning}
+        annotations:
+          summary: "Distributor checks keep failing: {{ $labels.code }}"
+          runbook: docs/operations.md#kartabridgeacquirefailing
+      - alert: KartaBridgeHeld
+        expr: karta_bridge_held == 1
+        labels: {severity: warning}
+        annotations:
+          summary: The bridge holds a download it did not sign (not newer, or failed Karta's checks)
+          runbook: docs/operations.md#kartabridgeheld
+      - alert: KartaBridgeSignerStalled
+        expr: karta_bridge_sign_state_age_seconds > scalar(karta:guard_bridge_signer_stalled_seconds)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: The bridge signer has not run recently (stopped, failing closed at start, or stuck)
+          runbook: docs/operations.md#kartabridgesignerstalled
+      - alert: KartaBridgeSignerFailing
+        expr: karta_bridge_sign_last_error == 1
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "The bridge signer's last run failed: {{ $labels.code }}"
+          runbook: docs/operations.md#kartabridgesignerfailing
+      - alert: KartaBridgeManifestExpiring
+        expr: karta_bridge_manifest_expires_timestamp_seconds - time() < scalar(karta:guard_bridge_manifest_expiry_seconds)
+        labels: {severity: critical}
+        annotations:
+          summary: The bridge's published manifest expires soon and was not renewed; the fetcher will refuse it
+          runbook: docs/operations.md#kartabridgemanifestexpiring

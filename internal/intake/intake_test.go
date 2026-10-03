@@ -838,3 +838,19 @@ func writeTmp(t *testing.T, dir, name string, b []byte) string {
 	}
 	return p
 }
+
+// A clean stop is recorded (a stopped watcher is not overdue) and cleared
+// by the next scan.
+func TestWatcherRecordsACleanStop(t *testing.T) {
+	r := newRig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.w.Run(ctx)
+	st, err := ReadState(r.handoff)
+	if err != nil || st == nil || st.StoppedAt == nil {
+		t.Fatalf("no clean stop recorded: %+v %v", st, err)
+	}
+	if st := r.scan(); st.StoppedAt != nil {
+		t.Fatalf("a scan did not clear the stop: %+v", st.StoppedAt)
+	}
+}

@@ -13,6 +13,14 @@
 # `online`, `make up-online`) is the only one with a route out, on its own
 # `egress` network. It has no database credential; it writes verified
 # deliveries into the `online` volume, which the publisher reads read-only.
+#
+# Local intake (Stage 5) is opt-in too: with KARTA_INTAKE_DIR=/data/intake
+# the publisher scans the `intake` volume (read-only) first. The watcher
+# (profile `intake`, `make up-intake`) watches a protected landing area and
+# the command (`intake-cli`, `make intake-submit`) submits one file; both
+# hand off into that volume and hold only a narrow operator credential (no
+# database, no route out). The controlled source bridge is in
+# compose.bridge.yaml (docs/runbook.md, "Controlled source bridge").
 name: karta
 
 x-logging: &logging
@@ -136,6 +144,13 @@ services:
       KARTA_ONLINE_DIR: /data/online
       # Data age after which the active release is reported stale (empty: no threshold).
       KARTA_DATA_STALE_AFTER: ${KARTA_DATA_STALE_AFTER:-}
+      # Local intake: empty (the default) keeps it off and refuses intake
+      # authorizations. Set to /data/intake (the `intake` volume) to enable.
+      KARTA_INTAKE_DIR: ${KARTA_INTAKE_DIR:-}
+      # Cap on an intake authorization's lifetime (empty: derived from the
+      # publish deadline, the retry limit and KARTA_INTAKE_MAX_OPEN).
+      KARTA_INTAKE_AUTHORIZATION_MAX_AGE: ${KARTA_INTAKE_AUTHORIZATION_MAX_AGE:-}
+      KARTA_INTAKE_MAX_OPEN: ${KARTA_INTAKE_MAX_OPEN:-2}
     secrets: [db_importer_password, operator_tokens]
     volumes:
       - ${KARTA_INBOX_HOST_DIR:-./data/inbox}:/data/inbox:ro
@@ -143,6 +158,7 @@ services:
       - ./config/regions:/config/regions:ro
       - ./config/sources:/config/sources:ro
       - online:/data/online:ro
+      - intake:/data/intake:ro
     tmpfs:
       - /tmp:size=1g,mode=1777
     read_only: true
@@ -198,6 +214,79 @@ services:
     cpus: ${KARTA_FETCHER_CPUS:-0.5}
     pids_limit: 64
     restart: unless-stopped
+    logging: *logging
+
+  # Local intake watcher (opt-in, `make up-intake`): watches the protected
+  # landing area (KARTA_INTAKE_LANDING_HOST_DIR, read-only here) for
+  # deliveries with a producer completion marker, checks the landing
+  # boundary before every scan, copies and hashes each delivery into the
+  # `intake` volume, and authorizes exactly that digest with its own
+  # intake_watch credential. No database, no route out: only `operator`.
+  intake-watch:
+    image: karta-api:${KARTA_IMAGE_TAG:-local}
+    profiles: [intake]
+    command: ["intake", "watch"]
+    environment:
+      KARTA_INTAKE_DIR: /data/intake
+      KARTA_REGION_FILE: /config/regions/${KARTA_PUBLISH_REGION:-tehran-chitgar}.json
+      KARTA_OPERATOR_URL: http://publisher:8081
+      KARTA_OPERATOR_TOKEN_FILE: /run/secrets/intake_watch_token
+      KARTA_INTAKE_LANDING_DIR: /landing
+      # The landing owner's numeric UID (the SFTP landing account) and,
+      # optionally, the one group allowed to write the landing directory.
+      KARTA_INTAKE_LANDING_UID: ${KARTA_INTAKE_LANDING_UID:-}
+      KARTA_INTAKE_WRITER_GID: ${KARTA_INTAKE_WRITER_GID:-}
+      KARTA_INTAKE_SETTLE: ${KARTA_INTAKE_SETTLE:-10s}
+      KARTA_INTAKE_POLL_INTERVAL: ${KARTA_INTAKE_POLL_INTERVAL:-10s}
+      KARTA_INTAKE_AUTHORIZATION_TTL: ${KARTA_INTAKE_AUTHORIZATION_TTL:-}
+      KARTA_MAX_INPUT_MB: ${KARTA_MAX_INPUT_MB:-4096}
+      KARTA_INTAKE_RESERVE_MB: ${KARTA_INTAKE_RESERVE_MB:-64}
+      KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+    secrets: [intake_watch_token]
+    volumes:
+      - intake:/data/intake
+      - ${KARTA_INTAKE_LANDING_HOST_DIR:-./data/landing}:/landing:ro
+      - ./config/regions:/config/regions:ro
+    networks: [operator]
+    # Its liveness is the age of its state file, reported by the publisher
+    # (karta_intake_watcher_state_age_seconds), as for the fetcher.
+    healthcheck:
+      disable: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KARTA_INTAKE_MEM_LIMIT:-256m}
+    cpus: ${KARTA_INTAKE_CPUS:-0.5}
+    pids_limit: 64
+    restart: unless-stopped
+    logging: *logging
+
+  # One-off authenticated intake command (`make intake-submit`): the file,
+  # its expectation and the person's own intake_submit token are mounted by
+  # the make target for that run only.
+  intake-cli:
+    image: karta-api:${KARTA_IMAGE_TAG:-local}
+    profiles: [tools]
+    entrypoint: ["/usr/local/bin/karta", "intake"]
+    environment:
+      KARTA_INTAKE_DIR: /data/intake
+      KARTA_REGION_FILE: /config/regions/${KARTA_PUBLISH_REGION:-tehran-chitgar}.json
+      KARTA_OPERATOR_URL: http://publisher:8081
+      KARTA_OPERATOR_TOKEN_FILE: /run/secrets/intake_token
+      KARTA_INTAKE_AUTHORIZATION_TTL: ${KARTA_INTAKE_AUTHORIZATION_TTL:-}
+      KARTA_MAX_INPUT_MB: ${KARTA_MAX_INPUT_MB:-4096}
+      KARTA_INTAKE_RESERVE_MB: ${KARTA_INTAKE_RESERVE_MB:-64}
+      KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+    volumes:
+      - intake:/data/intake
+      - ./config/regions:/config/regions:ro
+    networks: [operator]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KARTA_INTAKE_MEM_LIMIT:-256m}
+    cpus: ${KARTA_INTAKE_CPUS:-0.5}
+    pids_limit: 64
     logging: *logging
 
   # One-off operator API client: `docker compose run --rm operator-cli status`.
@@ -320,6 +409,9 @@ volumes:
   staging: {}
   # The fetcher's outbox: written by the fetcher, read-only for the publisher.
   online: {}
+  # The intake handoff directory: written by the intake watcher and command,
+  # read-only for the publisher.
+  intake: {}
   # Prometheus' time-series storage (monitoring profile).
   prometheus: {}
 
@@ -338,5 +430,9 @@ secrets:
     file: ./secrets/metrics_tokens
   operator_monitor_token:
     file: ./secrets/operator_monitor_token
+  # The intake watcher's own credential (scope intake_watch only), created
+  # by `make up-intake` with scripts/operator-credential.sh.
+  intake_watch_token:
+    file: ./secrets/intake_watch_token
   db_monitor_password:
     file: ./secrets/db_monitor_password

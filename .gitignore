@@ -16,3 +16,5 @@ __pycache__/
 # Backups and restore reports (scripts/backup.sh, scripts/restore.sh): data and
 # role password verifiers; never commit them
 /backups/
+# The co-located bridge's generated CA certificate (scripts/gen-bridge-tls.sh)
+/config/sources/bridge-ca.pem

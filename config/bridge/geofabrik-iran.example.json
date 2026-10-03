@@ -1,0 +1,13 @@
+{
+  "region_id": "iran",
+  "snapshot_url": "https://download.geofabrik.de/asia/iran-latest.osm.pbf",
+  "md5_url": "https://download.geofabrik.de/asia/iran-latest.osm.pbf.md5",
+  "distributor": "Geofabrik GmbH (download.geofabrik.de), OpenStreetMap data under the ODbL",
+  "user_agent": "karta-bridge/1 (+CONTACT: replace with the operator's e-mail or URL)",
+  "poll_interval": "6h",
+  "reverify_interval": "168h",
+  "download_timeout": "2h",
+  "stall_timeout": "2m",
+  "retry_initial": "15m",
+  "retry_max": "6h"
+}

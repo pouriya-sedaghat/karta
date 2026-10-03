@@ -136,6 +136,8 @@ func (s *Service) Metrics(ctx context.Context) ([]byte, error) {
 		m.Opt("karta_intake_watcher_state_age_seconds", "Seconds since the intake watcher last wrote its state; growing means it is not running.",
 			nil, in.Watcher.StateAgeSeconds)
 		if ws := in.Watcher.State; ws != nil {
+			m.Gauge("karta_intake_watcher_stopped", "1 if the intake watcher stopped cleanly (deliberately) and has not scanned since.",
+				nil, promtext.Bool(ws.StoppedAt != nil))
 			m.Gauge("karta_intake_preflight_ok", "1 if the watcher's last landing preflight passed (watcher report).", nil, promtext.Bool(ws.Preflight.OK))
 			m.Opt("karta_intake_last_scan_timestamp_seconds", "Last landing scan of the watcher (watcher report).", nil, ts(ws.LastScanAt))
 			waiting, refused := 0, 0

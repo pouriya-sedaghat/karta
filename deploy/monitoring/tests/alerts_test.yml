@@ -560,3 +560,194 @@ tests:
             exp_annotations:
               summary: "Filesystem /data fills up within a day at the current rate"
               runbook: docs/operations.md#kartadiskfillingup
+
+  # ------------------------------------------------------------ local intake
+  - name: a crashed intake watcher is overdue, a deliberately stopped one is not
+    interval: 1m
+    input_series:
+      # scans every 10 s until 10m, then its state stops being written
+      - series: 'karta_intake_watcher_state_age_seconds{job="karta-publisher",instance="p"}'
+        values: '5x10 600+60x30'
+      - series: 'karta_intake_watcher_stopped{job="karta-publisher",instance="p"}'
+        values: '0x40'
+      - series: 'karta_intake_preflight_ok{job="karta-publisher",instance="p"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: KartaIntakeWatcherOverdue
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: KartaIntakeWatcherOverdue
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: The intake watcher has not scanned the landing area recently; it crashed or hangs
+              runbook: docs/operations.md#kartaintakewatcheroverdue
+      - eval_time: 25m
+        alertname: KartaIntakePreflightFailing
+        exp_alerts: []
+
+  - name: a cleanly stopped watcher raises neither the overdue nor the preflight alert
+    interval: 1m
+    input_series:
+      - series: 'karta_intake_watcher_state_age_seconds{job="karta-publisher",instance="p"}'
+        values: '5x10 600+60x30'
+      - series: 'karta_intake_watcher_stopped{job="karta-publisher",instance="p"}'
+        values: '0x10 1x30'
+      - series: 'karta_intake_preflight_ok{job="karta-publisher",instance="p"}'
+        values: '0x40'
+      - series: 'karta_intake_watcher_auto_activation{job="karta-publisher",instance="p"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KartaIntakeWatcherOverdue
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KartaIntakePreflightFailing
+        exp_alerts: []
+      - eval_time: 39m
+        alertname: KartaIntakeActivationPaused
+        exp_alerts: []
+
+  - name: a failing landing preflight and a refused delivery alert
+    interval: 1m
+    input_series:
+      - series: 'karta_intake_watcher_state_age_seconds{job="karta-publisher",instance="p"}'
+        values: '5x30'
+      - series: 'karta_intake_watcher_stopped{job="karta-publisher",instance="p"}'
+        values: '0x30'
+      - series: 'karta_intake_preflight_ok{job="karta-publisher",instance="p"}'
+        values: '1x5 0x25'
+      - series: 'karta_intake_landing_refused{job="karta-publisher",instance="p"}'
+        values: '0x5 1x25'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KartaIntakePreflightFailing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: KartaIntakePreflightFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: The landing area fails the intake preflight; the watcher delivers nothing from it
+              runbook: docs/operations.md#kartaintakepreflightfailing
+      - eval_time: 7m
+        alertname: KartaIntakeDeliveryRefused
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: The intake watcher refused a landing delivery (incomplete, changed or unsafe files)
+              runbook: docs/operations.md#kartaintakedeliveryrefused
+
+  - name: paused watcher activation alerts only where a watcher runs
+    interval: 1m
+    input_series:
+      - series: 'karta_intake_watcher_auto_activation{job="karta-publisher",instance="p"}'
+        values: '0x90'
+      - series: 'karta_intake_watcher_state_age_seconds{job="karta-publisher",instance="p"}'
+        values: '5x90'
+      - series: 'karta_intake_watcher_stopped{job="karta-publisher",instance="p"}'
+        values: '0x90'
+      # a command-only deployment: no watcher state
+      - series: 'karta_intake_watcher_auto_activation{job="karta-publisher",instance="cmd"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KartaIntakeActivationPaused
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: KartaIntakeActivationPaused
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p}
+            exp_annotations:
+              summary: Automatic activation of watcher deliveries is paused (operator, rollback or restore)
+              runbook: docs/operations.md#kartaintakeactivationpaused
+
+  # ------------------------------------------------------------------ bridge
+  - name: bridge downloader, signer and manifest expiry
+    interval: 1m
+    input_series:
+      - series: 'up{job="karta-bridge",instance="b"}'
+        values: '1x5 0x200'
+      # the next check was due at 600 s and never happened
+      - series: 'karta_bridge_acquire_next_attempt_timestamp_seconds{job="karta-bridge",instance="b"}'
+        values: '600x205'
+      # the signer stops writing its state at 10m
+      - series: 'karta_bridge_sign_state_age_seconds{job="karta-bridge",instance="b"}'
+        values: '5x10 1500+60x195'
+      # the published manifest expires at 90000 s: within a day from 60m on
+      - series: 'karta_bridge_manifest_expires_timestamp_seconds{job="karta-bridge",instance="b"}'
+        values: '90000x205'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: KartaBridgeDown
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-bridge, instance: b}
+            exp_annotations:
+              summary: The bridge's metrics listener does not answer; its alerts are blind
+              runbook: docs/operations.md#kartabridgedown
+      - eval_time: 180m
+        alertname: KartaBridgeAcquireOverdue
+        exp_alerts: []
+      - eval_time: 200m
+        alertname: KartaBridgeAcquireOverdue
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-bridge, instance: b}
+            exp_annotations:
+              summary: The bridge downloader missed its scheduled distributor check; it is stopped or stuck
+              runbook: docs/operations.md#kartabridgeacquireoverdue
+      - eval_time: 14m
+        alertname: KartaBridgeSignerStalled
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: KartaBridgeSignerStalled
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-bridge, instance: b}
+            exp_annotations:
+              summary: The bridge signer has not run recently (stopped, failing closed at start, or stuck)
+              runbook: docs/operations.md#kartabridgesignerstalled
+      - eval_time: 30m
+        alertname: KartaBridgeManifestExpiring
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: KartaBridgeManifestExpiring
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-bridge, instance: b}
+            exp_annotations:
+              summary: The bridge's published manifest expires soon and was not renewed; the fetcher will refuse it
+              runbook: docs/operations.md#kartabridgemanifestexpiring
+
+  - name: the bridge reports trust refusals and held downloads, not routine replacements
+    interval: 1m
+    input_series:
+      - series: 'karta_bridge_acquire_last_error{job="karta-bridge",instance="b",code="distributor_checksum_mismatch"}'
+        values: '1x10'
+      # iran-latest replaced during a download: retried at the next check
+      - series: 'karta_bridge_acquire_last_error{job="karta-bridge",instance="c",code="source_changed"}'
+        values: '1x10'
+      - series: 'karta_bridge_held{job="karta-bridge",instance="b"}'
+        values: '0x5 1x5'
+      - series: 'karta_bridge_sign_last_error{job="karta-bridge",instance="b",code="clock_behind"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KartaBridgeSourceRefused
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-bridge, instance: b, code: distributor_checksum_mismatch}
+            exp_annotations:
+              summary: "The bridge refused the distributor's answer: distributor_checksum_mismatch"
+              runbook: docs/operations.md#kartabridgesourcerefused
+      - eval_time: 8m
+        alertname: KartaBridgeHeld
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-bridge, instance: b}
+            exp_annotations:
+              summary: The bridge holds a download it did not sign (not newer, or failed Karta's checks)
+              runbook: docs/operations.md#kartabridgeheld
+      - eval_time: 20m
+        alertname: KartaBridgeSignerFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-bridge, instance: b, code: clock_behind}
+            exp_annotations:
+              summary: "The bridge signer's last run failed: clock_behind"
+              runbook: docs/operations.md#kartabridgesignerfailing

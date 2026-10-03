@@ -12,6 +12,12 @@ rule_files:
   - /etc/karta/alerts.yml
   - /etc/karta/thresholds.yml
 
+# Extra scrape jobs mounted by an opt-in Compose file: compose.bridge.yaml
+# mounts deploy/monitoring/bridge here (job karta-bridge). Nothing matches
+# without it.
+scrape_config_files:
+  - /etc/karta-extra/*.yml
+
 # Where alerts go (Alertmanager, routing, on-call) is an owner decision and
 # is not configured here: firing alerts are visible in this Prometheus and
 # its API until an alert destination is chosen (docs/operations.md).

@@ -839,3 +839,22 @@ func TestServe(t *testing.T) {
 		t.Errorf("metrics: %s", Metrics(b.spool, b.publish, time.Now()))
 	}
 }
+
+// The committed examples stay valid (they are what deployments copy).
+func TestExampleConfigs(t *testing.T) {
+	s, err := LoadSource(filepath.Join("..", "..", "config", "bridge", "geofabrik-iran.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.PollInterval.D() < time.Hour || s.MD5URL == "" {
+		t.Errorf("the example polls more often than hourly or has no md5: %+v", s)
+	}
+	c, err := LoadSignerConfig(filepath.Join("..", "..", "config", "bridge", "signer.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Within the 192h a fetcher example accepts, and renewed at half.
+	if c.ManifestValidity.D() > 192*time.Hour || c.RenewBefore.D() != c.ManifestValidity.D()/2 {
+		t.Errorf("%+v", c)
+	}
+}

@@ -91,12 +91,17 @@ func (w *Watcher) setError(code string, err error) {
 	w.state.LastError = &StateError{At: w.now().UTC(), Code: code, Message: truncateRunes(err.Error(), 500)}
 }
 
-// Run scans until ctx ends.
+// Run scans until ctx ends, then records the clean stop.
 func (w *Watcher) Run(ctx context.Context) {
 	for {
 		w.ScanOnce(ctx)
 		select {
 		case <-ctx.Done():
+			now := w.now().UTC()
+			w.state.StoppedAt = &now
+			if err := w.save(); err != nil {
+				w.log.Error("could not save the intake state", "err", err)
+			}
 			return
 		case <-time.After(w.cfg.Poll):
 		}
@@ -113,7 +118,7 @@ func (w *Watcher) ScanOnce(ctx context.Context) {
 		}
 	}()
 	now := w.now().UTC()
-	w.state.LastScanAt = &now
+	w.state.LastScanAt, w.state.StoppedAt = &now, nil
 	pf := RunPreflight(PreflightOptions{Dir: w.cfg.Landing, Root: w.cfg.Root, OwnerUID: w.cfg.OwnerUID, WriterGID: w.cfg.WriterGID,
 		Statfs: w.cfg.Statfs, Now: w.now})
 	w.state.Preflight = pf

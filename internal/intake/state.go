@@ -35,7 +35,11 @@ type State struct {
 	// Landing is the landing directory as the watcher sees it.
 	Landing    string     `json:"landing"`
 	LastScanAt *time.Time `json:"last_scan_at"`
-	Preflight  Preflight  `json:"preflight"`
+	// StoppedAt is set when the watcher stopped cleanly (a deliberate stop
+	// or shutdown) and cleared by its next scan: a stopped watcher is not
+	// overdue, a crashed or hung one is.
+	StoppedAt *time.Time `json:"stopped_at"`
+	Preflight Preflight  `json:"preflight"`
 	// Entries are the landing deliveries not yet handed off (or refused).
 	Entries []LandingEntry `json:"entries"`
 	// Handoffs are this watcher's deliveries the publisher has or will

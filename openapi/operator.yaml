@@ -1119,12 +1119,16 @@ components:
         finished_at: { $ref: "#/components/schemas/Timestamp" }
     IntakeState:
       type: object
-      required: [version, updated_at, landing, last_scan_at, preflight, entries, handoffs, last_outcome, last_error, consumed]
+      required: [version, updated_at, landing, last_scan_at, stopped_at, preflight, entries, handoffs, last_outcome, last_error, consumed]
       properties:
         version: { type: integer }
         updated_at: { $ref: "#/components/schemas/Timestamp" }
         landing: { type: string }
         last_scan_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        stopped_at:
+          allOf: [{ $ref: "#/components/schemas/Timestamp" }]
+          nullable: true
+          description: Set when the watcher stopped cleanly (a deliberate stop or shutdown); cleared by its next scan.
         preflight:
           type: object
           required: [ok, checked_at, fs_type, problems]
