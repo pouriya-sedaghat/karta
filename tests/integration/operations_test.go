@@ -259,18 +259,24 @@ func script(t *testing.T, name string, args ...string) (string, int) {
 	return string(out), code
 }
 
-// pgdataHasCluster reports whether the test stack's database volume holds a
-// PostgreSQL cluster.
-func pgdataHasCluster(t *testing.T) bool {
+// inPgdata runs a shell command in the database image with the test stack's
+// database volume mounted ($PGDATA set as in the db service).
+func inPgdata(t *testing.T, command string) error {
 	t.Helper()
 	id, _, _ := compose(t, "ps", "-a", "-q", "db")
 	image, err := exec.Command("docker", "inspect", "-f", "{{.Config.Image}}", strings.TrimSpace(id)).Output()
 	if err != nil {
 		t.Fatalf("db image: %v", err)
 	}
-	err = exec.Command("docker", "run", "--rm", "-v", "karta-test_pgdata:/var/lib/postgresql:ro", "--entrypoint", "sh",
-		strings.TrimSpace(string(image)), "-c", `[ -f "$PGDATA/PG_VERSION" ]`).Run()
-	return err == nil
+	return exec.Command("docker", "run", "--rm", "-v", "karta-test_pgdata:/var/lib/postgresql", "--entrypoint", "sh",
+		strings.TrimSpace(string(image)), "-c", command).Run()
+}
+
+// pgdataHasCluster reports whether the test stack's database volume holds a
+// PostgreSQL cluster.
+func pgdataHasCluster(t *testing.T) bool {
+	t.Helper()
+	return inPgdata(t, `[ -f "$PGDATA/PG_VERSION" ]`) == nil
 }
 
 // testSwitchAroundBackup takes two backups while the active release
@@ -870,20 +876,50 @@ func TestOperations(t *testing.T) {
 			t.Fatalf("remove the database volume: %v %s", err, out)
 		}
 		t.Setenv("KARTA_RESTORE_REPORTS", t.TempDir())
-		// The outbox still holds fetcher state: without --replace the
-		// restore refuses before it touches the empty database volume.
-		if out, code := script(t, "restore.sh", dir); code == 0 || !strings.Contains(out, "holds files; nothing was changed") {
+		// The outbox survived, with fetcher state newer than the backup's.
+		// Without --replace the restore refuses before it changes anything;
+		// the empty, image-created database volume is not reported as in use.
+		if err := os.WriteFile(filepath.Join(stateDir, "state.json"),
+			[]byte(`{"version":1,"updated_at":"2026-10-02T00:00:00Z","source":"test","consecutive_failures":0,"highest_serial":99}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, code = script(t, "restore.sh", dir)
+		if code == 0 || !strings.Contains(out, "holds files; nothing was changed") || strings.Contains(out, "volume karta-test_pgdata holds") {
 			t.Fatalf("restore over an outbox with files, without --replace: %d %s", code, out)
 		}
 		if pgdataHasCluster(t) {
 			t.Fatal("the refused restore extracted the database")
 		}
-		_ = os.RemoveAll(stateDir)
-
+		// An interrupted extraction left files but no PG_VERSION: refused too.
+		if err := inPgdata(t, `mkdir -p "$PGDATA/base/1" && echo partial > "$PGDATA/base/1/112"`); err != nil {
+			t.Fatalf("seed a partial database volume: %v", err)
+		}
+		if out, code := script(t, "restore.sh", dir); code == 0 || !strings.Contains(out, "holds files but no database") {
+			t.Fatalf("restore over a partial database volume, without --replace: %d %s", code, out)
+		}
+		if inPgdata(t, `[ -f "$PGDATA/base/1/112" ]`) != nil || pgdataHasCluster(t) {
+			t.Fatal("the refused restore changed the partial database volume")
+		}
+		// With --replace, while the API and the publisher run (without a
+		// database): the stack stops, the partial volume is deleted, the
+		// base backup and the backed-up outbox are restored, and the fetcher
+		// stays stopped.
+		if _, stderr, code := compose(t, "up", "-d", "--no-deps", "api", "publisher"); code != 0 {
+			t.Fatalf("start api and publisher: %s", stderr)
+		}
 		start = time.Now()
-		out, code = script(t, "restore.sh", dir)
+		out, code = script(t, "restore.sh", dir, "--replace")
 		if code != 0 {
 			t.Fatalf("restore: %s", out)
+		}
+		if !strings.Contains(out, "stopping the stack") || !strings.Contains(out, "(partial)") {
+			t.Errorf("the restore did not stop the stack or delete the partial volume:\n%s", out)
+		}
+		if inPgdata(t, `[ ! -e "$PGDATA/base/1/112" ] || [ "$(cat "$PGDATA/base/1/112" 2>/dev/null)" != partial ]`) != nil {
+			t.Error("the partial file survived the restore")
+		}
+		if id, _, _ := compose(t, "--profile", "online", "ps", "-q", "--status", "running", "fetcher"); strings.TrimSpace(id) != "" {
+			t.Error("the fetcher runs after the restore")
 		}
 		recordMeasurement(t, "stage4_restore_seconds", time.Since(start).Seconds())
 		t.Logf("restore:\n%s", out)

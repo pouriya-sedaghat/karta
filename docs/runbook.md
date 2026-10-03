@@ -686,8 +686,11 @@ COMPOSE="docker compose -p karta-restore-test" KARTA_HTTP_PORT=18180 KARTA_OPERA
 ```
 
 A restore checks both destinations first and changes nothing unless the
-database volume and the fetcher's outbox are empty or `REPLACE=1` is given.
-It pauses automatic online activation and audits the restored pointer. Before `make up-online` and `online-resume`, confirm the
+database volume and the fetcher's outbox are empty or `REPLACE=1` is given
+(a volume with an interrupted restore's files is not empty). It then stops
+the whole stack, restores, and starts only the API and the publisher: the
+fetcher and the monitoring profile stay stopped. It pauses automatic online
+activation and audits the restored pointer. Before `make up-online` and `online-resume`, confirm the
 producer's current manifest serial. Then resubmit anything published or
 authorized after the backup (docs/operations.md, "Backup and restore").
 

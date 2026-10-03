@@ -20,9 +20,10 @@ import (
 )
 
 // fakeDocker stands in for the docker CLI. State lives in $FAKE_STATE:
-// db_has_data (the database volume holds a cluster), online (the outbox
-// host directory the publisher mounts; empty: none), outbox_copy (ok, fail
-// or hang). Every call is appended to $FAKE_STATE/calls.
+// db_contents (what the database volume holds: cluster or partial; absent:
+// empty), online (the outbox host directory the publisher mounts; empty:
+// none), outbox_copy (ok, fail or hang). Every call is appended to
+// $FAKE_STATE/calls.
 const fakeDocker = `#!/bin/sh
 st=$FAKE_STATE
 log() { echo "$*" >> "$st/calls"; }
@@ -45,7 +46,7 @@ case "$1" in
       */data/online*) cat "$st/online" 2>/dev/null ;;
     esac ;;
   image) echo sha256:test ;;
-  volume) log "volume rm $3"; rm -f "$st/db_has_data" ;;
+  volume) log "volume rm $3"; rm -f "$st/db_contents" ;;
   run)
     all="$*"
     case "$all" in
@@ -53,9 +54,9 @@ case "$1" in
         d=$(mount /backup "$@"); log "pg_basebackup rate=$(eval echo \${$#})"
         echo base > "$d/base.tar.gz"; echo wal > "$d/pg_wal.tar.gz"; echo manifest > "$d/backup_manifest" ;;
       *pg_verifybackup*) log "pg_verifybackup" ;;
-      *PG_VERSION*) [ -f "$st/db_has_data" ] ;;
-      *"ls -A /v"*) [ -n "$(ls -A "$(mount /v "$@")")" ] ;;
-      *"tar -xzf /backup/base.tar.gz"*) log "extract database"; touch "$st/db_has_data" ;;
+      *PG_VERSION*) log "inspect database"; cat "$st/db_contents" 2>/dev/null || echo empty ;;
+      *"ls -A /v"*) log "inspect outbox"; if [ -z "$(ls -A "$(mount /v "$@")")" ]; then echo empty; else echo files; fi ;;
+      *"tar -xzf /backup/base.tar.gz"*) log "extract database"; echo cluster > "$st/db_contents" ;;
       *"--exclude=./.partial"*)
         log "copy outbox"
         case "$(cat "$st/outbox_copy" 2>/dev/null)" in
@@ -74,7 +75,9 @@ esac
 `
 
 // fakeCompose stands in for `docker compose`. $FAKE_STATE/fetcher_running
-// marks a running fetcher; registry-summary prints $FAKE_STATE/summary.json.
+// and publisher_running mark running services (down stops both; with
+// $FAKE_STATE/write_on_down, the fetcher writes its outbox as it stops);
+// registry-summary prints $FAKE_STATE/summary.json.
 const fakeCompose = `#!/bin/sh
 st=$FAKE_STATE
 log() { echo "$*" >> "$st/calls"; }
@@ -87,6 +90,11 @@ case "$*" in
   "ps -q --status running fetcher") [ ! -f "$st/fetcher_running" ] || echo fetc ;;
   "stop fetcher") log "stop fetcher"; rm -f "$st/fetcher_running" ;;
   "start fetcher") log "start fetcher"; touch "$st/fetcher_running" ;;
+  down)
+    log "compose down"
+    if [ -f "$st/write_on_down" ] && [ -f "$st/fetcher_running" ]; then echo late > "$(cat "$st/online")/late-delivery"; fi
+    rm -f "$st/fetcher_running" "$st/publisher_running" ;;
+  "up -d api publisher") log "compose up -d api publisher"; touch "$st/publisher_running" ;;
   *registry-summary*) cat "$st/summary.json" ;;
   *restore-check*) log "restore-check $*"; echo '{"passed": true}' ;;
   "exec -T db postgres --version") echo "postgres (PostgreSQL) 18.6" ;;
@@ -149,6 +157,22 @@ func (e *env) set(name string, on bool) {
 	} else {
 		_ = os.Remove(p)
 	}
+}
+
+// database sets what the database volume holds: "cluster", "partial" or
+// "" (empty).
+func (e *env) database(contents string) {
+	p := filepath.Join(e.state, "db_contents")
+	if contents == "" {
+		_ = os.Remove(p)
+		return
+	}
+	write(e.t, p, contents+"\n", 0o644)
+}
+
+func (e *env) databaseContents() string {
+	b, _ := os.ReadFile(filepath.Join(e.state, "db_contents"))
+	return strings.TrimSpace(string(b))
 }
 
 func (e *env) has(name string) bool {
@@ -319,7 +343,7 @@ func TestRestorePreflightChangesNothingWhenItRefuses(t *testing.T) {
 	changed := func(calls []string) []string {
 		var bad []string
 		for _, c := range calls {
-			for _, p := range []string{"extract database", "restore outbox", "empty outbox", "volume rm", "compose up", "compose --profile"} {
+			for _, p := range []string{"extract database", "restore outbox", "empty outbox", "volume rm", "compose up", "compose down", "stop fetcher"} {
 				if strings.HasPrefix(c, p) {
 					bad = append(bad, c)
 				}
@@ -329,16 +353,18 @@ func TestRestorePreflightChangesNothingWhenItRefuses(t *testing.T) {
 	}
 	cases := []struct {
 		name       string
-		withOutbox bool // the backup has online.tar
-		dbInUse    bool
+		withOutbox bool   // the backup has online.tar
+		db         string // what the database volume holds ("": empty)
 		outboxFile bool
 		want       []string
 	}{
 		{name: "the database volume is lost but the outbox holds files", withOutbox: true, outboxFile: true,
 			want: []string{"the outbox " /* path */, "holds files; nothing was changed"}},
-		{name: "the database volume holds a cluster", withOutbox: true, dbInUse: true,
+		{name: "the database volume holds a cluster", withOutbox: true, db: "cluster",
 			want: []string{"holds a database; nothing was changed"}},
-		{name: "both hold data", withOutbox: true, dbInUse: true, outboxFile: true,
+		{name: "the database volume holds a partial extraction without PG_VERSION", withOutbox: true, db: "partial",
+			want: []string{"holds files but no database (an interrupted restore or other data); nothing was changed"}},
+		{name: "both hold data", withOutbox: true, db: "cluster", outboxFile: true,
 			want: []string{"holds a database; the outbox", "holds files; nothing was changed"}},
 		{name: "the backup has no outbox and the destination outbox holds files", outboxFile: true,
 			want: []string{"holds files (fetcher state or deliveries the backup would not replace); nothing was changed"}},
@@ -347,7 +373,9 @@ func TestRestorePreflightChangesNothingWhenItRefuses(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			e := setup(t)
 			b := e.backup(c.withOutbox)
-			e.set("db_has_data", c.dbInUse)
+			e.database(c.db)
+			e.set("fetcher_running", true)
+			e.set("publisher_running", true)
 			if c.outboxFile {
 				write(t, filepath.Join(e.outbox, "stale-state"), "stale\n", 0o644)
 			}
@@ -364,13 +392,16 @@ func TestRestorePreflightChangesNothingWhenItRefuses(t *testing.T) {
 			if bad := changed(calls); len(bad) > 0 {
 				t.Errorf("the refused restore changed something: %v", bad)
 			}
+			if !e.has("fetcher_running") || !e.has("publisher_running") {
+				t.Error("the refused restore stopped services")
+			}
 			if c.outboxFile {
 				if _, err := os.Stat(filepath.Join(e.outbox, "stale-state")); err != nil {
 					t.Errorf("the outbox was changed: %v", err)
 				}
 			}
-			if e.has("db_has_data") != c.dbInUse {
-				t.Errorf("the database volume was changed")
+			if got := e.databaseContents(); got != c.db {
+				t.Errorf("the database volume was changed: %q, was %q", got, c.db)
 			}
 		})
 	}
@@ -402,7 +433,7 @@ func TestRestoreReplace(t *testing.T) {
 	t.Run("a backup with an outbox replaces the destination outbox and database", func(t *testing.T) {
 		e := setup(t)
 		b := e.backup(true)
-		e.set("db_has_data", true)
+		e.database("cluster")
 		write(t, filepath.Join(e.outbox, "stale-state"), "stale\n", 0o644)
 		out, code := e.run("restore.sh", nil, b, "--replace")
 		calls := e.calls()
@@ -420,6 +451,68 @@ func TestRestoreReplace(t *testing.T) {
 		}
 	})
 
+	// The documented case: the database volume was lost while the API,
+	// publisher and fetcher kept running. Everything stops before either
+	// destination changes, and the fetcher stays stopped.
+	t.Run("a lost database with a surviving outbox and running services", func(t *testing.T) {
+		e := setup(t)
+		b := e.backup(true)
+		e.set("fetcher_running", true)
+		e.set("publisher_running", true)
+		write(t, filepath.Join(e.outbox, "stale-state"), "stale\n", 0o644)
+		out, code := e.run("restore.sh", nil, b, "--replace")
+		calls := e.calls()
+		if code != 0 {
+			t.Fatalf("exit %d: %s", code, out)
+		}
+		down, extract, outbox := index(calls, "compose down"), index(calls, "extract database"), index(calls, "restore outbox")
+		if down < 0 || extract < down || outbox < down {
+			t.Errorf("the stack did not stop before the restore changed anything: %v", calls)
+		}
+		if count(calls, "volume rm") != 0 {
+			t.Errorf("an empty database volume was deleted: %v", calls)
+		}
+		if e.has("fetcher_running") || count(calls, "start fetcher") != 0 {
+			t.Errorf("the fetcher was started: %v", calls)
+		}
+		if !e.has("publisher_running") || !strings.Contains(out, "the fetcher and the monitoring profile are stopped") {
+			t.Errorf("serving was not started again, or the stopped fetcher not reported: %s", out)
+		}
+	})
+
+	t.Run("a partial database volume is deleted before the base backup is extracted", func(t *testing.T) {
+		e := setup(t)
+		b := e.backup(true)
+		e.database("partial")
+		out, code := e.run("restore.sh", nil, b, "--replace")
+		calls := e.calls()
+		if code != 0 {
+			t.Fatalf("exit %d: %s", code, out)
+		}
+		rm, extract := index(calls, "volume rm pgdata-vol"), index(calls, "extract database")
+		if rm < 0 || extract < rm || !strings.Contains(out, "deleting the current database volume pgdata-vol (partial)") {
+			t.Errorf("the partial volume was not deleted first: %v\n%s", calls, out)
+		}
+	})
+
+	t.Run("an outbox the fetcher writes while the stack stops is refused without --replace", func(t *testing.T) {
+		e := setup(t)
+		b := e.backup(false)
+		e.set("fetcher_running", true)
+		e.set("write_on_down", true)
+		out, code := e.run("restore.sh", nil, b)
+		calls := e.calls()
+		if code == 0 || !strings.Contains(out, "the stack was stopped, but no data was changed") {
+			t.Fatalf("exit %d: %s", code, out)
+		}
+		if index(calls, "extract database") >= 0 || index(calls, "empty outbox") >= 0 {
+			t.Errorf("data was changed: %v", calls)
+		}
+		if _, err := os.Stat(filepath.Join(e.outbox, "late-delivery")); err != nil {
+			t.Errorf("the late delivery was removed: %v", err)
+		}
+	})
+
 	t.Run("empty destinations need no --replace", func(t *testing.T) {
 		e := setup(t)
 		b := e.backup(true)
@@ -428,10 +521,20 @@ func TestRestoreReplace(t *testing.T) {
 			t.Fatalf("exit %d: %s", code, out)
 		}
 		calls := e.calls()
-		if count(calls, "extract database") != 1 || count(calls, "restore outbox") != 1 || count(calls, "volume rm") != 0 {
+		if count(calls, "extract database") != 1 || count(calls, "restore outbox") != 1 || count(calls, "volume rm") != 0 ||
+			index(calls, "compose down") < 0 || index(calls, "compose down") > index(calls, "extract database") {
 			t.Errorf("calls: %v", calls)
 		}
 	})
+}
+
+func index(calls []string, prefix string) int {
+	for i, c := range calls {
+		if strings.HasPrefix(c, prefix) {
+			return i
+		}
+	}
+	return -1
 }
 
 func must(t *testing.T, err error) {

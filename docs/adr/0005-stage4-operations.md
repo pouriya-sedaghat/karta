@@ -144,10 +144,14 @@ re-decided with the tier D import time and backup size.
 ### Restore: verified, audited, anti-replay preserved
 
 `scripts/restore.sh` has a fixed order: verify, compare secrets, a
-preflight of both destinations, database, role passwords from the current
-secrets, outbox, `karta restore-check --finalize`, then serving. The
-preflight refuses before anything changes if the database volume or the
-fetcher's outbox holds data and `--replace` is not given. With `--replace`
+preflight of both destinations, a full stop of the stack, database, role
+passwords from the current secrets, outbox, `karta restore-check
+--finalize`, then serving (the fetcher stays stopped). The preflight
+refuses before anything changes, not even a service, if the database
+volume (a cluster, or any files an interrupted restore left) or the
+fetcher's outbox holds data and `--replace` is not given. The stop is
+unconditional, because after a lost database the publisher and fetcher may
+still run and would write the registry or outbox being restored. With `--replace`
 and a backup without an outbox, the outbox is emptied rather than left with
 another registry's fetcher state.
 

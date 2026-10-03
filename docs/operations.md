@@ -542,21 +542,33 @@ failure:
 1. verify `SHA256SUMS` and `pg_verifybackup`; tablespace archives are
    refused (see below);
 2. compare `./secrets` with the backup's fingerprints (a difference only
-   warns: step 5 applies the current secrets);
-3. preflight, before anything is changed: if the database volume holds a
-   cluster or the fetcher's outbox holds files, refuse without `--replace`,
-   naming both, and change nothing. This includes a lost database with a
-   surviving outbox, and an outbox the backup cannot replace because it has
-   no `online.tar`. With `--replace`, the database volume is deleted;
-4. extract the base backup and its WAL into a new `pgdata` volume. PostgreSQL
-   replays to the backup's consistent end when it starts;
-5. set every role's password to the current `./secrets`
+   warns: step 6 applies the current secrets);
+3. preflight, before anything is changed: no service is stopped and no file
+   is touched. The database volume counts as empty only as Docker creates
+   it from the image (at most empty directories). A volume with a cluster
+   (`PG_VERSION`), or with any other files (an interrupted restore's, for
+   example), is in use, and so is an outbox with files. Without
+   `--replace`, a destination in use is refused, naming every one, and
+   nothing changes. This includes a lost database with a surviving outbox,
+   and an outbox the backup cannot replace because it has no `online.tar`.
+   A volume that cannot be inspected is never taken for empty;
+4. stop the whole stack (API, publisher, fetcher, PostgreSQL and the
+   monitoring profile). This happens also when the database volume is
+   empty: after its loss the other services may still run, and a running
+   publisher or fetcher would write the registry or the outbox while they
+   are restored. Both destinations are then inspected again, now that
+   nothing writes, and refused as in step 3 if a fetcher filled the outbox
+   meanwhile. With `--replace`, a database volume in use (a cluster or
+   partial files) is deleted;
+5. extract the base backup and its WAL into the new `pgdata` volume.
+   PostgreSQL replays to the backup's consistent end when it starts;
+6. set every role's password to the current `./secrets`
    (`rotate-db-password.sh --current`), because a physical backup carries
    the old cluster's roles;
-6. restore the fetcher's outbox from the backup. If the backup has none,
+7. restore the fetcher's outbox from the backup. If the backup has none,
    `--replace` empties the outbox instead, so that no fetcher state or
    delivery from another registry survives;
-7. `karta restore-check --finalize`. The checks: registry schema; every
+8. `karta restore-check --finalize`. The checks: registry schema; every
    retained release database present and read-only; the active release
    loadable; the audit table append-only. Then the restore is checked
    against the backup's two summaries. A base backup restores the registry
@@ -577,9 +589,10 @@ failure:
    **pauses automatic online activation** and **audits the restored active
    pointer** (action `restore`, like a rollback) in one transaction. The
    report is saved in `backups/restore-reports/`;
-8. start the API and the publisher and wait until the API is ready.
+9. start the API and the publisher and wait until the API is ready.
 
-The fetcher is not started. After a restore:
+The fetcher and the monitoring profile stay stopped (`make up-monitoring`
+starts monitoring again). After a restore:
 
 * **Anti-replay.** The registry's verified serial is the one from the
   backup. Before resuming online activation, confirm the producer's current
@@ -615,9 +628,9 @@ the tablespace's volume, owned by `postgres` with mode 0700, and point
 | A publication after the backup is absent after the restore (recovery point = backup time) | A | same test |
 | Failed upgrade (registry schema newer than the build) undone by restoring with `--replace` | A | same test, "a failed upgrade is undone …" |
 | A damaged backup, and a restore over a database without `--replace`, refused before anything changes | A | same test |
-| A lost database with a surviving outbox, without `--replace`: refused, the database volume left unextracted | A | same test |
+| A lost database with a surviving outbox, without `--replace`: refused, the database volume left unextracted. A partial database volume (files, no `PG_VERSION`): refused without `--replace`. With `--replace` and the API and publisher running: the stack stops, the partial volume is deleted, the backed-up outbox replaces newer fetcher state, and the fetcher stays stopped | A | same test |
 | A release switch while `pg_basebackup` streams the files, and one after it ended but before the second summary: both restores pass, the first holds the switch and the second does not | A | `TestOperations` "a release switch around the base backup …"; `TestCompareWithBackup` |
-| The fetcher is started again after a failed or interrupted outbox copy, and a stopped fetcher stays stopped; the restore preflight changes nothing when it refuses, and `--replace` empties an outbox a backup without one cannot replace | A | `tests/scripts` (the scripts against stand-ins for Docker) |
+| The fetcher is started again after a failed or interrupted outbox copy, and a stopped fetcher stays stopped. The restore preflight changes nothing when it refuses, nor stops a service. The stack stops before either destination changes, also with an empty database volume, and the fetcher stays stopped. A partial database volume is deleted before extraction. An outbox a fetcher fills while the stack stops is refused. `--replace` empties an outbox a backup without one cannot replace | A | `tests/scripts` (the scripts against stand-ins for Docker) |
 | Disk exhaustion before a build, in staging and in the database during an import | A | `TestPublication` "disk exhaustion fails safely" |
 | Rollback, pinned clients, cleanup, crash at every transition | A | `TestPublication`, `TestOnline` |
 | Chitgar: backup under load (8,301 requests, 0 errors), restore into an isolated project | B | backup 10 s (16 MB), restore 16.7 s, all checks passed |
