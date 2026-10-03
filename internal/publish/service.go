@@ -330,7 +330,8 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 	}
 	s.phase("capacity", "")
 	if err := s.checkCapacity(ctx, v.Info.Size, cfg.ID); err != nil {
-		return fail(registry.SubRejected, CodeInsufficient, err)
+		state, code := capacityFailure(err)
+		return fail(state, code, err)
 	}
 
 	s.phase("waiting_for_build_lock", "")
@@ -586,6 +587,20 @@ func (s *Service) checkCapacity(ctx context.Context, snapshotBytes int64, region
 			ErrStorage, *c.DBVolumeFreeBytes, c.CandidateEstimate, c.MinFreeBytes)
 	}
 	return nil
+}
+
+// capacityFailure classifies an error from checkCapacity. Only a refusal
+// for space (ErrStorage) is insufficient_storage; it stands even if the
+// deadline passed just after it was decided. Any other error means the
+// capacity could not be measured: the job's deadline or a shutdown
+// cancelled a query, or the database failed. Such a publication is
+// interrupted (retried, or publication_timeout at the deadline: see
+// timeoutOutcome), never refused for storage it was not shown to lack.
+func capacityFailure(err error) (state, code string) {
+	if errors.Is(err, ErrStorage) {
+		return registry.SubRejected, CodeInsufficient
+	}
+	return registry.SubInterrupted, CodeInterrupted
 }
 
 func (s *Service) updateSubmission(ctx context.Context, id int64, u registry.SubmissionUpdate) {

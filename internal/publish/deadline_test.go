@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/pouriya-sedaghat/karta/internal/registry"
 )
@@ -101,5 +105,99 @@ func TestStoppedStagingIsInterruptedNotFailed(t *testing.T) {
 	// An input fault while staging stays what it is.
 	if out := stageOutcome(7, errors.New("disk")); out.State != registry.SubFailed {
 		t.Errorf("an I/O failure: %+v", out)
+	}
+}
+
+// blackholeDB accepts PostgreSQL connections and never answers: every query
+// through it blocks until its context ends, like one stuck on a lock.
+func blackholeDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	cfg, err := pgxpool.ParseConfig(fmt.Sprintf("host=127.0.0.1 port=%d user=karta dbname=karta sslmode=disable connect_timeout=60",
+		ln.Addr().(*net.TCPAddr).Port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		pool.Close()
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return pool
+}
+
+func TestCapacityQueryCrossingTheDeadlineIsATimeout(t *testing.T) {
+	s := &Service{cfg: Config{PublishTimeout: 300 * time.Millisecond}, reg: blackholeDB(t)}
+	parent := context.Background()
+	job, cancel := s.jobContext(parent)
+	defer cancel()
+	start := time.Now()
+	err := s.checkCapacity(job, 1<<20, "fixture")
+	took := time.Since(start)
+	if err == nil || took < 250*time.Millisecond || took > 10*time.Second {
+		t.Fatalf("capacity query: %v after %s, want it blocked until the 300ms deadline", err, took)
+	}
+	state, code := capacityFailure(err)
+	if state != registry.SubInterrupted || code != CodeInterrupted {
+		t.Fatalf("a capacity query stopped by the deadline is %s/%s, want interrupted (never insufficient_storage)", state, code)
+	}
+	out := s.timeoutOutcome(job, parent, "capacity", "touch the ready marker to submit again",
+		Outcome{State: state, Code: code, Reason: err.Error(), Err: err})
+	if out.State != registry.SubFailed || out.Code != CodePublicationTimeout || !errors.Is(out.Err, ErrPublicationTimeout) ||
+		!strings.Contains(out.Reason, "while capacity") {
+		t.Errorf("outcome %+v, want failed/publication_timeout naming the capacity phase", out)
+	}
+}
+
+func TestCapacityFailure(t *testing.T) {
+	storage := fmt.Errorf("%w: release databases use 10 bytes and the candidate needs about 20, above the budget of 15 bytes", ErrStorage)
+	for _, c := range []struct {
+		name  string
+		err   error
+		state string
+		code  string
+	}{
+		{"a refusal for space", storage, registry.SubRejected, CodeInsufficient},
+		{"a query cancelled by the deadline", fmt.Errorf("timeout: %w", context.DeadlineExceeded), registry.SubInterrupted, CodeInterrupted},
+		{"a query cancelled by a shutdown", fmt.Errorf("query: %w", context.Canceled), registry.SubInterrupted, CodeInterrupted},
+		{"the database failed", errors.New("connection reset by peer"), registry.SubInterrupted, CodeInterrupted},
+	} {
+		if state, code := capacityFailure(c.err); state != c.state || code != c.code {
+			t.Errorf("%s: %s/%s, want %s/%s", c.name, state, code, c.state, c.code)
+		}
+	}
+	// A refusal for space decided before the deadline stays a refusal.
+	s := &Service{cfg: Config{PublishTimeout: time.Millisecond}}
+	job, cancel := s.jobContext(context.Background())
+	defer cancel()
+	<-job.Done()
+	state, code := capacityFailure(storage)
+	out := s.timeoutOutcome(job, context.Background(), "capacity", "", Outcome{State: state, Code: code, Reason: storage.Error()})
+	if out.State != registry.SubRejected || out.Code != CodeInsufficient {
+		t.Errorf("a storage refusal that completed before the deadline became %s/%s", out.State, out.Code)
 	}
 }

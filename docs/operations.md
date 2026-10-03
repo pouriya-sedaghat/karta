@@ -167,8 +167,8 @@ image".
 Every publication (inbox, online delivery and `karta import`) runs under one
 deadline, `KARTA_PUBLISH_TIMEOUT` (default **6h, provisional**: set it from
 the tier D publication time plus a recorded margin). The deadline covers
-staging, verification, osm2pgsql, the post-import SQL and validation. When
-it passes:
+staging, verification, the storage capacity check, osm2pgsql, the
+post-import SQL and validation. When it passes:
 
 * the staging copy and the snapshot's structural scan stop at their next
   read, and every database statement of the job is cancelled. osm2pgsql is
@@ -178,7 +178,10 @@ it passes:
   run under `docker-init`, which reaps orphans;
 * the candidate database is dropped, the active release keeps serving, and
   the submission ends `failed` with reason code **`publication_timeout`**
-  (audited). The reason names the phase it was in;
+  (audited). The reason names the phase it was in. A step the deadline cut
+  off is never reported as something else: a capacity check stopped
+  mid-query is a timeout, not `insufficient_storage` (that is reserved for
+  a measured lack of space);
 * it is **not retried automatically**: it does not count toward
   `KARTA_PUBLISH_MAX_ATTEMPTS` the way an interrupted publication does,
   because a build that does not fit the budget would only time out again.
