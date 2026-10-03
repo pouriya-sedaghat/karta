@@ -200,8 +200,9 @@ rotation was already tested.
 
 `karta-load` (in the importer image) generates a repeatable mix of tile,
 search, manifest and style requests, closed-loop or at a fixed open-loop
-rate, pinned to a release, and reports per-kind percentiles, errors and
-late starts. `scripts/capacity-run.sh` wraps it with an environment record
+rate, pinned to a release or following the manifest's activations, and
+reports per-kind percentiles, errors, late starts and the releases it
+targeted. `scripts/capacity-run.sh` wraps it with an environment record
 and container sampling. `karta region-draft` writes a region file whose box
 is exactly the snapshot's header or verified sidecar box, with the digest
 pinned and **empty** acceptance checks. Iran's checks must come from a

@@ -1,7 +1,11 @@
 // Command karta-load drives map and search load against a running Karta
 // API and reports throughput, latency percentiles and errors per kind of
 // request, as JSON. It reads the manifest first and pins every request to
-// the release it names (like a map client), unless -follow is set.
+// the release it names (like a map client). With -follow it reads the
+// manifest again every -follow-interval and moves its tile and style
+// requests to the release the manifest names, as a client that reloads
+// would after an activation; searches are then unpinned (the active
+// release answers them).
 //
 //	karta-load -base http://127.0.0.1:8080 -duration 60s -concurrency 16
 //	karta-load -base ... -rate 200 -duration 5m      open loop: a fixed request rate
@@ -34,6 +38,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -48,6 +53,7 @@ type options struct {
 	maxZoom     int
 	queries     []string
 	follow      bool
+	refresh     time.Duration // manifest re-read interval with follow
 	timeout     time.Duration
 	seed        uint64
 }
@@ -199,10 +205,16 @@ type recorder struct {
 	samples  []string
 	late     int
 	releases map[string]bool
+	// targeted: every release whose URLs were requested; refreshes and
+	// refreshErrors count the manifest re-reads of follow mode.
+	targeted      map[string]bool
+	refreshes     int
+	refreshErrors int
 }
 
 func newRecorder() *recorder {
-	return &recorder{latency: map[string][]time.Duration{}, statuses: map[string]map[string]int{}, errors: map[string]int{}, releases: map[string]bool{}}
+	return &recorder{latency: map[string][]time.Duration{}, statuses: map[string]map[string]int{}, errors: map[string]int{},
+		releases: map[string]bool{}, targeted: map[string]bool{}}
 }
 
 func (r *recorder) add(kind string, status int, d time.Duration, err error) {
@@ -260,7 +272,12 @@ type Summary struct {
 	MinZoom        int                    `json:"min_zoom"`
 	MaxZoom        int                    `json:"max_zoom"`
 	ReleasesAnswer []string               `json:"releases_answered,omitempty"`
-	StartedAt      time.Time              `json:"started_at"`
+	// ReleasesTargeted lists every release whose tile, style or search
+	// URLs were requested: only the starting one when pinned.
+	ReleasesTargeted      []string  `json:"releases_targeted"`
+	ManifestRefreshes     int       `json:"manifest_refreshes,omitempty"`
+	ManifestRefreshErrors int       `json:"manifest_refresh_errors,omitempty"`
+	StartedAt             time.Time `json:"started_at"`
 }
 
 func percentile(sorted []time.Duration, p float64) float64 {
@@ -294,6 +311,12 @@ func (r *recorder) summary(s *Summary) {
 		s.ReleasesAnswer = append(s.ReleasesAnswer, id)
 	}
 	sort.Strings(s.ReleasesAnswer)
+	s.ReleasesTargeted = []string{}
+	for id := range r.targeted {
+		s.ReleasesTargeted = append(s.ReleasesTargeted, id)
+	}
+	sort.Strings(s.ReleasesTargeted)
+	s.ManifestRefreshes, s.ManifestRefreshErrors = r.refreshes, r.refreshErrors
 }
 
 func getManifest(ctx context.Context, c *http.Client, base string) (manifest, error) {
@@ -326,8 +349,50 @@ func run(ctx context.Context, o options) (Summary, error) {
 	s := Summary{Base: o.base, ReleaseID: m.Release.ReleaseID, Pinned: !o.follow, Concurrency: o.concurrency,
 		MinZoom: tg.minZoom, MaxZoom: tg.maxZoom, StartedAt: time.Now().UTC(), Mode: "closed_loop"}
 	rec := newRecorder()
+	rec.targeted[tg.release] = true
+	// The target every worker builds its next request from. Pinned, it never
+	// changes; following, the manifest is read again every o.refresh (not per
+	// request) and a new release replaces the target.
+	var cur atomic.Pointer[target]
+	cur.Store(tg)
 	ctx, cancel := context.WithTimeout(ctx, o.duration)
 	defer cancel()
+	if o.follow {
+		go func() {
+			t := time.NewTicker(o.refresh)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+				}
+				m, err := getManifest(ctx, client, o.base)
+				var next *target
+				if err == nil && m.Release.ReleaseID != cur.Load().release {
+					next, err = newTarget(m, o)
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				rec.mu.Lock()
+				rec.refreshes++
+				if err != nil {
+					// Keep the current target; the error is reported.
+					rec.refreshErrors++
+					if len(rec.samples) < 20 {
+						rec.samples = append(rec.samples, "manifest refresh: "+err.Error())
+					}
+				} else if next != nil {
+					rec.targeted[next.release] = true
+				}
+				rec.mu.Unlock()
+				if next != nil {
+					cur.Store(next)
+				}
+			}
+		}()
+	}
 	var tokens chan struct{}
 	if o.rate > 0 {
 		s.Mode, s.TargetRate = "open_loop", o.rate
@@ -371,7 +436,7 @@ func run(ctx context.Context, o options) (Summary, error) {
 				} else if ctx.Err() != nil {
 					return
 				}
-				kind, path := tg.next(r)
+				kind, path := cur.Load().next(r)
 				req, _ := http.NewRequestWithContext(ctx, http.MethodGet, o.base+path, nil)
 				t0 := time.Now()
 				resp, err := client.Do(req)
@@ -416,13 +481,14 @@ func main() {
 	flag.IntVar(&o.minZoom, "min-zoom", 10, "lowest tile zoom requested")
 	flag.IntVar(&o.maxZoom, "max-zoom", 16, "highest tile zoom requested")
 	flag.StringVar(&queries, "queries", "دریاچه,پارک,خیابان,بیمارستان,مدرسه,Lake,Park,Mall", "comma-separated search queries")
-	flag.BoolVar(&o.follow, "follow", false, "do not pin requests to the release the manifest named at the start")
+	flag.BoolVar(&o.follow, "follow", false, "follow activations: read the manifest again every -follow-interval and request the release it names (default: pin the release named at the start)")
+	flag.DurationVar(&o.refresh, "follow-interval", 5*time.Second, "how often -follow reads the manifest again")
 	flag.DurationVar(&o.timeout, "timeout", 15*time.Second, "per-request timeout")
 	flag.Uint64Var(&o.seed, "seed", 1, "random seed (runs are repeatable for the same seed and data)")
 	flag.StringVar(&out, "out", "", "also write the JSON summary to this file")
 	flag.Parse()
 	var err error
-	if o.mix, err = parseMix(mix); err != nil || o.concurrency < 1 || o.duration <= 0 || o.rate < 0 {
+	if o.mix, err = parseMix(mix); err != nil || o.concurrency < 1 || o.duration <= 0 || o.rate < 0 || (o.follow && o.refresh <= 0) {
 		fmt.Fprintln(os.Stderr, "karta-load: invalid flags:", err)
 		os.Exit(2)
 	}

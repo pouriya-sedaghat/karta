@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -109,5 +111,114 @@ func TestRun(t *testing.T) {
 	}
 	if s.Mode != "open_loop" || s.Late == 0 {
 		t.Errorf("saturation not detected: %+v", s)
+	}
+}
+
+// Follow mode moves its tile and style requests to the release a newer
+// manifest names (within a bounded refresh interval), and its unpinned
+// searches reach the active one; pinned mode stays on the release named at
+// the start, searches included.
+func TestFollowMovesToTheActivatedRelease(t *testing.T) {
+	a, b := "r"+strings.Repeat("a", 24), "r"+strings.Repeat("b", 24)
+	type hit struct {
+		release, kind string
+		at            time.Time
+	}
+	serve := func() (*httptest.Server, func(), func() []hit, func() time.Time) {
+		var mu sync.Mutex
+		var hits []hit
+		active := a
+		var switched time.Time
+		record := func(release, kind string) {
+			mu.Lock()
+			hits = append(hits, hit{release, kind, time.Now()})
+			mu.Unlock()
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /v1/manifest", func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			id := active
+			mu.Unlock()
+			fmt.Fprintf(w, `{"release":{"release_id":%q},"style_url":"https://maps.example/v1/releases/%s/style.json",
+				"tiles":{"url_template":"https://maps.example/v1/releases/%s/tiles/{z}/{x}/{y}.pbf","minzoom":0,"maxzoom":16,
+				"bounds":[51.175,35.705,51.285,35.785]},"search":{"url":"https://maps.example/v1/search"}}`, id, id, id)
+		})
+		mux.HandleFunc("GET /v1/releases/{id}/tiles/{z}/{x}/{y}", func(w http.ResponseWriter, r *http.Request) {
+			record(r.PathValue("id"), "tile")
+			w.WriteHeader(http.StatusNoContent)
+		})
+		mux.HandleFunc("GET /v1/releases/{id}/style.json", func(w http.ResponseWriter, r *http.Request) {
+			record(r.PathValue("id"), "style")
+			_, _ = w.Write([]byte("{}"))
+		})
+		mux.HandleFunc("GET /v1/search", func(w http.ResponseWriter, r *http.Request) {
+			id := r.URL.Query().Get("release_id")
+			if id == "" {
+				mu.Lock()
+				id = active
+				mu.Unlock()
+			}
+			record(id, "search")
+			fmt.Fprintf(w, `{"release_id":%q,"results":[]}`, id)
+		})
+		srv := httptest.NewServer(mux)
+		activate := func() {
+			mu.Lock()
+			active, switched = b, time.Now()
+			mu.Unlock()
+		}
+		return srv, activate, func() []hit {
+				mu.Lock()
+				defer mu.Unlock()
+				return append([]hit(nil), hits...)
+			}, func() time.Time {
+				mu.Lock()
+				defer mu.Unlock()
+				return switched
+			}
+	}
+	runWithSwitch := func(follow bool) (Summary, []hit, time.Time) {
+		srv, activate, hits, switched := serve()
+		defer srv.Close()
+		time.AfterFunc(400*time.Millisecond, activate)
+		s, err := run(context.Background(), options{base: srv.URL, duration: 1500 * time.Millisecond, concurrency: 2,
+			mix: map[string]int{"tile": 3, "style": 1, "search": 1}, minZoom: 12, maxZoom: 14, queries: []string{"Lake"},
+			follow: follow, refresh: 100 * time.Millisecond, timeout: time.Second, seed: 3})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s, hits(), switched()
+	}
+
+	s, hits, switched := runWithSwitch(true)
+	late := map[string]int{} // requests for A well after the switch
+	onB := map[string]int{}
+	for _, h := range hits {
+		if h.release == b {
+			onB[h.kind]++
+		}
+		if h.release == a && h.at.After(switched.Add(500*time.Millisecond)) {
+			late[h.kind]++
+		}
+	}
+	if onB["tile"] == 0 || onB["style"] == 0 || onB["search"] == 0 {
+		t.Errorf("follow mode did not request the activated release: %v", onB)
+	}
+	if len(late) != 0 {
+		t.Errorf("follow mode kept requesting the old release after the refresh interval: %v", late)
+	}
+	if s.Pinned || strings.Join(s.ReleasesTargeted, ",") != a+","+b || s.ReleaseID != a || s.ManifestRefreshes == 0 || s.ManifestRefreshErrors != 0 {
+		t.Errorf("follow summary: pinned %v, targeted %v, start %s, refreshes %d/%d errors", s.Pinned, s.ReleasesTargeted, s.ReleaseID,
+			s.ManifestRefreshes, s.ManifestRefreshErrors)
+	}
+
+	s, hits, _ = runWithSwitch(false)
+	for _, h := range hits {
+		if h.release != a {
+			t.Fatalf("pinned mode requested %s %s", h.kind, h.release)
+		}
+	}
+	if !s.Pinned || strings.Join(s.ReleasesTargeted, ",") != a || s.ManifestRefreshes != 0 {
+		t.Errorf("pinned summary: pinned %v, targeted %v, refreshes %d", s.Pinned, s.ReleasesTargeted, s.ManifestRefreshes)
 	}
 }

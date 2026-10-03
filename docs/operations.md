@@ -736,7 +736,13 @@ scripts/capacity-run.sh tier-b-chitgar-closed-c16 -duration 60s -concurrency 16 
 scripts/capacity-run.sh tier-d-iran-rate200 -rate 200 -duration 10m -concurrency 64        # open loop at a fixed rate
 ```
 
-`karta-load` pins one release by default (as clients do). It mixes tiles,
+`karta-load` pins one release by default (as clients do). With `-follow`
+it reads the manifest again every `-follow-interval` (5 s) and moves its
+tile and style requests to the release the manifest names, as a client
+that reloads after an activation would, and leaves searches unpinned (the
+active release answers them); use it for a run across a publication or
+rollback. The report lists every release it targeted
+(`releases_targeted`) and the manifest re-reads. It mixes tiles,
 searches, manifest and style requests by weight
 (`-mix tile=70,search=20,manifest=5,style=5`) over a zoom range and query
 list, and reports per-kind latency percentiles, errors, the achieved rate
