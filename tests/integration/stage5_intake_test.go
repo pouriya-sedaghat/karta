@@ -549,11 +549,31 @@ func TestIntake(t *testing.T) {
 			t.Fatal(err)
 		}
 		waitWatcher(t, "a passing preflight", 30*time.Second, func(s *intake.State) bool { return s.Preflight.OK })
-		// A delivery owned by another account than the landing owner.
-		land(t, "foreign", dataK, completionFor("foreign", dataK))
-		for _, n := range []string{"foreign.osm.pbf", "foreign.osm.pbf.complete"} {
-			if err := os.Lchown(filepath.Join(landingDir, n), 12345, 12345); err != nil {
-				t.Skipf("cannot chown in the landing area (the test is not root): %v", err)
+		// A delivery owned by another account than the landing owner (needs
+		// root to create; probed on a hidden name the watcher ignores).
+		probe := filepath.Join(landingDir, ".chown-probe")
+		if err := os.WriteFile(probe, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := os.Lchown(probe, 12345, 12345)
+		_ = os.Remove(probe)
+		if err != nil {
+			t.Logf("not root: the foreign-owner case is covered by the unit tests only (%v)", err)
+			return
+		}
+		for _, f := range []struct {
+			name string
+			b    []byte
+		}{{"foreign.osm.pbf", dataK}, {"foreign.osm.pbf.complete", completionFor("foreign", dataK)}} {
+			tmp := filepath.Join(landingDir, "."+f.name+".part")
+			if err := os.WriteFile(tmp, f.b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Lchown(tmp, 12345, 12345); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(tmp, filepath.Join(landingDir, f.name)); err != nil {
+				t.Fatal(err)
 			}
 		}
 		waitWatcher(t, "a refused foreign delivery", 30*time.Second, func(s *intake.State) bool {
@@ -639,6 +659,50 @@ func TestIntake(t *testing.T) {
 		}
 		if n := len(databases(t)); n != dbs {
 			t.Errorf("re-authorizing rebuilt the release: %d databases, were %d", n, dbs)
+		}
+	})
+
+	dataG2 := variant(t, at("2026-07-15T00:00:00Z"), nil, nil)
+	t.Run("an authorization that expires during the build stops activation", func(t *testing.T) {
+		restartPublisher(t, map[string]string{"KARTA_TEST_INTAKE_DIR": "/data/intake", "KARTA_TEST_INTAKE_MAX_AGE": "1m",
+			"KARTA_TEST_OSM2PGSQL": "/usr/local/bin/slow-osm2pgsql"})
+		defer restartPublisher(t, intakeOn)
+		active := status(t).activeID()
+		if _, _, code := compose(t, "exec", "-T", "publisher", "touch", "/tmp/karta-hold-import"); code != 0 {
+			t.Fatal("cannot hold the import")
+		}
+		res, code, stderr := runSubmit(t, nil, "test-alice", commandFile(t, "g2", dataG2), "--expect-sha256", digestOf(dataG2), "--no-wait")
+		if code != 0 {
+			t.Fatalf("exit %d %s", code, stderr)
+		}
+		var expires time.Time
+		r := op(t, http.MethodGet, "/v1/operator/intake/authorizations", alice, nil)
+		var l struct {
+			Records []struct {
+				Authorization struct {
+					ID        int64     `json:"id"`
+					ExpiresAt time.Time `json:"expires_at"`
+				} `json:"authorization"`
+			} `json:"records"`
+		}
+		r.json(t, &l)
+		for _, rec := range l.Records {
+			if rec.Authorization.ID == res.Result.AuthorizationID {
+				expires = rec.Authorization.ExpiresAt
+			}
+		}
+		if expires.IsZero() || time.Until(expires) > 61*time.Second {
+			t.Fatalf("the authorization's lifetime is not capped at 1m: expires %s", expires)
+		}
+		waitJobPhase(t, "building", 60*time.Second)
+		time.Sleep(time.Until(expires) + 2*time.Second)
+		compose(t, "exec", "-T", "publisher", "rm", "-f", "/tmp/karta-hold-import")
+		sub, _ := waitDigest(t, digestOf(dataG2), 120*time.Second)
+		if sub.State != "rejected" || sub.code() != "authorization_expired" || status(t).activeID() != active {
+			t.Fatalf("G2 after expiry: %+v (active %s, was %s)", sub, status(t).activeID(), active)
+		}
+		if rel := status(t).release(sub.release()); rel == nil || rel.State != "ready" {
+			t.Errorf("the built release is not kept ready: %+v", rel)
 		}
 	})
 

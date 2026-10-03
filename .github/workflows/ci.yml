@@ -50,7 +50,7 @@ jobs:
           go-version-file: go.mod
       - name: build images
         run: make build
-      - name: integration tests (Stage 1 stack, Stage 2 publication, Stage 3 online updates, Stage 4 operations; committed fixtures and a local controlled HTTPS source only)
+      - name: integration tests (Stage 1 stack, Stage 2 publication, Stage 3 online updates, Stage 4 operations, Stage 5 intake and bridge; committed fixtures and a local controlled HTTPS source only)
         run: make test-integration
       - name: browser test against the fixture
         run: |
