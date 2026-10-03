@@ -420,3 +420,71 @@ func validBaseURL(s string) error {
 	}
 	return nil
 }
+
+// Intake configures `karta intake` (Stage 5): the protected-folder watcher
+// and the authenticated submission command.
+type Intake struct {
+	// HandoffDir is the intake's handoff directory (the publisher's
+	// KARTA_INTAKE_DIR).
+	HandoffDir string
+	RegionFile string
+	// OperatorURL and TokenFile reach the operator API with an intake
+	// credential (scope intake_watch or intake_submit).
+	OperatorURL string
+	TokenFile   string
+	Timeout     time.Duration
+	// TTL is the validity asked for (0: the publisher's cap).
+	TTL           time.Duration
+	MaxInputBytes int64
+	ReserveBytes  int64
+	LogLevel      string
+	// The watcher's landing area.
+	LandingDir string
+	LandingUID int
+	// WriterGID is the one group allowed to write the landing area (-1:
+	// none).
+	WriterGID int
+	Settle    time.Duration
+	Poll      time.Duration
+}
+
+// LoadIntake reads the intake configuration; watch also needs the landing
+// area.
+func LoadIntake(getenv func(string) string, watch bool) (Intake, error) {
+	r := &reader{getenv: getenv}
+	c := Intake{
+		HandoffDir:    r.dir("KARTA_INTAKE_DIR", ""),
+		RegionFile:    r.str("KARTA_REGION_FILE", ""),
+		OperatorURL:   r.str("KARTA_OPERATOR_URL", "http://127.0.0.1:8081"),
+		TokenFile:     r.str("KARTA_OPERATOR_TOKEN_FILE", ""),
+		Timeout:       r.dur("KARTA_OPERATOR_CLIENT_TIMEOUT", time.Minute, time.Second, 10*time.Minute),
+		TTL:           r.dur("KARTA_INTAKE_AUTHORIZATION_TTL", 0, 0, 366*24*time.Hour),
+		MaxInputBytes: int64(r.int("KARTA_MAX_INPUT_MB", 4096, 1, 1<<22)) << 20,
+		ReserveBytes:  int64(r.int("KARTA_INTAKE_RESERVE_MB", 64, 0, 1<<22)) << 20,
+		LogLevel:      r.logLevel(),
+		LandingDir:    r.str("KARTA_INTAKE_LANDING_DIR", ""),
+		LandingUID:    r.int("KARTA_INTAKE_LANDING_UID", -1, -1, 1<<31-1),
+		WriterGID:     r.int("KARTA_INTAKE_WRITER_GID", -1, -1, 1<<31-1),
+		Settle:        r.dur("KARTA_INTAKE_SETTLE", 10*time.Second, 0, time.Hour),
+		Poll:          r.dur("KARTA_INTAKE_POLL_INTERVAL", 10*time.Second, time.Second, time.Hour),
+	}
+	for _, v := range []struct{ key, val string }{
+		{"KARTA_INTAKE_DIR", c.HandoffDir}, {"KARTA_REGION_FILE", c.RegionFile}, {"KARTA_OPERATOR_TOKEN_FILE", c.TokenFile},
+	} {
+		if v.val == "" {
+			r.errs = append(r.errs, fmt.Errorf("%s is required", v.key))
+		}
+	}
+	if c.RegionFile != "" {
+		r.regular("KARTA_REGION_FILE", c.RegionFile)
+	}
+	if watch {
+		if c.LandingDir == "" {
+			r.errs = append(r.errs, errors.New("KARTA_INTAKE_LANDING_DIR is required (the protected landing area)"))
+		}
+		if c.LandingUID < 0 {
+			r.errs = append(r.errs, errors.New("KARTA_INTAKE_LANDING_UID is required (the landing owner's numeric UID)"))
+		}
+	}
+	return c, errors.Join(r.errs...)
+}

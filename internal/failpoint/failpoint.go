@@ -37,6 +37,16 @@ var Known = []string{
 	"fetch.after_download",
 	"fetch.before_marker",
 	"fetch.after_marker",
+	// Stage 5: the local intake.
+	"intake.after_hash",
+	"intake.after_authorize",
+	"intake.before_marker",
+	"intake.after_marker",
+	// Stage 5: the bridge.
+	"bridge.acquire_mid_download",
+	"bridge.sign_after_asset",
+	"bridge.sign_after_state",
+	"bridge.sign_after_manifest",
 }
 
 var enabled = parse(os.Getenv("KARTA_FAILPOINTS"))

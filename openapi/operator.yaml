@@ -1112,6 +1112,7 @@ components:
         authorization_id: { type: integer, format: int64 }
         channel: { type: string }
         handed_off_at: { $ref: "#/components/schemas/Timestamp" }
+        landing_fingerprint: { type: string }
         submission_state: { type: string }
         reason_code: { type: string }
         release_id: { type: string }
@@ -1156,4 +1157,15 @@ components:
         handoffs: { type: array, nullable: true, items: { $ref: "#/components/schemas/IntakeHandoff" } }
         last_outcome: { allOf: [{ $ref: "#/components/schemas/IntakeHandoff" }], nullable: true }
         last_error: { $ref: "#/components/schemas/Problem" }
-        consumed: { type: array, nullable: true, items: { type: string } }
+        consumed:
+          type: array
+          nullable: true
+          items:
+            type: object
+            required: [fingerprint, name, outcome, at]
+            properties:
+              fingerprint: { type: string }
+              name: { type: string }
+              outcome: { type: string, enum: [delivered, refused] }
+              code: { type: string }
+              at: { $ref: "#/components/schemas/Timestamp" }

@@ -43,9 +43,18 @@ type State struct {
 	Handoffs    []Handoff   `json:"handoffs"`
 	LastOutcome *Handoff    `json:"last_outcome"`
 	LastError   *StateError `json:"last_error"`
-	// Consumed are fingerprints of landing deliveries already handed off or
-	// refused, so the same files are not processed again.
-	Consumed []string `json:"consumed"`
+	// Consumed are the landing deliveries already handed off or refused, by
+	// fingerprint, so the same files are not processed again.
+	Consumed []Consumed `json:"consumed"`
+}
+
+// Consumed is one landing delivery the watcher is done with.
+type Consumed struct {
+	Fingerprint string    `json:"fingerprint"`
+	Name        string    `json:"name"`
+	Outcome     string    `json:"outcome"`
+	Code        string    `json:"code,omitempty"`
+	At          time.Time `json:"at"`
 }
 
 // Preflight is the result of the landing checks.
@@ -85,6 +94,9 @@ type Handoff struct {
 	AuthorizationID int64     `json:"authorization_id"`
 	Channel         string    `json:"channel"`
 	HandedOffAt     time.Time `json:"handed_off_at"`
+	// LandingFingerprint identifies the landing files it came from (crash
+	// recovery completes a handoff only while they are unchanged).
+	LandingFingerprint string `json:"landing_fingerprint,omitempty"`
 	// SubmissionState is the publisher's state of the submission ("" until
 	// it has one), with its reason code and release.
 	SubmissionState string     `json:"submission_state"`

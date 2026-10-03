@@ -3,6 +3,9 @@
 //	karta serve                 serve the public HTTP API (configured by KARTA_* environment variables)
 //	karta publisher             watch the inbox (and online deliveries), publish releases and serve the operator API
 //	karta fetcher               poll the configured online source and deliver verified snapshots (opt-in)
+//	karta intake watch|submit   the local intake: protected-folder watcher and authenticated command (opt-in)
+//	karta intake check          the landing area preflight
+//	karta bridge acquire|sign|serve  the controlled source bridge: download, sign without network, serve (opt-in)
 //	karta import [flags]        publish an OSM snapshot file through the same path as the inbox
 //	karta operator COMMAND      call the operator API (status, audit, metrics, authorize, revoke, activate, rollback, cleanup, online-*)
 //	karta healthcheck [--live]  exit 0 if the local server is ready (or live)
@@ -72,6 +75,8 @@ func main() {
 		os.Exit(publisher())
 	case "fetcher":
 		os.Exit(fetcher())
+	case "intake":
+		os.Exit(runIntake(os.Args[2:]))
 	case "import":
 		os.Exit(runImport(os.Args[2:]))
 	case "operator":
@@ -93,7 +98,8 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: karta serve | publisher | fetcher | import --snapshot FILE --region FILE [flags] | operator COMMAND [flags] |\n"+
+	fmt.Fprintln(os.Stderr, "usage: karta serve | publisher | fetcher | intake watch|submit|check | bridge acquire|sign|serve|status |\n"+
+		"  import --snapshot FILE --region FILE [flags] | operator COMMAND [flags] |\n"+
 		"  healthcheck [--live] [--url URL] | registry-summary | restore-check [flags] | region-draft --snapshot FILE --id ID --name NAME | version")
 }
 
