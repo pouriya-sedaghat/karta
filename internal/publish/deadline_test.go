@@ -173,6 +173,27 @@ func TestCapacityQueryCrossingTheDeadlineIsATimeout(t *testing.T) {
 	}
 }
 
+func TestCapacityQueryStoppedByShutdownIsInterrupted(t *testing.T) {
+	s := &Service{cfg: Config{PublishTimeout: time.Minute}, reg: blackholeDB(t)}
+	parent, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+	job, cancel := s.jobContext(parent)
+	defer cancel()
+	time.AfterFunc(200*time.Millisecond, shutdown)
+	err := s.checkCapacity(job, 1<<20, "fixture")
+	if err == nil {
+		t.Fatal("the capacity query was not stopped by the shutdown")
+	}
+	state, code := capacityFailure(err)
+	out := s.timeoutOutcome(job, parent, "capacity", "touch the ready marker to submit again",
+		Outcome{State: state, Code: code, Reason: err.Error(), Err: err})
+	// Interrupted (retried at the next start), neither a storage refusal
+	// nor a timeout: the deadline had not passed.
+	if out.State != registry.SubInterrupted || out.Code != CodeInterrupted || errors.Is(out.Err, ErrPublicationTimeout) {
+		t.Errorf("a capacity query stopped by a shutdown: %+v, want interrupted", out)
+	}
+}
+
 func TestCapacityFailure(t *testing.T) {
 	storage := fmt.Errorf("%w: release databases use 10 bytes and the candidate needs about 20, above the budget of 15 bytes", ErrStorage)
 	for _, c := range []struct {
