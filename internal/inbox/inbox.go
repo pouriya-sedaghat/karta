@@ -35,6 +35,7 @@
 package inbox
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -359,7 +360,13 @@ type Options struct {
 // Stage copies a complete submission into a new directory under stagingDir
 // (created 0700, files 0600) and verifies it. On any error the staging
 // directory is removed.
-func Stage(dir string, e Entry, stagingDir, id string, opts Options) (st *Staged, err error) {
+func Stage(dir string, e Entry, stagingDir, id string, opts Options) (*Staged, error) {
+	return StageContext(context.Background(), dir, e, stagingDir, id, opts)
+}
+
+// StageContext is Stage, stopped when ctx ends: the copy of the snapshot
+// then fails with context.Cause(ctx) (a publication deadline or a shutdown).
+func StageContext(ctx context.Context, dir string, e Entry, stagingDir, id string, opts Options) (st *Staged, err error) {
 	if e.Problem != "" {
 		return nil, reject(e.Problem, "%s", e.ProblemDetail)
 	}
@@ -433,7 +440,7 @@ func Stage(dir string, e Entry, stagingDir, id string, opts Options) (st *Staged
 			return nil, err
 		}
 	}
-	st.SHA256, st.Size, err = copyVerified(dir, snapName, e.Snapshot, st.SnapshotPath, opts.MaxSnapshotBytes)
+	st.SHA256, st.Size, err = copyVerified(ctx, dir, snapName, e.Snapshot, st.SnapshotPath, opts.MaxSnapshotBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -486,8 +493,8 @@ func classifyWrite(err error) error {
 }
 
 // copyVerified copies the listed snapshot while hashing it, and checks that
-// it did not change during the copy.
-func copyVerified(dir, name string, want *FileState, dst string, limit int64) (string, int64, error) {
+// it did not change during the copy. It stops when ctx ends.
+func copyVerified(ctx context.Context, dir, name string, want *FileState, dst string, limit int64) (string, int64, error) {
 	src, err := openListed(dir, name, want)
 	if err != nil {
 		return "", 0, err
@@ -498,9 +505,12 @@ func copyVerified(dir, name string, want *FileState, dst string, limit int64) (s
 		return "", 0, classifyWrite(err)
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(src, limit+1))
+	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(ctxReader{ctx, src}, limit+1))
 	if err != nil {
 		_ = out.Close()
+		if ctx.Err() != nil {
+			return "", 0, fmt.Errorf("staging %s stopped: %w", name, context.Cause(ctx))
+		}
 		var pe *fs.PathError
 		if errors.As(err, &pe) && pe.Path == src.Name() {
 			return "", 0, reject(CodeIO, "read %s: %v", name, err)
@@ -565,7 +575,12 @@ func CleanStaging(stagingDir string, keep map[string]bool) ([]string, error) {
 // same checks as Stage: regular files only, never through a symlink, and
 // unchanged while copied. The staged snapshot keeps its .osm.pbf or .osm
 // suffix.
-func StageFile(snapshotPath, sidecarPath, stagingDir, id string, opts Options) (st *Staged, err error) {
+func StageFile(snapshotPath, sidecarPath, stagingDir, id string, opts Options) (*Staged, error) {
+	return StageFileContext(context.Background(), snapshotPath, sidecarPath, stagingDir, id, opts)
+}
+
+// StageFileContext is StageFile, stopped when ctx ends (see StageContext).
+func StageFileContext(ctx context.Context, snapshotPath, sidecarPath, stagingDir, id string, opts Options) (st *Staged, err error) {
 	dir, name := filepath.Split(snapshotPath)
 	if dir == "" {
 		dir = "."
@@ -623,7 +638,7 @@ func StageFile(snapshotPath, sidecarPath, stagingDir, id string, opts Options) (
 			return nil, err
 		}
 	}
-	st.SHA256, st.Size, err = copyVerified(dir, name, snap, st.SnapshotPath, opts.MaxSnapshotBytes)
+	st.SHA256, st.Size, err = copyVerified(ctx, dir, name, snap, st.SnapshotPath, opts.MaxSnapshotBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -642,4 +657,18 @@ func lstatRegular(path string) (*FileState, error) {
 		return nil, reject(CodeNotRegular, "%s is not a regular file", path)
 	}
 	return stateOf(fi), nil
+}
+
+// ctxReader fails the next read once ctx has ended, so a long copy stops
+// at the publication deadline or at shutdown.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if c.ctx.Err() != nil {
+		return 0, context.Cause(c.ctx)
+	}
+	return c.r.Read(p)
 }

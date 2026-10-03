@@ -32,7 +32,6 @@
 package importer
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -40,7 +39,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -158,8 +156,12 @@ func Verify(ctx context.Context, o VerifyOptions) (*Verified, error) {
 	if o.Now != nil {
 		now = o.Now
 	}
-	info, err := osmfile.Inspect(o.SnapshotPath, o.MaxInputBytes)
+	info, err := osmfile.InspectContext(ctx, o.SnapshotPath, o.MaxInputBytes)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Stopped (deadline or shutdown), not a fault of the input.
+			return nil, fmt.Errorf("verifying the snapshot was stopped: %w", context.Cause(ctx))
+		}
 		return nil, inputErr(CodeMalformed, "%v", err)
 	}
 	src := SourceReport{File: filepath.Base(info.Path), Format: string(info.Format), Size: info.Size, SHA256: info.SHA256,
@@ -725,8 +727,10 @@ func runPostSQL(ctx context.Context, conn *pgx.Conn) error {
 }
 
 func osm2pgsqlVersion(ctx context.Context, bin string) (string, error) {
-	out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput() // #nosec G204 -- configured binary path
-	if err != nil {
+	cmd := newTool(ctx, bin, "--version")
+	out, err := cmd.CombinedOutput()
+	_ = killGroup(cmd)
+	if err != nil && !errors.Is(err, exec.ErrWaitDelay) {
 		return "", fmt.Errorf("run %s --version: %w", bin, err)
 	}
 	for _, line := range strings.Split(string(out), "\n") {
@@ -739,6 +743,9 @@ func osm2pgsqlVersion(ctx context.Context, bin string) (string, error) {
 
 // runOsm2pgsql imports the snapshot. The password is passed through a
 // temporary 0600 pgpass file, never on the command line or in the environment.
+// osm2pgsql runs in its own process group (see runTool): when ctx ends (the
+// publication deadline, or a shutdown) it is stopped with every process it
+// started, and the error wraps the context's cause.
 func runOsm2pgsql(ctx context.Context, opts BuildOptions, snapshot, dbName string, log *slog.Logger) (int64, error) {
 	dir, err := os.MkdirTemp("", "karta-import-")
 	if err != nil {
@@ -770,32 +777,12 @@ func runOsm2pgsql(ctx context.Context, opts BuildOptions, snapshot, dbName strin
 		args = append(args, "--slim", "--drop")
 	}
 	args = append(args, snapshot)
-	cmd := exec.CommandContext(ctx, opts.Osm2pgsql, args...) // #nosec G204 -- fixed arguments, validated values
+	cmd := newTool(ctx, opts.Osm2pgsql, args...)
 	cmd.Env = []string{"PGPASSFILE=" + pgpass, "PGSSLMODE=" + opts.DB.SSLMode, "PGAPPNAME=karta-osm2pgsql", "PGCONNECT_TIMEOUT=10", "HOME=" + dir}
 	cmd.Dir = dir
-	out, err := cmd.StdoutPipe()
+	rss, tail, err := runTool(ctx, cmd, "osm2pgsql", log)
 	if err != nil {
-		return 0, err
-	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("start osm2pgsql: %w", err)
-	}
-	var tail []string
-	sc := bufio.NewScanner(out)
-	for sc.Scan() {
-		l := sc.Text()
-		log.Info("osm2pgsql", "line", l)
-		tail = append(tail, l)
-		if len(tail) > 20 {
-			tail = tail[1:]
-		}
-	}
-	_, _ = io.Copy(io.Discard, out)
-	err = cmd.Wait()
-	rss := childMaxRSS(cmd)
-	if err != nil {
-		return rss, fmt.Errorf("osm2pgsql failed (%v): %s", err, strings.Join(tail, " | "))
+		return rss, fmt.Errorf("%w: %s", err, tail)
 	}
 	return rss, nil
 }

@@ -1,0 +1,47 @@
+# Thresholds the Karta alert rules (alerts.yml) compare against, as
+# recording rules so each is set in one place. Load this file together with
+# alerts.yml.
+#
+# Two kinds, kept apart on purpose:
+#
+# * Engineering guards (group karta-guards): provisional values that bound
+#   resource saturation and overruns. They are NOT service objectives; set
+#   them from the measurements on the selected target host (tier D,
+#   docs/operations.md) and review them with the capacity results.
+#
+# * Owner objectives (group karta-objectives): the owner's service
+#   objectives. None is decided, so none is set: rules that compare against a
+#   missing objective never fire, and KartaObjectivesUnset says so. When the
+#   owner decides, uncomment and fill in the records below. The acceptable
+#   active-data age is not here: it is KARTA_DATA_STALE_AFTER on the
+#   publisher, exported as karta_data_stale_after_seconds.
+groups:
+  - name: karta-guards
+    rules:
+      # Free space of a filesystem below this fraction (node_exporter).
+      - record: karta:guard_disk_free_ratio
+        expr: vector(0.10)
+      # A container's working set above this fraction of its memory limit (cAdvisor).
+      - record: karta:guard_memory_ratio
+        expr: vector(0.90)
+      # Release databases above this fraction of KARTA_RELEASE_STORAGE_BUDGET_MB:
+      # the next build may be refused for space.
+      - record: karta:guard_release_storage_ratio
+        expr: vector(0.80)
+      # A publication still running this long after its deadline means the
+      # deadline did not stop it.
+      - record: karta:guard_publication_overrun_seconds
+        expr: vector(600)
+      # The fetcher is this late for its own next scheduled check: stopped or stuck.
+      - record: karta:guard_fetcher_overdue_seconds
+        expr: vector(900)
+
+  - name: karta-objectives
+    rules: []
+    # Owner decisions (docs/operations.md, "Owner inputs"). Example shape only:
+    #   - record: karta:objective_api_error_ratio      # allowed share of 5xx answers
+    #     expr: vector(<owner value>)
+    #   - record: karta:objective_api_latency_quantile # e.g. the 0.99 quantile
+    #     expr: vector(<owner value>)
+    #   - record: karta:objective_api_latency_seconds  # bound on that quantile
+    #     expr: vector(<owner value>)

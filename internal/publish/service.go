@@ -81,7 +81,10 @@ type Config struct {
 	CleanupMargin   time.Duration
 	CleanupInterval time.Duration
 	// MaxAttempts bounds retries of an interrupted submission.
-	MaxAttempts        int
+	MaxAttempts int
+	// PublishTimeout bounds one whole publication from staging through
+	// validation (0 = no deadline); see jobContext.
+	PublishTimeout     time.Duration
 	LockTimeout        time.Duration
 	PointerLockTimeout time.Duration
 	MaxFutureSkew      time.Duration
@@ -127,6 +130,9 @@ type Service struct {
 	now           func() time.Time
 	// readCounts reads a release database's stored counts (a test seam).
 	readCounts reportCountsReader
+	// started and stats feed the publication metrics.
+	started time.Time
+	stats   pubStats
 }
 
 // JobStatus describes the publication in progress.
@@ -170,7 +176,7 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 		pool.Close()
 		return nil, fmt.Errorf("migrate registry: %w", err)
 	}
-	s := &Service{cfg: cfg, log: log, reg: pool, settler: inbox.NewSettler(), onlineSettler: inbox.NewSettler(), now: time.Now}
+	s := &Service{cfg: cfg, log: log, reg: pool, settler: inbox.NewSettler(), onlineSettler: inbox.NewSettler(), now: time.Now, started: time.Now()}
 	s.readCounts = s.readReportCounts
 	return s, nil
 }
@@ -297,6 +303,9 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		MaxInputBytes: s.cfg.MaxInputBytes, MaxFutureSkew: s.cfg.MaxFutureSkew, Now: s.now, Authorize: authorize,
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return fail(registry.SubInterrupted, CodeInterrupted, err)
+		}
 		if code := importer.InputCode(err); code != "" {
 			return fail(registry.SubRejected, code, err)
 		}
@@ -321,7 +330,8 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 	}
 	s.phase("capacity", "")
 	if err := s.checkCapacity(ctx, v.Info.Size, cfg.ID); err != nil {
-		return fail(registry.SubRejected, CodeInsufficient, err)
+		state, code := capacityFailure(err)
+		return fail(state, code, err)
 	}
 
 	s.phase("waiting_for_build_lock", "")
@@ -412,6 +422,10 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 	if signed != nil {
 		gate = s.onlineGate(signed)
 	}
+	// The switch runs on its own short bound, not the job deadline: a
+	// release built and validated in time is switched to (see switchContext).
+	ctx, cancel := s.switchContext(ctx)
+	defer cancel()
 	res, err := registry.Activate(ctx, s.reg, registry.ActivateRequest{
 		Gate:   gate,
 		Target: built.ReleaseID, Expected: expected, CheckExpected: true, Action: "publish",
@@ -575,6 +589,20 @@ func (s *Service) checkCapacity(ctx context.Context, snapshotBytes int64, region
 	return nil
 }
 
+// capacityFailure classifies an error from checkCapacity. Only a refusal
+// for space (ErrStorage) is insufficient_storage; it stands even if the
+// deadline passed just after it was decided. Any other error means the
+// capacity could not be measured: the job's deadline or a shutdown
+// cancelled a query, or the database failed. Such a publication is
+// interrupted (retried, or publication_timeout at the deadline: see
+// timeoutOutcome), never refused for storage it was not shown to lack.
+func capacityFailure(err error) (state, code string) {
+	if errors.Is(err, ErrStorage) {
+		return registry.SubRejected, CodeInsufficient
+	}
+	return registry.SubInterrupted, CodeInterrupted
+}
+
 func (s *Service) updateSubmission(ctx context.Context, id int64, u registry.SubmissionUpdate) {
 	if id == 0 {
 		return
@@ -595,6 +623,13 @@ func (s *Service) finish(ctx context.Context, req request, out Outcome, markerDi
 	}
 	s.updateSubmission(ctx, req.subID, registry.SubmissionUpdate{State: out.State, ReasonCode: out.Code, Reason: out.Reason,
 		ReleaseID: out.ReleaseID, MarkerSHA256: markerDigest, SHA256: sha, SizeBytes: size})
+	s.mu.Lock()
+	var took time.Duration
+	if s.job != nil {
+		took = s.now().Sub(s.job.StartedAt)
+	}
+	s.mu.Unlock()
+	s.stats.record(req.source, out.State, out.Code, took)
 	outcome := registry.OutcomeSucceeded
 	switch out.State {
 	case registry.SubRejected, registry.SubDuplicate:
@@ -663,7 +698,9 @@ func (s *Service) ImportFile(ctx context.Context, o ImportOptions) Outcome {
 	req.subID = sub.ID
 	s.setJob(&JobStatus{SubmissionID: sub.ID, Name: req.name, Source: "cli", Phase: "staging", StartedAt: s.now(), PhaseAt: s.now()})
 	defer s.setJob(nil)
-	staged, err := inbox.StageFile(o.SnapshotPath, prov, s.cfg.StagingDir, newJobID("cli-"),
+	job, cancel := s.jobContext(ctx)
+	defer cancel()
+	staged, err := inbox.StageFileContext(job, o.SnapshotPath, prov, s.cfg.StagingDir, newJobID("cli-"),
 		inbox.Options{MaxSnapshotBytes: s.cfg.MaxInputBytes, ReserveBytes: s.cfg.StagingReserveBytes})
 	var out Outcome
 	if err != nil {
@@ -672,8 +709,9 @@ func (s *Service) ImportFile(ctx context.Context, o ImportOptions) Outcome {
 		defer os.RemoveAll(staged.Dir)
 		req.staged = staged
 		failpoint.Hit("stage.after_copy")
-		out = s.publish(ctx, req)
+		out = s.publish(job, req)
 	}
+	out = s.timeoutOutcome(job, ctx, s.currentPhase(), "run the import again", out)
 	s.finish(ctx, req, out, "")
 	if out.State == registry.SubPublished || out.State == registry.SubReady {
 		s.cleanupAfterPublish(ctx)
@@ -682,6 +720,11 @@ func (s *Service) ImportFile(ctx context.Context, o ImportOptions) Outcome {
 }
 
 func stageOutcome(subID int64, err error) Outcome {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrPublicationTimeout) {
+		// Stopped while copying: retried after a shutdown, or turned into
+		// publication_timeout by timeoutOutcome at the deadline.
+		return Outcome{SubmissionID: subID, State: registry.SubInterrupted, Code: CodeInterrupted, Reason: err.Error(), Err: err}
+	}
 	code := inbox.CodeOf(err)
 	out := Outcome{SubmissionID: subID, State: registry.SubRejected, Code: code, Reason: err.Error(), Err: fmt.Errorf("%w: %v", importer.ErrInput, err)}
 	switch code {
@@ -831,7 +874,9 @@ func (s *Service) processEntry(ctx context.Context, f feed, e inbox.Entry) {
 	s.log.Info("processing submission", "source", f.source, "name", e.Name, "submission_id", sub.ID, "attempt", sub.Attempts)
 	s.setJob(&JobStatus{SubmissionID: sub.ID, Name: e.Name, Source: f.source, Phase: "staging", StartedAt: s.now(), PhaseAt: s.now()})
 	defer s.setJob(nil)
-	staged, err := inbox.Stage(f.dir, e, s.cfg.StagingDir, f.source+"-"+strconv.FormatInt(sub.ID, 10)+"-"+strconv.Itoa(sub.Attempts),
+	job, cancel := s.jobContext(ctx)
+	defer cancel()
+	staged, err := inbox.StageContext(job, f.dir, e, s.cfg.StagingDir, f.source+"-"+strconv.FormatInt(sub.ID, 10)+"-"+strconv.Itoa(sub.Attempts),
 		inbox.Options{MaxSnapshotBytes: s.cfg.MaxInputBytes, ReserveBytes: s.cfg.StagingReserveBytes, RequireManifest: f.online})
 	var out Outcome
 	marker := ""
@@ -842,8 +887,9 @@ func (s *Service) processEntry(ctx context.Context, f feed, e inbox.Entry) {
 		marker = staged.MarkerSHA256
 		req.staged = staged
 		failpoint.Hit("stage.after_copy")
-		out = s.publish(ctx, req)
+		out = s.publish(job, req)
 	}
+	out = s.timeoutOutcome(job, ctx, s.currentPhase(), resubmitHint(f), out)
 	s.finish(ctx, req, out, marker)
 	if out.State == registry.SubPublished {
 		s.cleanupAfterPublish(ctx)

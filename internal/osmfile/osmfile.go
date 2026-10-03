@@ -15,6 +15,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -85,6 +86,12 @@ func DetectFormat(path string) (Format, error) {
 // Inspect validates the path, digests the file and parses its header.
 // maxSize bounds the accepted file size in bytes.
 func Inspect(path string, maxSize int64) (Info, error) {
+	return InspectContext(context.Background(), path, maxSize)
+}
+
+// InspectContext is Inspect, stopped when ctx ends: reading the file then
+// fails with context.Cause(ctx) (a publication deadline or a shutdown).
+func InspectContext(ctx context.Context, path string, maxSize int64) (Info, error) {
 	format, err := DetectFormat(path)
 	if err != nil {
 		return Info{}, err
@@ -116,13 +123,13 @@ func Inspect(path string, maxSize int64) (Info, error) {
 	h := sha256.New()
 	switch format {
 	case FormatPBF:
-		counter := &countingReader{r: io.TeeReader(f, h)}
+		counter := &countingReader{r: io.TeeReader(ctxReader{ctx, f}, h)}
 		err = scanPBF(bufio.NewReaderSize(counter, 1<<20), &info)
 		if err == nil && counter.n != st.Size() {
 			err = fmt.Errorf("read %d bytes but the file is %d bytes; it changed while being read", counter.n, st.Size())
 		}
 	case FormatXML:
-		if _, err = io.Copy(h, f); err != nil {
+		if _, err = io.Copy(h, ctxReader{ctx, f}); err != nil {
 			return Info{}, err
 		}
 		if _, err = f.Seek(0, io.SeekStart); err != nil {
@@ -490,4 +497,18 @@ func readXMLHeader(r io.Reader, info *Info) error {
 		info.BBox = &[4]float64{attrs["minlon"], attrs["minlat"], attrs["maxlon"], attrs["maxlat"]}
 		return nil
 	}
+}
+
+// ctxReader fails the next read once ctx has ended, so a long scan stops at
+// the publication deadline or at shutdown.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if c.ctx.Err() != nil {
+		return 0, context.Cause(c.ctx)
+	}
+	return c.r.Read(p)
 }

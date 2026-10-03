@@ -13,6 +13,7 @@ services:
   api:
     ports: !override
       - "127.0.0.1:${KARTA_TEST_HTTP_PORT:-18080}:8080"
+      - "127.0.0.1:${KARTA_TEST_METRICS_PORT:-18083}:9464"
     environment:
       # The integration test recreates the API with another base URL to check
       # that previously issued style URLs are not reused for different bytes.
@@ -37,6 +38,8 @@ services:
       # slow-osm2pgsql delays every import by 15 s, for the tests that must
       # observe or interrupt a running import.
       KARTA_OSM2PGSQL: ${KARTA_TEST_OSM2PGSQL:-osm2pgsql}
+      # The bounded-publication tests shorten the whole-publication deadline.
+      KARTA_PUBLISH_TIMEOUT: ${KARTA_TEST_PUBLISH_TIMEOUT:-6h}
       # Fault injection (internal/failpoint): test-only.
       KARTA_FAILPOINTS: ${KARTA_TEST_FAILPOINTS:-}
       # Online updates are off unless the Stage 3 suite turns them on.
@@ -46,6 +49,7 @@ services:
       - ${KARTA_INBOX_HOST_DIR:?set by make test-integration}:/data/inbox:ro
       - ./config/regions:/config/regions:ro
       - ./tests/integration/slow-osm2pgsql.sh:/usr/local/bin/slow-osm2pgsql:ro
+      - ./tests/integration/forking-osm2pgsql.sh:/usr/local/bin/forking-osm2pgsql:ro
       # The Stage 3 suite's source files (test keys, test CA) and the
       # fetcher's outbox, both host directories the tests control.
       - ${KARTA_TEST_SOURCE_CONFIG_DIR:?set by make test-integration}:/config/sources:ro
@@ -55,9 +59,20 @@ services:
       - /var/lib/karta/staging:size=${KARTA_TEST_STAGING_SIZE:-64m},uid=10001,gid=10001,mode=0700
     # A failpoint exit must stay down until the test restarts the publisher.
     restart: "no"
+  # The monitoring profile on test ports (the operations suite starts it).
+  postgres-exporter:
+    ports: !override
+      - "127.0.0.1:${KARTA_TEST_DB_METRICS_PORT:-18087}:9187"
+  prometheus:
+    ports: !override
+      - "127.0.0.1:${KARTA_TEST_PROMETHEUS_PORT:-18090}:9090"
   importer:
     environment:
       KARTA_RETAIN_RELEASES: "2"
+      # The region the test publisher serves (registry-summary, restore-check).
+      KARTA_REGION_FILE: /config/regions/fixture.json
+    volumes:
+      - ./tests/integration/slow-osm2pgsql.sh:/usr/local/bin/slow-osm2pgsql:ro
   # The fetcher only reaches the controlled test source: `sourcenet` is
   # internal (no route out of Docker), so the suite cannot download from a
   # live external host. It runs as the test user so the tests can inspect,

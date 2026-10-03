@@ -70,9 +70,14 @@ services:
       KARTA_CORS_ALLOWED_ORIGINS: ${KARTA_CORS_ALLOWED_ORIGINS:-}
       KARTA_RELEASE_POLL_INTERVAL: ${KARTA_RELEASE_POLL_INTERVAL:-5s}
       KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
-    secrets: [db_api_password]
+      # Request metrics on their own listener, for the monitoring credential
+      # only (secrets/metrics_tokens); never on the public port.
+      KARTA_METRICS_LISTEN_ADDR: ":9464"
+      KARTA_METRICS_TOKENS_FILE: /run/secrets/metrics_tokens
+    secrets: [db_api_password, metrics_tokens]
     ports:
       - "${KARTA_HTTP_BIND:-127.0.0.1}:${KARTA_HTTP_PORT:-8080}:8080"
+      - "${KARTA_METRICS_BIND:-127.0.0.1}:${KARTA_API_METRICS_PORT:-9464}:9464"
     networks: [backend, frontend]
     depends_on:
       db:
@@ -95,6 +100,12 @@ services:
   publisher:
     image: karta-importer:${KARTA_IMAGE_TAG:-local}
     entrypoint: ["/usr/local/bin/karta", "publisher"]
+    # A minimal init (docker-init) is PID 1 and reaps every process a build
+    # leaves behind; karta itself also stops osm2pgsql's whole process group.
+    init: true
+    # Time to drop the candidate and record an interrupted publication on
+    # shutdown before Docker kills the process.
+    stop_grace_period: 30s
     environment: &publication-env
       KARTA_DB_HOST: db
       KARTA_DB_USER: karta_importer
@@ -114,6 +125,10 @@ services:
       KARTA_RELEASE_TABLESPACE: ${KARTA_RELEASE_TABLESPACE:-}
       KARTA_OSM2PGSQL_CACHE_MB: ${KARTA_OSM2PGSQL_CACHE_MB:-800}
       KARTA_OSM2PGSQL_PROCESSES: ${KARTA_OSM2PGSQL_PROCESSES:-2}
+      # Whole-publication deadline (staging through validation). The default
+      # is provisional: set it from measured publication times on the target
+      # host (docs/operations.md).
+      KARTA_PUBLISH_TIMEOUT: ${KARTA_PUBLISH_TIMEOUT:-6h}
       KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
       # Online updates: empty (the default) keeps them off. Set to a source
       # file such as /config/sources/NAME.json and run `make up-online`.
@@ -201,6 +216,62 @@ services:
     security_opt: ["no-new-privileges:true"]
     logging: *logging
 
+  # Optional monitoring (profile `monitoring`, `make up-monitoring`). The
+  # exporter reads PostgreSQL statistics as karta_monitor (pg_monitor: no
+  # table data); Prometheus scrapes the API, the publisher and the exporter
+  # with the monitoring credential and evaluates deploy/monitoring/alerts.yml.
+  # Both reach their targets on `backend`; `monitoring` (no NAT) only
+  # publishes their ports, on 127.0.0.1 by default.
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e
+    profiles: [monitoring]
+    command: ["--web.listen-address=:9187"]
+    environment:
+      DATA_SOURCE_URI: db:5432/postgres?sslmode=disable
+      DATA_SOURCE_USER: karta_monitor
+      DATA_SOURCE_PASS_FILE: /run/secrets/db_monitor_password
+    secrets: [db_monitor_password]
+    ports:
+      - "${KARTA_METRICS_BIND:-127.0.0.1}:${KARTA_DB_METRICS_PORT:-9187}:9187"
+    networks: [backend, monitoring]
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 32
+    restart: unless-stopped
+    logging: *logging
+
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    profiles: [monitoring]
+    command:
+      - --config.file=/etc/karta/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${KARTA_PROMETHEUS_RETENTION:-15d}
+      - --web.listen-address=:9090
+    volumes:
+      - ./deploy/monitoring:/etc/karta:ro
+      - prometheus:/prometheus
+    tmpfs:
+      - /tmp:size=64m
+    secrets: [operator_monitor_token]
+    ports:
+      - "${KARTA_METRICS_BIND:-127.0.0.1}:${KARTA_PROMETHEUS_PORT:-9090}:9090"
+    networks: [backend, monitoring]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KARTA_PROMETHEUS_MEM_LIMIT:-512m}
+    cpus: 0.5
+    pids_limit: 64
+    restart: unless-stopped
+    logging: *logging
+
   importer:
     build:
       context: .
@@ -208,6 +279,7 @@ services:
       target: importer
     image: karta-importer:${KARTA_IMAGE_TAG:-local}
     profiles: [tools]
+    init: true
     environment:
       <<: *publication-env
       KARTA_STAGING_DIR: /tmp
@@ -238,12 +310,18 @@ networks:
       com.docker.network.bridge.enable_ip_masquerade: "false"
   # Only the fetcher joins it: its route to the online source.
   egress: {}
+  # Publishes the optional monitoring ports; no NAT route out.
+  monitoring:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
 
 volumes:
   pgdata: {}
   staging: {}
   # The fetcher's outbox: written by the fetcher, read-only for the publisher.
   online: {}
+  # Prometheus' time-series storage (monitoring profile).
+  prometheus: {}
 
 secrets:
   db_superuser_password:
@@ -256,3 +334,9 @@ secrets:
     file: ./secrets/operator_tokens
   operator_token:
     file: ./secrets/operator_token
+  metrics_tokens:
+    file: ./secrets/metrics_tokens
+  operator_monitor_token:
+    file: ./secrets/operator_monitor_token
+  db_monitor_password:
+    file: ./secrets/db_monitor_password

@@ -58,6 +58,23 @@ func TestImportDefaults(t *testing.T) {
 	}
 }
 
+func TestPublishTimeout(t *testing.T) {
+	c, err := LoadImport(env(map[string]string{}))
+	if err != nil || c.PublishTimeout != 6*time.Hour {
+		t.Fatalf("default %s, %v", c.PublishTimeout, err)
+	}
+	c, err = LoadImport(env(map[string]string{"KARTA_PUBLISH_TIMEOUT": "90m"}))
+	if err != nil || c.PublishTimeout != 90*time.Minute {
+		t.Fatalf("90m: %s, %v", c.PublishTimeout, err)
+	}
+	// Always bounded: no zero (unbounded) value, and at most a week.
+	for _, bad := range []string{"0", "0s", "500ms", "200h", "soon"} {
+		if _, err := LoadImport(env(map[string]string{"KARTA_PUBLISH_TIMEOUT": bad})); err == nil || !strings.Contains(err.Error(), "KARTA_PUBLISH_TIMEOUT") {
+			t.Errorf("%q: %v", bad, err)
+		}
+	}
+}
+
 func TestOnlineConfig(t *testing.T) {
 	dir := t.TempDir()
 	region := dir + "/region.json"
@@ -110,5 +127,33 @@ func TestOnlineConfig(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("fetcher without %s: %v", want, err)
 		}
+	}
+}
+
+func TestMetricsListener(t *testing.T) {
+	base := map[string]string{"KARTA_PUBLIC_BASE_URL": "http://x"}
+	c, err := LoadServe(env(base))
+	if err != nil || c.MetricsListenAddr != "" {
+		t.Fatalf("metrics are off by default: %q %v", c.MetricsListenAddr, err)
+	}
+	tokens := t.TempDir() + "/metrics_tokens"
+	if err := os.WriteFile(tokens, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	with := func(kv ...string) map[string]string {
+		m := map[string]string{"KARTA_PUBLIC_BASE_URL": "http://x"}
+		for i := 0; i < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	if c, err := LoadServe(env(with("KARTA_METRICS_LISTEN_ADDR", ":9464", "KARTA_METRICS_TOKENS_FILE", tokens))); err != nil || c.MetricsTokensFile != tokens {
+		t.Fatalf("%+v %v", c, err)
+	}
+	if _, err := LoadServe(env(with("KARTA_METRICS_LISTEN_ADDR", ":9464", "KARTA_METRICS_TOKENS_FILE", "/does/not/exist"))); err == nil {
+		t.Error("a missing tokens file accepted")
+	}
+	if _, err := LoadServe(env(with("KARTA_METRICS_LISTEN_ADDR", ":8080", "KARTA_METRICS_TOKENS_FILE", tokens))); err == nil {
+		t.Error("metrics on the public listener accepted")
 	}
 }

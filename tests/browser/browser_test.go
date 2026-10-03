@@ -282,6 +282,44 @@ func TestDemoRendersOffline(t *testing.T) {
 		})
 	}
 
+	// ODbL attribution: the page footer is on screen with the copyright and
+	// license links, and the map's attribution control carries the style
+	// source's attribution.
+	t.Run("OpenStreetMap attribution is visible", func(t *testing.T) {
+		var a struct {
+			Visible bool   `json:"visible"`
+			Text    string `json:"text"`
+			Href    string `json:"href"`
+			License string `json:"license"`
+			Control string `json:"control"`
+		}
+		if err := chromedp.Run(ctx, chromedp.Evaluate(`(() => {
+			const f = document.getElementById('attribution');
+			const r = f.getBoundingClientRect(), s = getComputedStyle(f);
+			const link = text => [...f.querySelectorAll('a')].find(a => a.textContent.includes(text));
+			const c = document.querySelector('.maplibregl-ctrl-attrib-inner');
+			return {
+				visible: r.width > 0 && r.height > 0 && r.top >= 0 && r.bottom <= innerHeight &&
+					s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0,
+				text: f.textContent.replace(/\s+/g, ' ').trim(),
+				href: link('OpenStreetMap') ? link('OpenStreetMap').href : '',
+				license: link('Open Database License') ? link('Open Database License').href : '',
+				control: c ? c.textContent : '',
+			};
+		})()`, &a)); err != nil {
+			t.Fatal(err)
+		}
+		if !a.Visible || !strings.Contains(a.Text, "© OpenStreetMap contributors") {
+			t.Errorf("attribution footer: visible %v, text %q", a.Visible, a.Text)
+		}
+		if a.Href != "https://www.openstreetmap.org/copyright" || a.License != "https://opendatacommons.org/licenses/odbl/1-0/" {
+			t.Errorf("attribution links: %q, %q", a.Href, a.License)
+		}
+		if !strings.Contains(a.Control, "OpenStreetMap contributors") {
+			t.Errorf("map attribution control: %q", a.Control)
+		}
+	})
+
 	t.Run("search", func(t *testing.T) {
 		var first string
 		sctx, cancel := context.WithTimeout(ctx, 60*time.Second)

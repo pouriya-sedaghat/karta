@@ -5,7 +5,8 @@
 #                    (also `karta operator`, the operator API client, and
 #                    `karta fetcher`, the opt-in online source poller)
 #   target importer  Ubuntu 24.04 + osm2pgsql 1.11.0, non-root: `karta import`
-#                    and `karta publisher` (entrypoint overridden in compose)
+#                    and `karta publisher` (entrypoint overridden in compose);
+#                    also karta-load, the capacity measuring tool
 #
 # Optional build secret `build_ca`: a PEM bundle for networks that intercept
 # TLS (corporate proxies). Without it the default trust stores are used.
@@ -38,11 +39,28 @@ COPY internal/ internal/
 COPY openapi/ openapi/
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/karta ./cmd/karta \
+ && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/karta-load ./cmd/karta-load \
  && mkdir -p /out/online
+# License notices of everything compiled into the binaries (the Go standard
+# library and every linked module) and of the embedded Vazirmatn fonts,
+# shipped in both images under /usr/share/licenses/karta (docs/licenses.md).
+RUN set -eu; n=/out/licenses; mkdir -p "$n/go-modules"; \
+    cp internal/glyphs/fonts/OFL.txt "$n/Vazirmatn-OFL.txt"; \
+    cp "$(go env GOROOT)/LICENSE" "$n/go-modules/golang.org_go@$(go env GOVERSION).LICENSE"; \
+    go list -deps -f '{{with .Module}}{{if not .Main}}{{.Path}}@{{.Version}} {{.Dir}}{{end}}{{end}}' ./cmd/karta ./cmd/karta-load | sort -u | \
+    while read -r mod dir; do \
+      [ -n "$mod" ] || continue; \
+      found=; for f in "$dir"/LICENSE* "$dir"/COPYING* "$dir"/NOTICE*; do \
+        [ -f "$f" ] || continue; cp "$f" "$n/go-modules/$(echo "$mod" | tr / _).$(basename "$f")"; found=1; \
+      done; \
+      [ -n "$found" ] || { echo "no license file for $mod" >&2; exit 1; }; \
+    done; \
+    ls "$n/go-modules"
 
 FROM ${RUNTIME_IMAGE} AS api
 COPY --from=build /out/karta /usr/local/bin/karta
 COPY --from=web /src/web/dist /opt/karta/web
+COPY --from=build /out/licenses /usr/share/licenses/karta
 # The fetcher's outbox (a named volume takes this owner when first mounted).
 COPY --from=build --chown=65532:65532 /out/online /var/lib/karta/online
 ENV KARTA_WEB_DIR=/opt/karta/web
@@ -60,7 +78,8 @@ RUN apt-get update \
  && install -d -o 10001 -g 10001 -m 0700 /var/lib/karta/staging \
  && install -d -o root -g root -m 0755 /data/inbox \
  && install -d -o 65532 -g 65532 -m 0755 /data/online
-COPY --from=build /out/karta /usr/local/bin/karta
+COPY --from=build /out/karta /out/karta-load /usr/local/bin/
+COPY --from=build /out/licenses /usr/share/licenses/karta
 USER 10001:10001
 WORKDIR /tmp
 ENTRYPOINT ["/usr/local/bin/karta", "import"]

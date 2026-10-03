@@ -66,6 +66,9 @@ type Config struct {
 	RequestTimeout     time.Duration
 	CORSAllowedOrigins []string
 	WebDir             string
+	// Metrics, when set, counts every request (served elsewhere: see
+	// Metrics.Handler).
+	Metrics *Metrics
 }
 
 // Releases resolves releases; implemented by release.Manager.

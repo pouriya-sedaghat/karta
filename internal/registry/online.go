@@ -242,21 +242,33 @@ func ReadFreshness(ctx context.Context, q Querier) (Freshness, error) {
 	return f, nil
 }
 
-// CountSubmissions counts submissions by source and state (metrics).
-func CountSubmissions(ctx context.Context, q Querier) (map[[2]string]int64, error) {
-	rows, err := q.Query(ctx, `SELECT source, state, count(*) FROM registry.submissions GROUP BY source, state`)
+// SubmissionCount is the number of submissions in one source and state, and
+// when the latest of them finished (nil in a state without an end:
+// processing, interrupted).
+type SubmissionCount struct {
+	N            int64
+	LastFinished *time.Time
+}
+
+// CountSubmissions counts submissions by source and state, with each
+// state's latest finish time (metrics). Every final outcome sets finished_at
+// and a retry clears it, so a new outcome is always its state's latest
+// finish time, even when a retried older row leaves the state at the same
+// time and the count stays the same.
+func CountSubmissions(ctx context.Context, q Querier) (map[[2]string]SubmissionCount, error) {
+	rows, err := q.Query(ctx, `SELECT source, state, count(*), max(finished_at) FROM registry.submissions GROUP BY source, state`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[[2]string]int64{}
+	out := map[[2]string]SubmissionCount{}
 	for rows.Next() {
 		var src, st string
-		var n int64
-		if err := rows.Scan(&src, &st, &n); err != nil {
+		var c SubmissionCount
+		if err := rows.Scan(&src, &st, &c.N, &c.LastFinished); err != nil {
 			return nil, err
 		}
-		out[[2]string{src, st}] = n
+		out[[2]string{src, st}] = c
 	}
 	return out, rows.Err()
 }

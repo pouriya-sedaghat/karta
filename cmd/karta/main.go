@@ -6,6 +6,9 @@
 //	karta import [flags]        publish an OSM snapshot file through the same path as the inbox
 //	karta operator COMMAND      call the operator API (status, audit, metrics, authorize, revoke, activate, rollback, cleanup, online-*)
 //	karta healthcheck [--live]  exit 0 if the local server is ready (or live)
+//	karta registry-summary      print what a backup records about the registry (JSON)
+//	karta restore-check [flags] verify a restored registry and its releases; --finalize records the restore
+//	karta region-draft [flags]  print a region file for a snapshot (its exact box and digest; checks left empty)
 //	karta version               print the build version
 package main
 
@@ -32,6 +35,8 @@ import (
 	"github.com/pouriya-sedaghat/karta/internal/importer"
 	"github.com/pouriya-sedaghat/karta/internal/online"
 	"github.com/pouriya-sedaghat/karta/internal/operator"
+	"github.com/pouriya-sedaghat/karta/internal/osmfile"
+	"github.com/pouriya-sedaghat/karta/internal/provenance"
 	"github.com/pouriya-sedaghat/karta/internal/publish"
 	"github.com/pouriya-sedaghat/karta/internal/region"
 	"github.com/pouriya-sedaghat/karta/internal/registry"
@@ -51,6 +56,7 @@ const (
 	exitValidation  = 5
 	exitStorage     = 6
 	exitBusy        = 7
+	exitTimeout     = 8
 	exitInterrupted = 130
 )
 
@@ -72,6 +78,12 @@ func main() {
 		os.Exit(runOperator(os.Args[2:]))
 	case "healthcheck":
 		os.Exit(healthcheck(os.Args[2:]))
+	case "registry-summary":
+		os.Exit(registrySummary(os.Args[2:]))
+	case "restore-check":
+		os.Exit(restoreCheck(os.Args[2:]))
+	case "region-draft":
+		os.Exit(regionDraft(os.Args[2:]))
 	case "version":
 		fmt.Println(version)
 	default:
@@ -81,7 +93,8 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: karta serve | publisher | fetcher | import --snapshot FILE --region FILE [flags] | operator COMMAND [flags] | healthcheck [--live] [--url URL] | version")
+	fmt.Fprintln(os.Stderr, "usage: karta serve | publisher | fetcher | import --snapshot FILE --region FILE [flags] | operator COMMAND [flags] |\n"+
+		"  healthcheck [--live] [--url URL] | registry-summary | restore-check [flags] | region-draft --snapshot FILE --id ID --name NAME | version")
 }
 
 func logger(level string) *slog.Logger {
@@ -116,13 +129,48 @@ func serve() int {
 	// request can run, so requests that resolved it finish on it.
 	drain := cfg.RequestTimeout + 5*time.Second
 	mgr := release.NewManager(cfg.DB, cfg.RegistryDB, g.Fontstacks(), drain, log)
+	var metrics *api.Metrics
+	if cfg.MetricsListenAddr != "" {
+		metrics = api.NewMetrics()
+	}
 	handler, err := api.New(api.Config{
 		PublicBaseURL: cfg.PublicBaseURL, RequestTimeout: cfg.RequestTimeout,
-		CORSAllowedOrigins: cfg.CORSAllowedOrigins, WebDir: cfg.WebDir,
+		CORSAllowedOrigins: cfg.CORSAllowedOrigins, WebDir: cfg.WebDir, Metrics: metrics,
 	}, mgr, g, log)
 	if err != nil {
 		log.Error("build handler", "err", err)
 		return exitFailure
+	}
+	// Request metrics: a separate listener, authenticated with a scoped
+	// monitoring credential; never on the public listener.
+	var metricsSrv *http.Server
+	if metrics != nil {
+		creds, err := operator.OpenCredentialFile(cfg.MetricsTokensFile, log)
+		if err != nil {
+			log.Error("metrics credentials", "file", cfg.MetricsTokensFile, "err", err)
+			return exitUsage
+		}
+		metricsSrv = &http.Server{
+			Addr:              cfg.MetricsListenAddr,
+			Handler:           operator.RequireScope(creds, operator.ScopeStatus, "/metrics", metrics.Handler(mgr), log),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    16 << 10,
+			ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		}
+		mln, err := net.Listen("tcp", cfg.MetricsListenAddr)
+		if err != nil {
+			log.Error("listen", "addr", cfg.MetricsListenAddr, "err", err)
+			return exitFailure
+		}
+		go func() {
+			if err := metricsSrv.Serve(mln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("metrics listener stopped", "err", err)
+			}
+		}()
+		log.Info("metrics listening", "addr", mln.Addr().String())
 	}
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -161,6 +209,9 @@ func serve() int {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("shutdown", "err", err)
 	}
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(shutdownCtx)
+	}
 	// Pools close only after the server stopped taking requests.
 	stopMgr()
 	<-mgrDone
@@ -171,7 +222,8 @@ func publicationConfig(c config.Import, regionFile, inboxDir string) publish.Con
 	return publish.Config{
 		RegionPath: regionFile, InboxDir: inboxDir, StagingDir: c.StagingDir, MaxInputBytes: c.MaxInputBytes,
 		PinGrace: c.PinGrace, RetainReleases: c.RetainReleases, CleanupMargin: c.CleanupMargin, CleanupInterval: c.CleanupInterval,
-		MaxAttempts: c.MaxAttempts, LockTimeout: c.LockTimeout, PointerLockTimeout: c.PointerLockTimeout, MaxFutureSkew: c.MaxFutureSkew,
+		MaxAttempts: c.MaxAttempts, PublishTimeout: c.PublishTimeout, LockTimeout: c.LockTimeout, PointerLockTimeout: c.PointerLockTimeout,
+		MaxFutureSkew:       c.MaxFutureSkew,
 		StagingReserveBytes: c.StagingReserveBytes, StorageBudgetBytes: c.StorageBudgetBytes, DBVolumePath: c.DBVolumePath,
 		MinFreeBytes: c.MinFreeBytes, CandidateSizeFactor: c.CandidateSizeFactor,
 		Build: importer.BuildOptions{
@@ -441,6 +493,8 @@ func runImport(args []string) int {
 	}
 	log.Error("import failed", "state", out.State, "reason_code", out.Code, "err", err)
 	switch {
+	case errors.Is(err, publish.ErrPublicationTimeout):
+		return exitTimeout
 	case errors.Is(err, context.Canceled):
 		return exitInterrupted
 	case errors.Is(err, importer.ErrStorage):
@@ -594,5 +648,212 @@ func healthcheck(args []string) int {
 		fmt.Fprintln(os.Stderr, "status", resp.Status)
 		return exitFailure
 	}
+	return exitOK
+}
+
+// oneOffService opens the publication service for a one-off maintenance
+// command, with the importer's configuration (KARTA_* variables) and the
+// region in KARTA_REGION_FILE.
+func oneOffService(ctx context.Context, name string) (*publish.Service, *slog.Logger, int) {
+	cfg, err := config.LoadImport(os.Getenv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "karta %s: invalid configuration:\n%v\n", name, err)
+		return nil, nil, exitUsage
+	}
+	log := logger(cfg.LogLevel).With("service", "karta-"+name, "version", version)
+	g, err := glyphs.New()
+	if err != nil {
+		log.Error("load fonts", "err", err)
+		return nil, nil, exitFailure
+	}
+	pc := publicationConfig(cfg, os.Getenv("KARTA_REGION_FILE"), "")
+	pc.Fontstacks = g.Fontstacks()
+	svc, err := publish.New(ctx, pc, log)
+	if err != nil {
+		log.Error("open the registry", "err", err)
+		return nil, nil, exitFailure
+	}
+	return svc, log, exitOK
+}
+
+// registrySummary prints what a backup records about the registry.
+func registrySummary(args []string) int {
+	fs := flag.NewFlagSet("registry-summary", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
+		return exitUsage
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	svc, log, code := oneOffService(ctx, "registry-summary")
+	if svc == nil {
+		return code
+	}
+	defer svc.Close()
+	sum, err := svc.Summary(ctx)
+	if err != nil {
+		log.Error("registry summary", "err", err)
+		return exitFailure
+	}
+	b, _ := json.MarshalIndent(sum, "", "  ")
+	fmt.Println(string(b))
+	return exitOK
+}
+
+func readSummary(path string) (*publish.RegistrySummary, error) {
+	b, err := os.ReadFile(path) // #nosec G304 -- operator-supplied backup file
+	if err != nil {
+		return nil, err
+	}
+	var s publish.RegistrySummary
+	if err := json.Unmarshal(b, &s); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return &s, nil
+}
+
+// restoreCheck verifies a restored registry and its release databases
+// against what the backup recorded and, with --finalize, records the
+// restore: automatic online activation is paused and the restored active
+// pointer is audited (docs/operations.md, "Restore").
+func restoreCheck(args []string) int {
+	fs := flag.NewFlagSet("restore-check", flag.ContinueOnError)
+	before := fs.String("expect-before", "", "registry summary taken before the backup (registry.before.json)")
+	after := fs.String("expect-after", "", "registry summary taken after the backup (registry.after.json)")
+	outbox := fs.String("fetcher-outbox", "", "restored fetcher outbox directory, to compare its verified serial")
+	finalize := fs.Bool("finalize", false, "record the restore if every check passes: pause automatic online activation and audit it")
+	backupID := fs.String("backup-id", "", "backup identifier recorded with --finalize")
+	reason := fs.String("reason", "restore from backup", "reason recorded in the audit log")
+	actor := fs.String("actor", "restore", "name recorded as the actor in the audit log")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
+		return exitUsage
+	}
+	if *finalize && *backupID == "" {
+		fmt.Fprintln(os.Stderr, "karta restore-check: --finalize needs --backup-id")
+		return exitUsage
+	}
+	exp := publish.RestoreExpect{}
+	if *before != "" && *after == "" {
+		fmt.Fprintln(os.Stderr, "karta restore-check: --expect-before needs --expect-after")
+		return exitUsage
+	}
+	if *after != "" {
+		a, err := readSummary(*after)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "karta restore-check:", err)
+			return exitUsage
+		}
+		exp.After = a
+		if *before != "" {
+			b, err := readSummary(*before)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "karta restore-check:", err)
+				return exitUsage
+			}
+			exp.Before = b
+		}
+	}
+	if *outbox != "" {
+		st, err := online.ReadState(*outbox)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "karta restore-check: fetcher state:", err)
+			return exitFailure
+		}
+		if st != nil {
+			v := st.HighestSerial
+			exp.FetcherSerial = &v
+		}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	svc, log, code := oneOffService(ctx, "restore-check")
+	if svc == nil {
+		return code
+	}
+	defer svc.Close()
+	rep, err := svc.CheckRestore(ctx, exp)
+	if err != nil {
+		log.Error("restore check", "err", err)
+		return exitFailure
+	}
+	b, _ := json.MarshalIndent(rep, "", "  ")
+	fmt.Println(string(b))
+	if !rep.Passed {
+		log.Error("the restored registry failed its checks; nothing was recorded")
+		return exitFailure
+	}
+	if *finalize {
+		if err := svc.FinalizeRestore(ctx, publish.Principal{Name: *actor, Source: "cli"}, *backupID, *reason, rep, exp.FetcherSerial); err != nil {
+			log.Error("record the restore", "err", err)
+			return exitFailure
+		}
+		log.Info("restore recorded: automatic online activation is paused until an operator resumes it", "backup_id", *backupID,
+			"active_release_id", rep.Summary.ActiveRelease)
+	}
+	return exitOK
+}
+
+// regionDraft prints a region file for a snapshot: its box exactly as the
+// snapshot's header or verified provenance sidecar states it, its digest
+// pinned, a default view, and empty validation checks to fill in from a
+// measured import of that snapshot (docs/operations.md, "The Iran region").
+func regionDraft(args []string) int {
+	fs := flag.NewFlagSet("region-draft", flag.ContinueOnError)
+	snapshot := fs.String("snapshot", "", "the snapshot the region is for (.osm.pbf)")
+	provPath := fs.String("provenance", "", "its provenance sidecar (default: <snapshot>.provenance.json if present)")
+	id := fs.String("id", "", "region id: lowercase letters, digits and -")
+	name := fs.String("name", "", "region name")
+	maxMB := fs.Int64("max-input-mb", 4096, "largest snapshot accepted (as KARTA_MAX_INPUT_MB)")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *snapshot == "" || *id == "" || *name == "" {
+		fmt.Fprintln(os.Stderr, "usage: karta region-draft --snapshot FILE [--provenance FILE] --id ID --name NAME")
+		return exitUsage
+	}
+	info, err := osmfile.Inspect(*snapshot, *maxMB<<20)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "karta region-draft:", err)
+		return exitInput
+	}
+	if *provPath == "" {
+		if fi, err := os.Lstat(*snapshot + ".provenance.json"); err == nil && fi.Mode().IsRegular() {
+			*provPath = *snapshot + ".provenance.json"
+		}
+	}
+	var box *[4]float64
+	from := "the snapshot header"
+	if info.BBox != nil {
+		b := *info.BBox
+		box = &b
+	}
+	if *provPath != "" {
+		sc, err := provenance.Load(*provPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "karta region-draft:", err)
+			return exitInput
+		}
+		pbox, _, err := sc.Verify(info.SHA256, info.Size)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "karta region-draft: the sidecar does not describe this snapshot:", err)
+			return exitInput
+		}
+		if box != nil && !region.SameBBox(*box, pbox) {
+			fmt.Fprintf(os.Stderr, "karta region-draft: the header box %v and the sidecar box %v differ; the publisher refuses such a snapshot\n", *box, pbox)
+			return exitInput
+		}
+		box, from = &pbox, "the provenance sidecar"
+	}
+	if box == nil {
+		fmt.Fprintln(os.Stderr, "karta region-draft: the snapshot has no header box and no provenance sidecar; no region can be matched to it")
+		return exitInput
+	}
+	cfg, err := region.Draft(*id, *name, *box, info.SHA256, *provPath != "")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "karta region-draft:", err)
+		return exitUsage
+	}
+	b, _ := json.MarshalIndent(cfg, "", "  ")
+	fmt.Println(string(b))
+	fmt.Fprintf(os.Stderr, "box from %s; %d nodes, %d ways, %d relations; SHA-256 %s pinned.\n"+
+		"The validation checks are empty: import this snapshot (--no-activate), then set min_counts, max_drop_fraction, searches and tiles\n"+
+		"from its measured report (docs/operations.md, \"The Iran region\"); never copy them from another region.\n",
+		from, info.Nodes, info.Ways, info.Relations, info.SHA256)
 	return exitOK
 }

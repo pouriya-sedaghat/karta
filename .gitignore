@@ -13,3 +13,6 @@ __pycache__/
 /web/dist/
 # Test artefacts (screenshots, reports)
 /artifacts/
+# Backups and restore reports (scripts/backup.sh, scripts/restore.sh): data and
+# role password verifiers; never commit them
+/backups/

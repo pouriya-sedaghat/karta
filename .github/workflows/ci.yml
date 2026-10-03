@@ -30,13 +30,16 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_extract_tehran.py' -v
       - name: unit tests (race detector)
         run: make test
+      - name: Prometheus configuration and alert rule unit tests (promtool)
+        run: make test-alerts
 
   stack:
     name: stack, publication, browser and disconnected tests (fixtures)
     runs-on: ubuntu-24.04
-    # The publication and online suites wait on purpose (slow imports and
-    # downloads, pin grace periods, cleanup margins, backoff): about 20
-    # minutes of the budget.
+    # The publication, online and operations suites wait on purpose (slow
+    # imports and downloads, pin grace periods, cleanup margins, backoff,
+    # publication deadlines, alerts firing and clearing): about 25 minutes
+    # of the budget.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +50,7 @@ jobs:
           go-version-file: go.mod
       - name: build images
         run: make build
-      - name: integration tests (Stage 1 stack, Stage 2 publication, Stage 3 online updates; committed fixtures and a local controlled HTTPS source only)
+      - name: integration tests (Stage 1 stack, Stage 2 publication, Stage 3 online updates, Stage 4 operations; committed fixtures and a local controlled HTTPS source only)
         run: make test-integration
       - name: browser test against the fixture
         run: |
