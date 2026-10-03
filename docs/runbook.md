@@ -532,8 +532,11 @@ hypervisor shared folder (VirtualBox, VMware, Hyper-V) or an SMB share is
 only an untrusted transfer space: from there, use the command with an
 expectation.
 
-The watcher copies a complete delivery into the handoff volume and leaves
-the landing files alone; it remembers what it consumed and never processes
+Every delivered file must be owned by the landing account and writable by
+it alone (mode 0644: umask 022 for the landing account); files writable by
+their group or others are refused (`unsafe_mode`), since anyone who can
+write them could change them in place. The watcher copies a complete
+delivery into the handoff volume and leaves the landing files alone; it remembers what it consumed and never processes
 the same files twice. Remove published deliveries from the landing area
 (`make op-status` shows each entry's state). A raw Geofabrik file has no
 provenance sidecar: keep `require_provenance` off in the Iran region file, or
@@ -559,6 +562,10 @@ resumes publication. `intake-resume` (scope `publish`) resumes the watcher.
 * **Stop the watcher**: `make intake-off` (stops it and removes its
   credential; its open authorizations expire by themselves, or close them
   with `make op CMD='revoke --sha256 ... --reason "..."'`).
+* **Stop one digest**: `make op CMD='revoke --sha256 ... --reason "..."'`
+  closes every open authorization of it, the intake's included, and the
+  intake cannot authorize it again (`digest_revoked`) until an operator
+  authorizes it (`make op CMD='authorize ...'`).
 * **Remove a person's credential**: `scripts/operator-credential.sh remove alice`
   (refused from the next request on, no restart).
 * **Turn the intake off**: remove `KARTA_INTAKE_DIR` from `.env` and
@@ -574,10 +581,11 @@ None of these affects online updates or direct manual publication.
 | landing entry | `waiting_for_completion_marker`, `settling`, `queue_full` | waiting: no marker yet; files changed within `KARTA_INTAKE_SETTLE`; `KARTA_INTAKE_MAX_OPEN` handoffs in flight |
 | landing entry | `size_mismatch`, `digest_mismatch`, `changed_during_copy`, `completion_stale` | the copy is not the source's (cut, changed, or replaced after the marker): deliver again under a new name |
 | landing entry | `invalid_completion`, `invalid_name` | the marker is not `karta-delivery/1` for this file, or the name is not allowed |
-| landing entry | `symlink`, `not_regular_file`, `hard_link`, `wrong_owner`, `too_large`, `empty_file` | unsafe or foreign files are never opened: remove them |
+| landing entry | `symlink`, `not_regular_file`, `hard_link`, `wrong_owner`, `unsafe_mode`, `too_large`, `empty_file` | unsafe or foreign files (also files writable by their group or others: upload with umask 022) are never opened: remove them |
+| landing entry | `digest_revoked` | an operator revoked this digest: only an operator's `authorize` releases it again |
 | landing entry | `region_mismatch`, `malformed_snapshot`, `timestamp_missing` | the advisory header check failed before any authorization |
 | preflight | `landing_missing`, `not_a_directory`, `symlink`, `wrong_owner`, `writable_by_others`, `writable_by_group`, `unsupported_filesystem`, `parent_*` | fix the landing area (above) |
-| API | `intake_disabled`, `intake_limit_reached`, `intake_refused` (`region_mismatch`, `too_large`, `validity_beyond_cap`), `credentials_unavailable` | the intake is off; too many open authorizations for the credential; the request is outside the publisher's bounds; the credentials file does not parse |
+| API | `intake_disabled`, `intake_limit_reached`, `intake_refused` (`region_mismatch`, `too_large`, `validity_beyond_cap`, `digest_revoked`), `credentials_unavailable` | the intake is off; too many open authorizations for the credential; the request is outside the publisher's bounds, or the digest was revoked by an operator; the credentials file does not parse |
 | submission | `authorization_revoked`, `authorization_expired`, `unauthorized_digest` | the authorization was revoked, expired (also while queued) or never covered the digest, checked again at the switch: the built release stays `ready`, the pointer is unchanged; a fresh authorization (or a new delivery) re-evaluates it and activates the ready release without a rebuild |
 | submission | `intake_activation_paused` | watcher activation is paused: `intake-resume`, or activate the ready release explicitly |
 

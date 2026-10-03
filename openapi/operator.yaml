@@ -370,12 +370,15 @@ paths:
         credential repeating the same digest, size and name gets its open
         authorization back (`200`, `created: false`); a different size or name
         closes only that credential's own row first. Authorizations of
-        operators and of other intake credentials are never touched.
-        `409 intake_disabled` without `KARTA_INTAKE_DIR`; `409
+        operators and of other intake credentials are never touched. An
+        intake authorization admits only the intake handoff of that name,
+        never the same bytes through the inbox, `karta import` or an online
+        source. `409 intake_disabled` without `KARTA_INTAKE_DIR`; `409
         intake_limit_reached` beyond `KARTA_INTAKE_MAX_OPEN`; `409
         intake_refused` (`reason_code` `region_mismatch`, `too_large`,
-        `validity_beyond_cap`) outside the publisher's bounds. Audited as
-        `intake_authorize`.
+        `validity_beyond_cap`) outside the publisher's bounds, or
+        (`digest_revoked`) for a digest an operator revoked, until an
+        operator authorizes it again. Audited as `intake_authorize`.
       requestBody:
         required: true
         content:
@@ -651,7 +654,8 @@ components:
               type: string
               description: |
                 For `policy_refused`, the rule that refused (older_than_active, not_newer, region_changed, excessive_data_loss,
-                counts_unavailable, region_config); for `intake_refused`, region_mismatch, too_large or validity_beyond_cap.
+                counts_unavailable, region_config); for `intake_refused`, region_mismatch, too_large, validity_beyond_cap or
+                digest_revoked.
             request_id: { type: string }
     SwitchBody:
       type: object

@@ -107,7 +107,9 @@ func (s *Service) verifyDelivery(ctx context.Context, req request, cfg region.Co
 	s.updateSubmission(ctx, req.subID, registry.SubmissionUpdate{State: registry.SubProcessing, ManifestSerial: m.Serial, ManifestSHA256: v.EnvelopeSHA256})
 	failpoint.Hit("online.after_verify")
 	if src.RequireOperatorAuthorization {
-		return v, s.authorizer, nil
+		// Only an operator's authorization: an intake authorization admits
+		// its own handoff, never an online delivery.
+		return v, s.authorizer(registry.AuthScope{}), nil
 	}
 	return v, func(_ context.Context, regionID, digest string, size int64) (string, error) {
 		if regionID == m.RegionID && digest == m.Snapshot.SHA256 && size == m.Snapshot.SizeBytes {
@@ -126,11 +128,11 @@ func (s *Service) verifyDelivery(ctx context.Context, req request, cfg region.Co
 func (s *Service) onlineGate(sv *online.Verified) func(ctx context.Context, q registry.Querier) error {
 	return func(ctx context.Context, q registry.Querier) error {
 		authorized := func(ctx context.Context, regionID, digest string, size int64) (string, error) {
-			a, err := registry.Authorized(ctx, q, regionID, digest, size)
+			a, err := registry.Authorized(ctx, q, regionID, digest, size, registry.AuthScope{Lock: true})
 			if err != nil || a == nil {
 				return "", err
 			}
-			return fmt.Sprintf("operator authorization %d by %s", a.ID, a.CreatedBy), nil
+			return a.Describe(), nil
 		}
 		if err := reauthorizeOnline(ctx, reauthorizeOptions{SourcePath: s.cfg.OnlineSourcePath, RegionPath: s.cfg.RegionPath,
 			Signed: sv, Now: s.now(), Skew: s.cfg.MaxFutureSkew, MaxInputBytes: s.cfg.MaxInputBytes, Authorized: authorized}); err != nil {

@@ -39,6 +39,8 @@ type fakeAPI struct {
 	subs     map[string]*Submission
 	down     bool
 	requests []string
+	// revoked digests are refused as an operator's revoke would make them.
+	revoked map[string]bool
 }
 
 func newFakeAPI() *fakeAPI {
@@ -75,6 +77,10 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var req AuthorizeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(400, map[string]any{"error": map[string]string{"code": "invalid_request", "message": err.Error()}})
+			return
+		}
+		if f.revoked[req.SHA256] {
+			writeJSON(409, map[string]any{"error": map[string]string{"code": "intake_refused", "reason_code": "digest_revoked", "message": "revoked"}})
 			return
 		}
 		if req.RegionID != f.region || float64(req.TTLSeconds) > f.maxTTL || req.SizeBytes < 1 {
@@ -591,8 +597,19 @@ func TestWatcherRefusesUnsafeFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.put("dir.osm.pbf.complete", completion("dir", data))
+	// Files others could rewrite in place (owner and inode unchanged).
+	r.put("gw.osm.pbf", data)
+	r.put("gw.osm.pbf.complete", completion("gw", data))
+	r.put("ow.osm.pbf", data)
+	r.put("ow.osm.pbf.complete", completion("ow", data))
+	for p, mode := range map[string]os.FileMode{"gw.osm.pbf": 0o664, "ow.osm.pbf.complete": 0o646} {
+		if err := os.Chmod(filepath.Join(r.landing, p), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
 	st := r.scan()
-	for name, code := range map[string]string{"sym": CodeSymlink, "fifo": CodeNotRegular, "hard": CodeHardLink, "dir": CodeNotRegular} {
+	for name, code := range map[string]string{"sym": CodeSymlink, "fifo": CodeNotRegular, "hard": CodeHardLink, "dir": CodeNotRegular,
+		"gw": CodeUnsafeMode, "ow": CodeUnsafeMode} {
 		if e := r.entry(st, name); e.State != StateRefused || e.Code != code {
 			t.Errorf("%s: %+v", name, e)
 		}
@@ -852,5 +869,64 @@ func TestWatcherRecordsACleanStop(t *testing.T) {
 	}
 	if st := r.scan(); st.StoppedAt != nil {
 		t.Fatalf("a scan did not clear the stop: %+v", st.StoppedAt)
+	}
+}
+
+// A digest an operator revoked is refused by the publisher; the watcher
+// records a final refusal instead of asking again at every scan.
+func TestWatcherRecordsAFinalAPIRefusal(t *testing.T) {
+	r := newRig(t)
+	data := fixtureA(t)
+	r.api.mu.Lock()
+	r.api.revoked = map[string]bool{digest(data): true}
+	r.api.mu.Unlock()
+	r.put("rev.osm.pbf", data)
+	r.put("rev.osm.pbf.complete", completion("rev", data))
+	for i := 0; i < 3; i++ {
+		r.scan()
+	}
+	st := r.scan()
+	if e := r.entry(st, "rev"); e.State != StateRefused || e.Code != "digest_revoked" {
+		t.Fatalf("%+v", e)
+	}
+	posts := 0
+	r.api.mu.Lock()
+	for _, q := range r.api.requests {
+		if q == "POST /v1/operator/intake/authorizations" {
+			posts++
+		}
+	}
+	r.api.mu.Unlock()
+	if posts != 1 {
+		t.Errorf("the refused authorization was requested %d times", posts)
+	}
+	if hs := r.handoffs(); len(hs) != 0 {
+		t.Errorf("handoff files left: %v", hs)
+	}
+}
+
+// Visible handoffs no authorization of the caller names are removed once
+// they are older than twice the validity cap (any authorization they had
+// has expired); fresh ones of other credentials are left alone.
+func TestReconcileSweepsStaleHandoffs(t *testing.T) {
+	r := newRig(t)
+	put := func(name string, age time.Duration) {
+		for _, suffix := range []string{".osm.pbf", ".osm.pbf.ready"} {
+			p := filepath.Join(r.handoff, name+suffix)
+			if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			at := time.Now().Add(-age)
+			if err := os.Chtimes(p, at, at); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	put("fixture-c20260101T000000Z-0123456789ab", 3*time.Hour) // the fake publisher's cap is 1h
+	put("fixture-c20260102T000000Z-ba9876543210", 10*time.Minute)
+	r.scan()
+	left := strings.Join(dirNames(t, r.handoff), " ")
+	if strings.Contains(left, "0123456789ab") || !strings.Contains(left, "ba9876543210.osm.pbf.ready") {
+		t.Fatalf("handoff directory after the sweep: %s", left)
 	}
 }

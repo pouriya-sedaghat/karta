@@ -17,12 +17,48 @@ import (
 
 var assetPath = regexp.MustCompile(`^/` + SnapshotsDir + `/([0-9a-f]{64})\.osm\.pbf(\.provenance\.json)?$`)
 
+// Bounds of the serving process: at most MaxConcurrent requests at a time
+// (others get 503 with Retry-After), and a response whose client reads
+// nothing for writeStall is abandoned (the fetcher resumes with Range).
+var (
+	MaxConcurrent = 16
+	writeStall    = time.Minute
+)
+
+// limitConcurrency answers 503 beyond n requests in progress.
+func limitConcurrency(n int, h http.Handler) http.Handler {
+	sem := make(chan struct{}, n)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			h.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+		}
+	})
+}
+
+// stallWriter extends the connection's write deadline before every write,
+// so a slow but moving download continues and a stalled one ends.
+type stallWriter struct {
+	http.ResponseWriter
+	rc *http.ResponseController
+}
+
+func (s stallWriter) Write(b []byte) (int, error) {
+	_ = s.rc.SetWriteDeadline(time.Now().Add(writeStall))
+	return s.ResponseWriter.Write(b)
+}
+
 // Handler serves the publish directory read-only: GET and HEAD of
 // /manifest.json and of content-addressed /snapshots/<sha256>.osm.pbf files
 // and their sidecars, nothing else. Assets carry a strong ETag (their
 // digest) and answer Range requests, so the fetcher's verified resume works.
 func Handler(publish string, log *slog.Logger) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return limitConcurrency(MaxConcurrent, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w = stallWriter{ResponseWriter: w, rc: http.NewResponseController(w)}
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -79,7 +115,7 @@ func Handler(publish string, log *slog.Logger) http.Handler {
 		}
 		h.Set("ETag", `"sha256:`+etag+`"`)
 		http.ServeContent(w, r, name, fi.ModTime(), f)
-	})
+	}))
 }
 
 // Statuses reads acquire's and sign's reports for the serve process's

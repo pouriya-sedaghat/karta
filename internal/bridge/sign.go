@@ -68,7 +68,12 @@ type Signer struct {
 	state SignerState
 	log   *slog.Logger
 	now   func() time.Time
+	// lock is held for the signer's life: one process allocates serials.
+	lock *os.File
 }
+
+// LockFileName is the signer's single-instance lock in its state directory.
+const LockFileName = "lock"
 
 // ErrFailClosed is a signer that must not sign until an operator acts.
 var ErrFailClosed = errors.New("the signer refuses to sign")
@@ -99,6 +104,18 @@ func NewSigner(cfg SignConfig, log *slog.Logger, raise *Raise) (*Signer, error) 
 			return nil, err
 		}
 	}
+	lk, err := safefile.Lock(filepath.Join(cfg.StateDir, LockFileName))
+	if err != nil {
+		return nil, fmt.Errorf("another signer holds %s (stop it first; a raise needs the signer stopped): %w",
+			filepath.Join(cfg.StateDir, LockFileName), err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = lk.Close()
+		}
+	}()
+	s.lock = lk
 	st, err := ReadSignerState(cfg.StateDir)
 	if err != nil {
 		return nil, fmt.Errorf("%w: the signer state exists but cannot be read (%v); restore it, then if needed raise the high-water serial", ErrFailClosed, err)
@@ -135,15 +152,116 @@ func NewSigner(cfg SignConfig, log *slog.Logger, raise *Raise) (*Signer, error) 
 		return nil, err
 	}
 	_, _ = inbox.CleanStaging(filepath.Join(cfg.Publish, stagingDirName), nil)
-	if c := s.state.Current; c != nil && !c.Promoted && s.now().Before(c.ExpiresAt) {
-		// A crash between persisting the envelope and publishing it: the
-		// same serial is published with the same bytes.
-		if err := s.promote(); err != nil {
-			return nil, err
-		}
-		log.Info("published a manifest a crash left unpublished", "serial", c.Serial)
+	if err := s.reconcilePublished(); err != nil {
+		return nil, err
 	}
-	return s, s.save()
+	if err := s.save(); err != nil {
+		return nil, err
+	}
+	ok = true
+	return s, nil
+}
+
+// Close releases the single-instance lock.
+func (s *Signer) Close() error {
+	if s.lock == nil {
+		return nil
+	}
+	err := s.lock.Close()
+	s.lock = nil
+	return err
+}
+
+// reconcilePublished makes the current manifest agree with the published
+// one. An envelope persisted but not yet published (a crash or a failed
+// write in between) is published as it is, but only if it is newer than
+// what is published: an older state's pending envelope (a restored backup,
+// after a raise) never replaces a newer manifest. When the published
+// manifest is newer than the state knows, it becomes the current one (the
+// publish volume is written only by the signer), so renewal and the
+// not-newer rule work from what Karta can actually see.
+func (s *Signer) reconcilePublished() error {
+	raw, err := safefile.ReadRegular(filepath.Join(s.cfg.Publish, ManifestFile), online.MaxEnvelopeBytes)
+	var pub *online.Manifest
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return fmt.Errorf("%w: the published manifest cannot be read: %v", ErrFailClosed, err)
+	default:
+		if pub, err = online.ParseUnverified(raw); err != nil {
+			return fmt.Errorf("%w: the published manifest cannot be parsed: %v", ErrFailClosed, err)
+		}
+	}
+	published := int64(0)
+	if pub != nil {
+		published = pub.Serial
+	}
+	c := s.state.Current
+	switch {
+	case c != nil && c.Serial > published:
+		if s.now().Before(c.ExpiresAt) && (!c.Promoted || string(raw) != c.Envelope) {
+			if err := s.promote(); err != nil {
+				return err
+			}
+			s.log.Info("published the current manifest, which was not published", "serial", c.Serial)
+		}
+	case c != nil && c.Serial == published && string(raw) == c.Envelope:
+		if !c.Promoted {
+			c.Promoted = true
+		}
+	case pub != nil:
+		prev := int64(0)
+		if c != nil {
+			prev = c.Serial
+		}
+		var ids []string
+		var env online.Envelope
+		if json.Unmarshal(raw, &env) == nil {
+			for _, sig := range env.Signatures {
+				ids = append(ids, sig.KeyID)
+			}
+		}
+		s.state.Current = &Signed{Serial: pub.Serial, SHA256: pub.Snapshot.SHA256, SizeBytes: pub.Snapshot.SizeBytes,
+			DataTimestamp: pub.Snapshot.DataTimestamp, IssuedAt: pub.IssuedAt, ExpiresAt: pub.ExpiresAt, EnvelopeSHA256: safefile.SHA256Hex(raw),
+			KeyIDs: ids, Envelope: string(raw), Promoted: true, Reason: "adopted: the published manifest is newer than the state"}
+		found := false
+		for i := range s.state.Assets {
+			if s.state.Assets[i].SHA256 == pub.Snapshot.SHA256 {
+				found = true
+				if pub.ExpiresAt.After(s.state.Assets[i].ExpiresAt) {
+					s.state.Assets[i].ExpiresAt = pub.ExpiresAt
+				}
+			}
+		}
+		if !found {
+			s.state.Assets = append(s.state.Assets, AssetRef{SHA256: pub.Snapshot.SHA256, ExpiresAt: pub.ExpiresAt})
+		}
+		s.log.Warn("adopted the published manifest as the current one (the state knew only an older one)", "published_serial", pub.Serial,
+			"state_serial", prev, "high_water", s.state.HighWater)
+	}
+	return nil
+}
+
+// publishPending publishes, during a run, a persisted envelope whose
+// publication failed (for example for space): it is retried at every run,
+// not only at the next start.
+func (s *Signer) publishPending() error {
+	c := s.state.Current
+	if c == nil || c.Promoted || !s.now().Before(c.ExpiresAt) {
+		return nil
+	}
+	published, err := s.publishedSerial()
+	if err != nil {
+		return err
+	}
+	if c.Serial <= published {
+		return s.reconcilePublished()
+	}
+	if err := s.promote(); err != nil {
+		return err
+	}
+	s.log.Info("published a manifest whose publication had failed", "serial", c.Serial)
+	return nil
 }
 
 // State returns a copy of the signer state.
@@ -222,10 +340,19 @@ func (s *Signer) RunOnce(ctx context.Context) {
 		s.log.Error("not signing", "err", err)
 		return
 	}
+	failed := false
+	fail := func(code string, err error, msg string) {
+		failed = true
+		s.setError(code, err)
+		s.log.Error(msg, "err", err)
+	}
+	if err := s.publishPending(); err != nil {
+		fail(codeOr(online.CodeOf(err), "publish"), err, "could not publish the current manifest; retrying")
+	}
 	entries, err := inbox.Scan(s.cfg.Spool, 1000)
 	if err != nil {
-		s.setError("spool", err)
-		return
+		fail("spool", err, "could not read the spool")
+		entries = nil
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].Marker == nil || entries[j].Marker == nil {
@@ -237,19 +364,19 @@ func (s *Signer) RunOnce(ctx context.Context) {
 		if ctx.Err() != nil || !e.Complete() || s.processed(e.Name) {
 			continue
 		}
+		// A failing acquisition (for example no space to stage it) never
+		// stops the renewal of the current manifest below.
 		if err := s.consider(ctx, e); err != nil {
-			s.setError(codeOr(online.CodeOf(err), "sign"), err)
-			s.log.Error("could not process an acquisition; retrying", "sha256", e.Name, "err", err)
-			return
+			fail(codeOr(online.CodeOf(err), "sign"), err, "could not process an acquisition; retrying ("+e.Name+")")
 		}
 	}
 	if err := s.renew(); err != nil {
-		s.setError(codeOr(online.CodeOf(err), "renew"), err)
-		s.log.Error("could not renew the manifest", "err", err)
-		return
+		fail(codeOr(online.CodeOf(err), "renew"), err, "could not renew the manifest")
 	}
 	s.pruneAssets()
-	s.state.LastError = nil
+	if !failed {
+		s.state.LastError = nil
+	}
 }
 
 func codeOr(code, def string) string {

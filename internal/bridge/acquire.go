@@ -55,6 +55,8 @@ type AcquireConfig struct {
 
 // Acquirer polls the distributor and spools new complete snapshots.
 type Acquirer struct {
+	// lock is held for the process's life: one downloader per spool.
+	lock   *os.File
 	cfg    AcquireConfig
 	log    *slog.Logger
 	state  AcquireState
@@ -78,11 +80,16 @@ func NewAcquirer(cfg AcquireConfig, log *slog.Logger) (*Acquirer, error) {
 			return nil, fmt.Errorf("%s is not a directory", d.path)
 		}
 	}
+	lk, err := safefile.Lock(filepath.Join(cfg.Spool, AcquireDirName, LockFileName))
+	if err != nil {
+		return nil, fmt.Errorf("another acquire process holds the spool's lock: %w", err)
+	}
 	st, err := ReadAcquireState(cfg.Spool)
 	if err != nil {
+		_ = lk.Close()
 		return nil, fmt.Errorf("the acquire state exists but cannot be read (%w); restore it or move it aside", err)
 	}
-	a := &Acquirer{cfg: cfg, log: log, now: time.Now, jitter: rand.Float64} // #nosec G404 -- backoff jitter
+	a := &Acquirer{cfg: cfg, log: log, now: time.Now, jitter: rand.Float64, lock: lk} // #nosec G404 -- backoff jitter
 	if st != nil {
 		a.state = *st
 	}
@@ -96,6 +103,16 @@ func NewAcquirer(cfg AcquireConfig, log *slog.Logger) (*Acquirer, error) {
 
 // State returns a copy of the state.
 func (a *Acquirer) State() AcquireState { return a.state }
+
+// Close releases the spool's single-instance lock.
+func (a *Acquirer) Close() error {
+	if a.lock == nil {
+		return nil
+	}
+	err := a.lock.Close()
+	a.lock = nil
+	return err
+}
 
 func (a *Acquirer) save() error {
 	a.state.UpdatedAt = a.now().UTC()

@@ -248,6 +248,11 @@ func (h *Handoffer) deliver(ctx context.Context, d delivery) (*handedOff, error)
 		if errors.As(err, &apiErr) && apiErr.Code == "intake_limit_reached" {
 			return nil, ErrQueueFull
 		}
+		if errors.As(err, &apiErr) && apiErr.Code == "intake_refused" && apiErr.ReasonCode != "" {
+			// A final refusal (a revoked digest, another region, a size or
+			// validity out of bounds): not retried at every scan.
+			return nil, refuse(apiErr.ReasonCode, "the publisher refused the authorization: %s", apiErr.Message)
+		}
 		return nil, err
 	}
 	failpoint.Hit("intake.after_authorize")
@@ -556,12 +561,21 @@ func (h *Handoffer) reconcile(ctx context.Context, resume func(Record) bool) (Re
 
 // sweep removes crash leftovers: temporary copies (nobody copies while the
 // lock is held) and hidden copies older than the validity cap that no
-// authorization of the caller names.
+// authorization of the caller names; and visible handoffs older than twice
+// the cap that no authorization of the caller names, whoever made them (a
+// removed credential's, or one whose command never ran again): every
+// authorization they could have had expired long ago, so the publisher can
+// no longer activate them. Markers go first.
 func (h *Handoffer) sweep(mine map[string]bool, capTTL time.Duration) {
 	entries, err := os.ReadDir(h.cfg.Dir)
 	if err != nil {
 		return
 	}
+	old := func(e os.DirEntry, age time.Duration) bool {
+		fi, err := e.Info()
+		return err == nil && fi.Mode().IsRegular() && time.Since(fi.ModTime()) > age
+	}
+	var stale []string
 	for _, e := range entries {
 		n := e.Name()
 		p := filepath.Join(h.cfg.Dir, n)
@@ -571,13 +585,30 @@ func (h *Handoffer) sweep(mine map[string]bool, capTTL time.Duration) {
 		case strings.HasPrefix(n, ".") && strings.Contains(n, ".hashed"):
 			base := strings.TrimPrefix(n, ".")
 			base = base[:strings.Index(base, ".hashed")]
-			if mine[base] {
-				continue
-			}
-			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > capTTL {
+			if !mine[base] && old(e, capTTL) {
 				_ = os.Remove(p)
 			}
+		case strings.HasPrefix(n, "."):
+		case strings.HasSuffix(n, inbox.MarkerSuffix):
+			if base := strings.TrimSuffix(n, inbox.MarkerSuffix); !mine[base] && old(e, 2*capTTL) {
+				stale = append(stale, base)
+			}
+		case strings.HasSuffix(n, inbox.SnapshotSuffix):
+			// A visible snapshot whose marker was never written (or is
+			// already gone).
+			if base := strings.TrimSuffix(n, inbox.SnapshotSuffix); !mine[base] && old(e, 2*capTTL) {
+				if _, err := os.Lstat(filepath.Join(h.cfg.Dir, base+inbox.MarkerSuffix)); errors.Is(err, os.ErrNotExist) {
+					stale = append(stale, base)
+				}
+			}
 		}
+	}
+	for _, base := range stale {
+		vis, marker, side, _, _ := h.paths(base)
+		_ = os.Remove(marker)
+		_ = os.Remove(vis)
+		_ = os.Remove(side)
+		h.cfg.Log.Info("removed a stale handoff no open authorization names", "name", base)
 	}
 }
 

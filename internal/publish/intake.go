@@ -50,6 +50,9 @@ const (
 	CodeIntakeRegion   = "region_mismatch"
 	CodeIntakeTooLarge = "too_large"
 	CodeIntakeTTL      = "validity_beyond_cap"
+	// CodeIntakeRevoked is a digest an operator revoked: the intake cannot
+	// authorize it again until an operator authorizes it.
+	CodeIntakeRevoked = "digest_revoked"
 )
 
 func (s *Service) intakeEnabled() bool { return s.cfg.IntakeDir != "" }
@@ -114,9 +117,14 @@ func (s *Service) IntakeAuthorize(ctx context.Context, p Principal, channel stri
 		return refuse(&IntakeRefusal{Code: CodeIntakeTTL, Msg: fmt.Sprintf("a validity of %s is beyond the cap of %s (KARTA_INTAKE_AUTHORIZATION_MAX_AGE)",
 			r.TTL, s.cfg.IntakeMaxAge)})
 	}
-	return registry.AuthorizeIntake(ctx, s.reg, registry.IntakeRequest{RegionID: cfg.ID, SHA256: r.SHA256, SizeBytes: r.SizeBytes,
+	a, created, err := registry.AuthorizeIntake(ctx, s.reg, registry.IntakeRequest{RegionID: cfg.ID, SHA256: r.SHA256, SizeBytes: r.SizeBytes,
 		ExpiresAt: s.now().Add(r.TTL), Channel: channel, Name: r.Name, CreatedBy: p.Name, Reason: r.Reason, RequestID: p.RequestID,
 		MaxOpen: s.cfg.IntakeMaxOpen})
+	if errors.Is(err, registry.ErrIntakeBlocked) {
+		// Audited by the registry; reported as a bounded refusal.
+		return nil, false, &IntakeRefusal{Code: CodeIntakeRevoked, Msg: err.Error()}
+	}
+	return a, created, err
 }
 
 // IntakeClose closes one of the caller's own intake authorizations.
@@ -188,8 +196,8 @@ func (s *Service) setIntake(ctx context.Context, p Principal, on bool, reason st
 // unauthorized explains why a digest is neither pinned nor authorized now:
 // the newest authorization it had was revoked or expired, or it never had
 // one (or one for another size).
-func (s *Service) unauthorized(ctx context.Context, q registry.Querier, regionID, digest string, size int64) (string, string, error) {
-	a, err := registry.LatestAuthorization(ctx, q, regionID, digest)
+func (s *Service) unauthorized(ctx context.Context, q registry.Querier, regionID, digest string, size int64, scope registry.AuthScope) (string, string, error) {
+	a, err := registry.LatestAuthorization(ctx, q, regionID, digest, scope)
 	if err != nil {
 		return "", "", err
 	}
@@ -220,7 +228,8 @@ func (s *Service) unauthorized(ctx context.Context, q registry.Querier, regionID
 // unexpired authorization. A snapshot covered only by a watcher
 // authorization also needs automatic watcher activation not to be paused.
 // A refusal leaves the active release as it is and the candidate ready.
-func (s *Service) manualGate(digest string, size int64) func(context.Context, registry.Querier) error {
+func (s *Service) manualGate(digest string, size int64, scope registry.AuthScope) func(context.Context, registry.Querier) error {
+	scope.Lock = true
 	return func(ctx context.Context, q registry.Querier) error {
 		cfg, err := region.Load(s.cfg.RegionPath)
 		if err != nil {
@@ -229,12 +238,12 @@ func (s *Service) manualGate(digest string, size int64) func(context.Context, re
 		if cfg.Source.Pinned(digest) {
 			return nil
 		}
-		a, err := registry.Authorized(ctx, q, cfg.ID, digest, size)
+		a, err := registry.Authorized(ctx, q, cfg.ID, digest, size, scope)
 		if err != nil {
 			return err
 		}
 		if a == nil {
-			code, msg, err := s.unauthorized(ctx, q, cfg.ID, digest, size)
+			code, msg, err := s.unauthorized(ctx, q, cfg.ID, digest, size, scope)
 			if err != nil {
 				return err
 			}

@@ -184,6 +184,7 @@ type brig struct {
 	keys    []ed25519.PrivateKey
 	conf    string
 	a       *Acquirer
+	last    *Signer
 	clock   time.Time
 	log     *slog.Logger
 }
@@ -262,10 +263,16 @@ func (b *brig) writeSignerConf(extra map[string]any) {
 }
 
 func (b *brig) signer(raise *Raise) (*Signer, error) {
+	// One signer at a time (the state directory's lock), as in a deployment.
+	if b.last != nil {
+		_ = b.last.Close()
+		b.last = nil
+	}
 	s, err := NewSigner(SignConfig{ConfigPath: b.conf, RegionPath: b.region, Spool: b.spool, Publish: b.publish, StateDir: b.state,
 		MaxInputBytes: 64 << 20, MaxFutureSkew: 10 * time.Minute, Poll: time.Second, Version: "test"}, b.log, raise)
 	if s != nil {
 		s.now = func() time.Time { return b.clock }
+		b.last = s
 	}
 	return s, err
 }
@@ -857,4 +864,211 @@ func TestExampleConfigs(t *testing.T) {
 	if c.ManifestValidity.D() > 192*time.Hour || c.RenewBefore.D() != c.ManifestValidity.D()/2 {
 		t.Errorf("%+v", c)
 	}
+}
+
+// spoolNewer makes the stand-in serve a newer variant and acquires it.
+func spoolNewer(t *testing.T, b *brig, ts time.Time) []byte {
+	t.Helper()
+	nb := variantB(t, ts, false)
+	b.g.set(func(g *geofabrik) { g.body = nb })
+	b.clock = b.clock.Add(time.Minute)
+	if err := b.a.CheckOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return nb
+}
+
+// blockManifestWrite makes the next atomic write of manifest.json fail
+// (its temporary name is taken by a directory), as a full disk would.
+func blockManifestWrite(t *testing.T, b *brig) func() {
+	t.Helper()
+	d := filepath.Join(b.publish, ".tmp-"+ManifestFile)
+	if err := os.MkdirAll(filepath.Join(d, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return func() { _ = os.RemoveAll(d) }
+}
+
+// A manifest whose publication failed is published at the next run, not
+// only at the next start, and is not reported as published meanwhile.
+func TestSignerRetriesAFailedPublication(t *testing.T) {
+	b := newBrig(t, fixture(t, "karta-fixture-a.osm.pbf"), nil)
+	ctx := context.Background()
+	if err := b.a.CheckOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s := b.mustSigner()
+	s.RunOnce(ctx)
+	nb := spoolNewer(t, b, time.Now().UTC().Add(-time.Hour))
+	unblock := blockManifestWrite(t, b)
+	s.RunOnce(ctx)
+	if st := s.State(); st.Current.Promoted || st.LastError == nil || b.manifest().Serial != 1 {
+		t.Fatalf("a failed publication: promoted %v, error %+v, published %d", st.Current.Promoted, st.LastError, b.manifest().Serial)
+	}
+	if m := string(Metrics(b.spool, b.publish, b.clock)); !strings.Contains(m, "karta_bridge_manifest_pending 1") ||
+		strings.Contains(m, "karta_bridge_manifest_serial 2") {
+		t.Errorf("metrics report an unpublished manifest as published:\n%s", m)
+	}
+	unblock()
+	s.RunOnce(ctx)
+	if m := b.manifest(); m.Serial != 2 || m.Snapshot.SHA256 != sha(nb) || s.State().LastError != nil {
+		t.Fatalf("not retried: published %d %s, error %+v", m.Serial, m.Snapshot.SHA256, s.State().LastError)
+	}
+}
+
+// An acquisition that keeps failing (here: its staging name is taken, as
+// with no space) does not stop the current manifest's renewal.
+func TestSignerRenewsDespiteAFailingAcquisition(t *testing.T) {
+	b := newBrig(t, fixture(t, "karta-fixture-a.osm.pbf"), nil)
+	ctx := context.Background()
+	if err := b.a.CheckOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s := b.mustSigner()
+	s.RunOnce(ctx)
+	first := b.manifest()
+	nb := spoolNewer(t, b, time.Now().UTC().Add(-time.Hour))
+	if err := os.WriteFile(filepath.Join(b.publish, stagingDirName, "sign-"+sha(nb)[:16]), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b.clock = first.ExpiresAt.Add(-time.Hour) // renewal due
+	s.RunOnce(ctx)
+	m := b.manifest()
+	if m.Serial <= first.Serial || !m.ExpiresAt.After(first.ExpiresAt) || m.Snapshot.SHA256 != first.Snapshot.SHA256 {
+		t.Fatalf("not renewed: %+v after %+v", m, first)
+	}
+	if s.State().LastError == nil {
+		t.Error("the failing acquisition is not reported")
+	}
+}
+
+// Restoring an older state whose current envelope was never published,
+// then raising the high-water serial, never publishes that older envelope
+// over the newer published manifest: the published one becomes current.
+func TestSignerRaiseNeverLowersThePublishedSerial(t *testing.T) {
+	b := newBrig(t, fixture(t, "karta-fixture-a.osm.pbf"), nil)
+	ctx := context.Background()
+	if err := b.a.CheckOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s := b.mustSigner()
+	s.RunOnce(ctx) // serial 1
+	spoolNewer(t, b, time.Now().UTC().Add(-2*time.Hour))
+	unblock := blockManifestWrite(t, b)
+	s.RunOnce(ctx) // serial 2 persisted, not published
+	unblock()
+	backup, err := os.ReadFile(filepath.Join(b.state, stateFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s = b.mustSigner() // publishes serial 2
+	n3 := spoolNewer(t, b, time.Now().UTC().Add(-time.Hour))
+	s.RunOnce(ctx) // serial 3
+	if m := b.manifest(); m.Serial != 3 {
+		t.Fatalf("setup: published serial %d", m.Serial)
+	}
+	if err := os.WriteFile(filepath.Join(b.state, stateFileName), backup, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.signer(nil); !errors.Is(err, ErrFailClosed) {
+		t.Fatalf("the older state started: %v", err)
+	}
+	s, err = b.signer(&Raise{To: 3, Reason: "restored from backup"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := b.manifest(); m.Serial != 3 || m.Snapshot.SHA256 != sha(n3) {
+		t.Fatalf("the published manifest went back to serial %d", m.Serial)
+	}
+	if c := s.State().Current; c == nil || c.Serial != 3 || c.SHA256 != sha(n3) || !c.Promoted {
+		t.Fatalf("current %+v, want the published serial 3", c)
+	}
+	// Renewal continues above the published serial, with the published data.
+	b.clock = b.manifest().ExpiresAt.Add(-time.Hour)
+	s.RunOnce(ctx)
+	if m := b.manifest(); m.Serial != 4 || m.Snapshot.SHA256 != sha(n3) {
+		t.Fatalf("after the raise: serial %d %s", m.Serial, m.Snapshot.SHA256)
+	}
+}
+
+// One signer per state directory: a second one (or a raise while the
+// signer runs) is refused instead of overwriting the first one's serials.
+func TestSignerSingleInstance(t *testing.T) {
+	b := newBrig(t, fixture(t, "karta-fixture-a.osm.pbf"), nil)
+	s1 := b.mustSigner()
+	open := func(raise *Raise) (*Signer, error) {
+		return NewSigner(SignConfig{ConfigPath: b.conf, RegionPath: b.region, Spool: b.spool, Publish: b.publish, StateDir: b.state,
+			MaxInputBytes: 64 << 20, MaxFutureSkew: 10 * time.Minute, Poll: time.Second, Version: "test"}, b.log, raise)
+	}
+	if _, err := open(nil); err == nil {
+		t.Fatal("a second signer started")
+	}
+	if _, err := open(&Raise{To: 50, Reason: "Karta verified 49"}); err == nil {
+		t.Fatal("a raise ran while the signer runs")
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := open(&Raise{To: 50, Reason: "Karta verified 49"})
+	if err != nil {
+		t.Fatalf("after the first signer stopped: %v", err)
+	}
+	_ = s2.Close()
+	if _, err := NewAcquirer(AcquireConfig{SourcePath: b.src, Spool: b.spool, MaxInputBytes: 1 << 20, Version: "test"}, b.log); err == nil {
+		t.Error("a second downloader opened the spool")
+	}
+}
+
+func TestServeBounds(t *testing.T) {
+	t.Run("concurrency", func(t *testing.T) {
+		release := make(chan struct{})
+		entered := make(chan struct{}, 2)
+		h := limitConcurrency(1, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			entered <- struct{}{}
+			<-release
+		}))
+		done := make(chan struct{})
+		go func() {
+			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/manifest.json", nil))
+			close(done)
+		}()
+		<-entered
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/manifest.json", nil))
+		if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+			t.Errorf("beyond the limit: %d %v", rec.Code, rec.Header())
+		}
+		close(release)
+		<-done
+	})
+	t.Run("a stalled download is abandoned", func(t *testing.T) {
+		old := writeStall
+		writeStall = 300 * time.Millisecond
+		defer func() { writeStall = old }()
+		dir := t.TempDir()
+		name := strings.Repeat("ab", 32) + ".osm.pbf"
+		if err := os.MkdirAll(filepath.Join(dir, SnapshotsDir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, SnapshotsDir, name), make([]byte, 64<<20), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		finished := make(chan struct{})
+		inner := Handler(dir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			inner.ServeHTTP(w, r)
+			close(finished)
+		}))
+		defer srv.Close()
+		resp, err := http.Get(srv.URL + "/" + SnapshotsDir + "/" + name) // never read
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		select {
+		case <-finished:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the handler is still writing to a client that reads nothing")
+		}
+	})
 }

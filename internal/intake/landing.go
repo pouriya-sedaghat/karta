@@ -26,6 +26,7 @@ const (
 	CodeNotRegular        = "not_regular_file"
 	CodeHardLink          = "hard_link"
 	CodeWrongOwner        = "wrong_owner"
+	CodeUnsafeMode        = "unsafe_mode"
 	CodeTooLarge          = "too_large"
 	CodeEmpty             = "empty_file"
 	CodeInvalidCompletion = "invalid_completion"
@@ -164,6 +165,11 @@ func scanLanding(dir string, ownerUID uint32, maxSnapshot int64) ([]landingEntry
 			e.problem(CodeHardLink, "%s has %d hard links; another path to the same file may be writable outside the landing area", n, st.Nlink)
 		case st.UID != ownerUID:
 			e.problem(CodeWrongOwner, "%s is owned by UID %d, not the landing owner %d", n, st.UID, ownerUID)
+		case fi.Mode().Perm()&0o022 != 0:
+			// Anyone else who can write the file could change it in place,
+			// keeping its owner and inode.
+			e.problem(CodeUnsafeMode, "%s is writable by its group or by others (mode %04o); deliveries must be writable by the landing owner "+
+				"only (umask 022)", n, fi.Mode().Perm())
 		}
 	}
 	out := make([]landingEntry, 0, len(by))

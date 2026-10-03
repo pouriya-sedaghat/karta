@@ -17,6 +17,9 @@ var (
 	// ErrIntakeNotOwned is a close of an authorization the credential did not
 	// create (reported as not found, so ids of others are not revealed).
 	ErrIntakeNotOwned = errors.New("no such intake authorization of this credential")
+	// ErrIntakeBlocked is a digest an operator revoked: only an operator can
+	// authorize it again.
+	ErrIntakeBlocked = errors.New("an operator revoked this digest; only an operator can authorize it again")
 )
 
 // intakeLockKey serialises the open-authorization count of one intake
@@ -71,6 +74,21 @@ func AuthorizeIntake(ctx context.Context, db TxBeginner, r IntakeRequest) (*Auth
 		}
 		return Audit(ctx, tx, AuditEntry{Actor: r.CreatedBy, Source: "operator_api", Action: "intake_authorize", Target: r.SHA256,
 			Outcome: outcome, Reason: r.Reason, RequestID: r.RequestID, Detail: detail})
+	}
+	var blockedBy string
+	switch err := tx.QueryRow(ctx, `SELECT blocked_by FROM registry.intake_blocks WHERE region_id = $1 AND sha256 = $2`,
+		r.RegionID, r.SHA256).Scan(&blockedBy); {
+	case err == nil:
+		why := "revoked by " + blockedBy
+		if err := audit(OutcomeRejected, why, nil); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, err
+		}
+		return nil, false, fmt.Errorf("%w (%s)", ErrIntakeBlocked, why)
+	case !errors.Is(err, pgx.ErrNoRows):
+		return nil, false, err
 	}
 	// Expired rows of this credential are closed; they authorize nothing.
 	if _, err := tx.Exec(ctx, `UPDATE registry.authorizations SET revoked_at = now(), revoked_by = $1, revoke_reason = 'expired'
@@ -259,6 +277,14 @@ FROM registry.intake_policy WHERE region_id = $1`, regionID).Scan(&p.RegionID, &
 	return &p, err
 }
 
+// EnsureIntakePolicy creates the region's intake policy row (watcher
+// activation on) if it is missing, so that an activation's share lock and a
+// pause's update always meet on the same row.
+func EnsureIntakePolicy(ctx context.Context, q Querier, regionID string) error {
+	_, err := q.Exec(ctx, `INSERT INTO registry.intake_policy (region_id) VALUES ($1) ON CONFLICT (region_id) DO NOTHING`, regionID)
+	return err
+}
+
 // IntakeWatcherAutoActivateLocked reads, with a share lock on the policy
 // row, whether watcher-admitted snapshots are activated automatically:
 // inside an activation transaction a pause that commits first is seen, one
@@ -276,7 +302,7 @@ func IntakeWatcherAutoActivateLocked(ctx context.Context, q Querier, regionID st
 // activation of watcher-admitted snapshots and audits the change; a
 // request that changes nothing is audited as a noop.
 func SetIntakeWatcherAutoActivate(ctx context.Context, q Querier, regionID string, on bool, actor, source, reason, requestID string, detail map[string]any) (bool, error) {
-	if _, err := q.Exec(ctx, `INSERT INTO registry.intake_policy (region_id) VALUES ($1) ON CONFLICT (region_id) DO NOTHING`, regionID); err != nil {
+	if err := EnsureIntakePolicy(ctx, q, regionID); err != nil {
 		return false, err
 	}
 	tag, err := q.Exec(ctx, `

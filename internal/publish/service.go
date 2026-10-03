@@ -202,6 +202,11 @@ func (s *Service) Announce(ctx context.Context) error {
 	if err := registry.SetFreshness(ctx, s.reg, f); err != nil {
 		return err
 	}
+	if s.intakeEnabled() {
+		if err := registry.EnsureIntakePolicy(ctx, s.reg, s.regionID()); err != nil {
+			return err
+		}
+	}
 	if s.onlineEnabled() {
 		return registry.EnsureOnlinePolicy(ctx, s.reg, s.regionID())
 	}
@@ -275,14 +280,26 @@ func (s *Service) onlineFeed() feed {
 	return feed{source: SourceOnline, dir: s.cfg.OnlineDir, settler: s.onlineSettler, online: true, scan: &s.onlineScan}
 }
 
-// authorizer looks up authorizations (an operator's or the local
-// intake's) for digests not pinned in the region configuration.
-func (s *Service) authorizer(ctx context.Context, regionID, digest string, size int64) (string, error) {
-	a, err := registry.Authorized(ctx, s.reg, regionID, digest, size)
-	if err != nil || a == nil {
-		return "", err
+// authScope is what may admit a submission of a feed: an operator's
+// authorization for every feed, and for the intake feed also the intake
+// authorization created for exactly that handoff name.
+func authScope(source, name string) registry.AuthScope {
+	if source == SourceIntake {
+		return registry.AuthScope{IntakeName: name}
 	}
-	return a.Describe(), nil
+	return registry.AuthScope{}
+}
+
+// authorizer looks up authorizations in scope for digests not pinned in
+// the region configuration.
+func (s *Service) authorizer(scope registry.AuthScope) importer.Authorizer {
+	return func(ctx context.Context, regionID, digest string, size int64) (string, error) {
+		a, err := registry.Authorized(ctx, s.reg, regionID, digest, size, scope)
+		if err != nil || a == nil {
+			return "", err
+		}
+		return a.Describe(), nil
+	}
 }
 
 // publish runs verify, policy, capacity, build and switch for a staged
@@ -298,7 +315,8 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		return fail(registry.SubRejected, importer.CodeRegionConfig, fmt.Errorf("%w: region: %v", importer.ErrInput, err))
 	}
 	s.phase("verifying", "")
-	authorize := importer.Authorizer(s.authorizer)
+	scope := authScope(req.source, req.name)
+	authorize := s.authorizer(scope)
 	var signed *online.Verified
 	if req.source == SourceOnline {
 		sv, auth, err := s.verifyDelivery(ctx, req, cfg)
@@ -322,7 +340,7 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 			if code == importer.CodeUnauthorizedDigest {
 				// Say why: an authorization that expired while queued, or
 				// was revoked, is reported as such.
-				if c, msg, uerr := s.unauthorized(ctx, s.reg, cfg.ID, req.staged.SHA256, req.staged.Size); uerr == nil && c != code {
+				if c, msg, uerr := s.unauthorized(ctx, s.reg, cfg.ID, req.staged.SHA256, req.staged.Size, scope); uerr == nil && c != code {
 					return fail(registry.SubRejected, c, &importer.InputError{Code: c, Msg: msg})
 				}
 			}
@@ -444,7 +462,7 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 	if signed != nil {
 		gate = s.onlineGate(signed)
 	} else {
-		gate = s.manualGate(v.Info.SHA256, v.Info.Size)
+		gate = s.manualGate(v.Info.SHA256, v.Info.Size, scope)
 	}
 	// The switch runs on its own short bound, not the job deadline: a
 	// release built and validated in time is switched to (see switchContext).
@@ -881,7 +899,7 @@ func (s *Service) retryable(ctx context.Context) func(*registry.Submission) bool
 			default:
 				return false
 			}
-			a, err := registry.Authorized(ctx, s.reg, prior.RegionID, *prior.SHA256, *prior.SizeBytes)
+			a, err := registry.Authorized(ctx, s.reg, prior.RegionID, *prior.SHA256, *prior.SizeBytes, authScope(prior.Source, prior.Name))
 			return err == nil && a != nil
 		}
 		return false

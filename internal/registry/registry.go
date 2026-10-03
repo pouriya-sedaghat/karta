@@ -268,6 +268,17 @@ CREATE TABLE registry.intake_policy (
     changed_by text,
     change_reason text
 );
+
+-- An operator's revoke is the stop button for a digest: the intake may not
+-- authorize it again until an operator authorizes it.
+CREATE TABLE registry.intake_blocks (
+    region_id text NOT NULL,
+    sha256 text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    blocked_at timestamptz NOT NULL DEFAULT now(),
+    blocked_by text NOT NULL,
+    reason text NOT NULL,
+    PRIMARY KEY (region_id, sha256)
+);
 `,
 }
 
@@ -986,6 +997,10 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+authColumns, a.RegionID, a.SHA256, a
 	if err != nil {
 		return nil, false, err
 	}
+	// An operator's authorization lifts an earlier revoke's intake block.
+	if _, err := tx.Exec(ctx, `DELETE FROM registry.intake_blocks WHERE region_id = $1 AND sha256 = $2`, a.RegionID, a.SHA256); err != nil {
+		return nil, false, err
+	}
 	detail := map[string]any{"region_id": a.RegionID, "authorization_id": created.ID}
 	if a.SizeBytes != nil {
 		detail["size_bytes"] = *a.SizeBytes
@@ -1006,7 +1021,8 @@ func sameSize(a, b *int64) bool {
 
 // Revoke closes every open authorization for (region, digest): the
 // operator's and those of local intake credentials. It is the operator's
-// stop button for a digest.
+// stop button for a digest: the intake cannot authorize it again until an
+// operator authorizes it (registry.intake_blocks).
 func Revoke(ctx context.Context, db TxBeginner, region, digest, actor, reason, requestID string) (bool, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -1034,6 +1050,11 @@ WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL RETURNING id, channe
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
+	if _, err := tx.Exec(ctx, `INSERT INTO registry.intake_blocks (region_id, sha256, blocked_by, reason) VALUES ($1, $2, $3, $4)
+ON CONFLICT (region_id, sha256) DO UPDATE SET blocked_at = now(), blocked_by = EXCLUDED.blocked_by, reason = EXCLUDED.reason`,
+		region, digest, truncate(actor, 64), truncate(reason, 2000)); err != nil {
+		return false, err
+	}
 	outcome := OutcomeSucceeded
 	if len(ids) == 0 {
 		outcome = OutcomeNoop
@@ -1052,14 +1073,39 @@ WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL RETURNING id, channe
 // the watcher's activation pause.
 const authPrecedence = `CASE channel WHEN 'operator' THEN 0 WHEN 'intake_submit' THEN 1 ELSE 2 END, id DESC`
 
-// Authorized returns an open, unexpired authorization that covers the
-// digest (and size, when the authorization records one), preferring an
+// AuthScope selects the authorizations that may admit a submission. An
+// operator's authorization admits its digest through every feed; an intake
+// authorization admits only the intake handoff it was created for, never the
+// same bytes dropped into the inbox, given to `karta import` or delivered
+// online.
+type AuthScope struct {
+	// IntakeName is the handoff name of a submission from the intake feed,
+	// "" for every other feed (operator authorizations only).
+	IntakeName string
+	// Lock takes a share lock on the row found, inside an activation
+	// transaction: a revoke that commits first is seen, one that waits
+	// commits after the switch.
+	Lock bool
+}
+
+// scopeClause restricts a query to the rows of an AuthScope whose
+// IntakeName is parameter n.
+func scopeClause(n int) string {
+	return fmt.Sprintf(`(channel = 'operator' OR ($%d <> '' AND channel <> 'operator' AND intake_name = $%d))`, n, n)
+}
+
+// Authorized returns an open, unexpired authorization in scope that covers
+// the digest (and size, when the authorization records one), preferring an
 // operator's, or nil. A registry without the table (version < 2)
 // authorizes nothing.
-func Authorized(ctx context.Context, q Querier, region, digest string, size int64) (*Authorization, error) {
+func Authorized(ctx context.Context, q Querier, region, digest string, size int64, scope AuthScope) (*Authorization, error) {
+	lock := ""
+	if scope.Lock {
+		lock = " FOR SHARE"
+	}
 	a, err := scanAuth(q.QueryRow(ctx, `SELECT `+authColumns+` FROM registry.authorizations
 WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())
-  AND (size_bytes IS NULL OR size_bytes = $3) ORDER BY `+authPrecedence+` LIMIT 1`, region, digest, size))
+  AND (size_bytes IS NULL OR size_bytes = $3) AND `+scopeClause(4)+` ORDER BY `+authPrecedence+` LIMIT 1`+lock, region, digest, size, scope.IntakeName))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -1070,12 +1116,12 @@ WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL AND (expires_at IS N
 	return a, err
 }
 
-// LatestAuthorization returns the newest authorization ever recorded for
-// (region, digest), open or not, or nil: it explains why a digest is not
-// authorized (revoked, expired) when Authorized finds nothing.
-func LatestAuthorization(ctx context.Context, q Querier, region, digest string) (*Authorization, error) {
+// LatestAuthorization returns the newest authorization in scope ever
+// recorded for (region, digest), open or not, or nil: it explains why a
+// digest is not authorized (revoked, expired) when Authorized finds nothing.
+func LatestAuthorization(ctx context.Context, q Querier, region, digest string, scope AuthScope) (*Authorization, error) {
 	a, err := scanAuth(q.QueryRow(ctx, `SELECT `+authColumns+` FROM registry.authorizations
-WHERE region_id = $1 AND sha256 = $2 ORDER BY id DESC LIMIT 1`, region, digest))
+WHERE region_id = $1 AND sha256 = $2 AND `+scopeClause(3)+` ORDER BY id DESC LIMIT 1`, region, digest, scope.IntakeName))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}

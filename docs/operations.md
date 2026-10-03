@@ -285,7 +285,8 @@ publication time, and the budget derived from it) is open.
   (`KARTA_BRIDGE_METRICS_LISTEN_ADDR=:9465`, scope `status`): the acquire and
   sign reports (`karta_bridge_*`: state ages, last check and success, next
   attempt, consecutive failures and the last error code, the verified
-  download, the high-water and published serial, manifest expiry and data
+  download, the high-water and published serial (`karta_bridge_manifest_pending`
+  while a signed manifest's publication has not succeeded), manifest expiry and data
   timestamp, a held download, the signer's last error). Karta's own view of
   the bridge stays the fetcher's report and the data age: Karta never
   connects to the bridge for monitoring.

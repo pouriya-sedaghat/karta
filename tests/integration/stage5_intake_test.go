@@ -433,6 +433,32 @@ func TestIntake(t *testing.T) {
 		}
 	})
 
+	t.Run("an intake authorization admits only its own handoff; an operator revoke blocks the intake", func(t *testing.T) {
+		z := variant(t, at("2026-02-03T00:00:00Z"), nil, nil)
+		expectStatus(t, intakeAuthorize(t, alice, z, map[string]any{"name": "z-handoff"}), http.StatusCreated)
+		// The same bytes in the untrusted inbox are not admitted by it.
+		submit(t, "z-inbox", z, nil, "")
+		if sub := waitSubmission(t, "z-inbox", 60*time.Second); sub.State != "rejected" || sub.code() != "unauthorized_digest" {
+			t.Errorf("an intake authorization admitted an inbox delivery: %+v", sub)
+		}
+		for _, n := range []string{"z-inbox.osm.pbf", "z-inbox.osm.pbf.ready"} {
+			_ = os.Remove(filepath.Join(inboxDir, n))
+		}
+		// The operator's revoke is the stop button: the intake cannot
+		// authorize the digest again until an operator authorizes it.
+		expectStatus(t, op(t, http.MethodPost, "/v1/operator/authorizations/"+digestOf(z)+"/revoke", admin, map[string]any{"reason": "blocked"}), http.StatusOK)
+		for _, tok := range []string{alice, bob, watchTok} {
+			r := intakeAuthorize(t, tok, z, map[string]any{"name": "z-again"})
+			if r.status != http.StatusConflict || r.reasonCode(t) != "digest_revoked" {
+				t.Errorf("re-authorized after an operator revoke: %d %s", r.status, r.body)
+			}
+		}
+		authorize(t, z, "reviewed: released again")
+		r := intakeAuthorize(t, alice, z, map[string]any{"name": "z-again"})
+		expectStatus(t, r, http.StatusCreated)
+		expectStatus(t, op(t, http.MethodPost, "/v1/operator/authorizations/"+digestOf(z)+"/revoke", admin, map[string]any{"reason": "cleanup"}), http.StatusOK)
+	})
+
 	dataC := variant(t, at("2026-03-01T00:00:00Z"), nil, nil)
 	t.Run("the command needs an independent expectation and refuses a mismatch before authorizing", func(t *testing.T) {
 		f := commandFile(t, "c", dataC)

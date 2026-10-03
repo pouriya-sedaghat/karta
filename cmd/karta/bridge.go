@@ -69,6 +69,7 @@ func bridgeAcquire(ctx context.Context, c config.Bridge, log *slog.Logger) int {
 		log.Error("prepare the spool", "err", err)
 		return exitFailure
 	}
+	defer a.Close()
 	log.Info("bridge acquire ready", "snapshot_url", src.SnapshotURL, "md5_url", src.MD5URL, "poll_interval", src.PollInterval.D().String(),
 		"reverify_interval", src.ReverifyInterval.D().String(), "spool", c.SpoolDir)
 	a.Run(ctx)
@@ -95,6 +96,7 @@ func bridgeSign(ctx context.Context, c config.Bridge, log *slog.Logger, args []s
 		}
 		return exitFailure
 	}
+	defer s.Close()
 	if raise != nil {
 		log.Info("high-water serial raised; start the signer normally", "high_water", s.State().HighWater)
 		return exitOK

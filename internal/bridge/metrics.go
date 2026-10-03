@@ -47,6 +47,10 @@ func Metrics(spool, publish string, now time.Time) []byte {
 		m.Gauge("karta_bridge_sign_state_age_seconds", "Seconds since sign last wrote its state.", nil, now.Sub(s.UpdatedAt).Seconds())
 		m.Gauge("karta_bridge_sign_high_water_serial", "Highest manifest serial allocated.", nil, float64(s.HighWater))
 		if c := s.Current; c != nil {
+			m.Gauge("karta_bridge_manifest_pending", "1 if the current manifest is signed but its publication has not succeeded yet.", nil,
+				promtext.Bool(!c.Promoted))
+		}
+		if c := s.Current; c != nil && c.Promoted {
 			m.Gauge("karta_bridge_manifest_serial", "Serial of the published manifest.", nil, float64(c.Serial))
 			m.Opt("karta_bridge_manifest_expires_timestamp_seconds", "When the published manifest expires.", nil, ts(&c.ExpiresAt))
 			m.Opt("karta_bridge_manifest_data_timestamp_seconds", "Data timestamp the published manifest signs.", nil, ts(&c.DataTimestamp))

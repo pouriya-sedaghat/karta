@@ -574,6 +574,26 @@ What the implementation settled within the decisions above, for review:
   the high-water serial raised, the signer may sign a snapshot again that
   the restored state never recorded (same bytes, a new serial). No serial
   is reused or lowered (tested end to end).
+* **Review fixes (before the PR).** An independent adversarial review of the
+  code found, and this PR fixes, with regression tests:
+  an intake authorization admitted the same digest through every feed (now
+  `registry.AuthScope`: an intake row admits only the intake submission with
+  its handoff name, every other feed and the online
+  `require_operator_authorization` check accept operator rows only); the
+  switch re-check read the authorization without a row lock (now `FOR
+  SHARE`, and the intake policy row is created at start so a pause and an
+  activation always meet on it); an operator revoke could be undone by a
+  new intake authorization of the digest (now `registry.intake_blocks`,
+  cleared only by an operator's authorize; `digest_revoked`); landing files
+  writable by their group or others were accepted (`unsafe_mode`); a final
+  API refusal was retried at every scan; visible handoffs of a removed
+  credential stayed forever (now swept after twice the validity cap); the
+  signer stopped renewing when one acquisition failed, never retried a
+  failed publication while running, and could publish a restored older
+  pending envelope over a newer manifest after a raise (now it reconciles
+  with the published manifest and adopts it when it is newer), and two
+  signers could share a state directory (now a lock, also for acquire);
+  `bridge-serve` had no write deadline or concurrency bound.
 * **Evidence.** Tier A only: unit tests with race detection for every new
   package, script tests, promtool rule tests with negative controls, and
   `TestIntake` and `TestBridge` against the Compose stack (fixtures, the
