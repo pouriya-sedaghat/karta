@@ -281,8 +281,13 @@ func pgdataHasCluster(t *testing.T) bool {
 // restore-check and serve the release the base backup ended with.
 func testSwitchAroundBackup(t *testing.T) {
 	ctx := context.Background()
+	// A restore with --replace stops the database: connect again after one.
 	pg := superuser(t, "postgres")
-	defer pg.Close(ctx)
+	defer func() { pg.Close(ctx) }()
+	reconnect := func() {
+		pg.Close(ctx)
+		pg = superuser(t, "postgres")
+	}
 	var size int64
 	if err := pg.QueryRow(ctx, `SELECT sum(pg_database_size(oid))::bigint FROM pg_database`).Scan(&size); err != nil {
 		t.Fatal(err)
@@ -364,6 +369,7 @@ func testSwitchAroundBackup(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("restore across a switch: %s", out)
 		}
+		reconnect()
 		waitReady(t, true, "ready")
 		waitPublisher(t)
 		waitManifest(t, want)
@@ -962,7 +968,7 @@ func TestOperations(t *testing.T) {
 			// Refused before anything changes: a restore over a database
 			// without --replace, a damaged file, and a damaged base backup
 			// whose SHA256SUMS was rewritten to match.
-			if out, code := script(t, "restore.sh", pre); code == 0 || !strings.Contains(out, "holds a database; nothing was changed") {
+			if out, code := script(t, "restore.sh", pre); code == 0 || !strings.Contains(out, "holds a database") || !strings.Contains(out, "nothing was changed") {
 				t.Errorf("restore over a database without --replace: %d %s", code, out)
 			}
 			damaged := filepath.Join(t.TempDir(), "damaged")
