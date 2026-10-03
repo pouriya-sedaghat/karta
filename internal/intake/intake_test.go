@@ -264,7 +264,7 @@ func newRig(t *testing.T) *rig {
 		t.Fatal(err)
 	}
 	w, err := NewWatcher(WatcherConfig{Landing: "/srv/landing", Root: root, OwnerUID: uint32(os.Getuid()), Settle: 0, Poll: time.Second, // #nosec G115 -- test uid
-		Statfs: func(string) (int64, error) { return r.fs, nil },
+		Statfs:  func(string) (int64, error) { return r.fs, nil },
 		Handoff: HandoffConfig{Dir: r.handoff, RegionPath: repoFile(t, "config/regions/fixture.json"), Client: c, MaxInputBytes: 1 << 30}},
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
