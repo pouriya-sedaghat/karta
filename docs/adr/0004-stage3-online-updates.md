@@ -381,4 +381,4 @@ Nothing about the source (URL, errors, check times) is in the public API.
   `max_manifest_validity` and the poll interval to it, and run the stack with
   that source in the target environment. Stage 3 is verified only against the
   local controlled source in CI and in the implementation environment, not
-  on the owner's VM.
+  on a target host.
