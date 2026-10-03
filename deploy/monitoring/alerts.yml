@@ -34,9 +34,11 @@ groups:
           summary: The Karta publisher does not answer its metrics scrape; publication and its alerts are blind
           runbook: docs/operations.md#kartapublisherdown
       # A target missing from the scrape configuration silences every alert
-      # derived from it.
+      # derived from it: the API's, the publisher's, and the database's
+      # (KartaPostgresExporterDown and KartaPostgresDown need up and pg_up
+      # series from the karta-postgres job).
       - alert: KartaScrapeTargetMissing
-        expr: absent(up{job="karta-api"}) or absent(up{job="karta-publisher"})
+        expr: absent(up{job="karta-api"}) or absent(up{job="karta-publisher"}) or absent(up{job="karta-postgres"})
         for: 10m
         labels: {severity: critical}
         annotations:

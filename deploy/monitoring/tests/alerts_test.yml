@@ -188,6 +188,8 @@ tests:
         values: '1x20'
       - series: 'up{job="karta-publisher",instance="p"}'
         values: '0x20'
+      - series: 'up{job="karta-postgres",instance="e"}'
+        values: '1x20'
     alert_rule_test:
       - eval_time: 3m
         alertname: KartaPublisherDown
@@ -208,6 +210,8 @@ tests:
     input_series:
       - series: 'up{job="karta-api",instance="a"}'
         values: '1x20'
+      - series: 'up{job="karta-postgres",instance="e"}'
+        values: '1x20'
     alert_rule_test:
       - eval_time: 15m
         alertname: KartaScrapeTargetMissing
@@ -216,6 +220,34 @@ tests:
             exp_annotations:
               summary: "Scrape target karta-publisher is missing: its alerts cannot fire"
               runbook: docs/operations.md#kartascrapetargetmissing
+
+  # Without the karta-postgres job there is no up or pg_up series for the
+  # database: KartaPostgresExporterDown and KartaPostgresDown cannot fire,
+  # so the missing job itself must.
+  - name: a missing PostgreSQL scrape job is reported although the database alerts are silent
+    interval: 1m
+    input_series:
+      - series: 'up{job="karta-api",instance="a"}'
+        values: '1x20'
+      - series: 'up{job="karta-publisher",instance="p"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KartaScrapeTargetMissing
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: KartaScrapeTargetMissing
+        exp_alerts:
+          - exp_labels: {severity: critical, job: karta-postgres}
+            exp_annotations:
+              summary: "Scrape target karta-postgres is missing: its alerts cannot fire"
+              runbook: docs/operations.md#kartascrapetargetmissing
+      - eval_time: 15m
+        alertname: KartaPostgresExporterDown
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: KartaPostgresDown
+        exp_alerts: []
 
   - name: an unready API reports its reason; a dead one is down
     interval: 1m

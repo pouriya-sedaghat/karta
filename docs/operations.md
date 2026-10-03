@@ -315,9 +315,12 @@ than the build: a failed upgrade, see "Images and upgrades").
 
 #### KartaScrapeTargetMissing
 
-A Karta job is missing from the scrape configuration, so its alerts cannot
-fire. Restore the `karta-api` and `karta-publisher` jobs in the Prometheus
-configuration.
+A Karta job is missing from the scrape configuration (or service discovery
+stopped producing its target), so its alerts cannot fire. The `job` label
+names it: `karta-api`, `karta-publisher`, or `karta-postgres`. Without
+`karta-postgres`, KartaPostgresExporterDown and KartaPostgresDown are
+silent. Restore the job in the Prometheus configuration (`make
+up-monitoring` for the bundled profile, which includes all three).
 
 #### KartaNoActiveRelease
 
