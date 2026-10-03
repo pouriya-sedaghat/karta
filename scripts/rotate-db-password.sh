@@ -16,6 +16,12 @@
 # running containers. The password reaches psql on standard input (never a
 # command line), and statement logging is off for that session.
 # Run it on the database host; COMPOSE overrides `docker compose`.
+#
+# Exit status: 0 done; 3 the role does not exist (nothing was changed;
+# only this case, so that a caller can tell an absent optional role from a
+# failure); 2 usage, or a missing or unusable secret file; 1 anything else
+# (the database cannot be queried, ALTER ROLE failed, or the login with the
+# new password failed).
 set -eu
 cd "$(dirname "$0")/.."
 COMPOSE=${COMPOSE:-docker compose}
@@ -31,16 +37,20 @@ case "${1:-}" in
   superuser) role=postgres;       file=secrets/db_superuser_password; db=postgres ;;
   *) echo "usage: $0 [--current] api|importer|monitor|superuser" >&2; exit 2 ;;
 esac
-[ -s "$file" ] || { echo "$file is missing" >&2; exit 2; }
 
 # Local socket as the database superuser (trusted inside the db container).
+# psql's own exit status 3 (an error with ON_ERROR_STOP) must not leak out
+# as "the role does not exist": every psql failure below exits 1.
 psql_su() { $COMPOSE exec -T db psql -v ON_ERROR_STOP=1 --no-psqlrc -q -U postgres -d postgres "$@"; }
 
-exists=$(printf "SELECT count(*) FROM pg_roles WHERE rolname = '%s';\n" "$role" | psql_su -tA)
-if [ "$exists" != 1 ]; then
-  echo "role $role does not exist here (the monitor role is created by make monitoring-role)" >&2
-  exit 3
-fi
+exists=$(printf "SELECT count(*) FROM pg_roles WHERE rolname = '%s';\n" "$role" | psql_su -tA) ||
+  { echo "$role: cannot query the database's roles" >&2; exit 1; }
+case "$exists" in
+  1) ;;
+  0) echo "role $role does not exist here (the monitor role is created by make monitoring-role)" >&2; exit 3 ;;
+  *) echo "$role: unexpected answer to the role query: $exists" >&2; exit 1 ;;
+esac
+[ -s "$file" ] || { echo "$file is missing" >&2; exit 2; }
 if [ "$mode" = rotate ]; then
   umask 077
   pw=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
@@ -53,12 +63,14 @@ case "$pw" in
 esac
 [ ${#pw} -ge 16 ] || { echo "$file holds a password shorter than 16 characters" >&2; exit 2; }
 
-printf "SET log_statement = 'none';\nSET log_min_duration_statement = -1;\nALTER ROLE %s PASSWORD '%s';\n" "$role" "$pw" | psql_su
+printf "SET log_statement = 'none';\nSET log_min_duration_statement = -1;\nALTER ROLE %s PASSWORD '%s';\n" "$role" "$pw" | psql_su ||
+  { echo "$role: setting the password failed" >&2; exit 1; }
 if [ "$mode" = rotate ]; then
   printf '%s' "$pw" > "$file"
 fi
 # Prove it: log in over TCP with the new password.
-printf '%s' "$pw" | $COMPOSE exec -T db sh -c 'PGPASSWORD=$(cat) psql -h 127.0.0.1 -U "$1" -d "$2" -tAc "SELECT 1" > /dev/null' sh "$role" "$db"
+printf '%s' "$pw" | $COMPOSE exec -T db sh -c 'PGPASSWORD=$(cat) psql -h 127.0.0.1 -U "$1" -d "$2" -tAc "SELECT 1" > /dev/null' sh "$role" "$db" ||
+  { echo "$role: the password was set, but logging in with it over TCP failed" >&2; exit 1; }
 if [ "$mode" = rotate ]; then
   echo "$role: password rotated, written to $file and verified"
 else

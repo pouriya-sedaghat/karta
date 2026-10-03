@@ -77,7 +77,8 @@ esac
 // fakeCompose stands in for `docker compose`. $FAKE_STATE/fetcher_running
 // and publisher_running mark running services (down stops both; with
 // $FAKE_STATE/write_on_down, the fetcher writes its outbox as it stops);
-// registry-summary prints $FAKE_STATE/summary.json.
+// registry-summary prints $FAKE_STATE/summary.json; the restore's query for
+// the monitor role answers $FAKE_STATE/monitor_role (default 1: present).
 const fakeCompose = `#!/bin/sh
 st=$FAKE_STATE
 log() { echo "$*" >> "$st/calls"; }
@@ -97,10 +98,24 @@ case "$*" in
   "up -d api publisher") log "compose up -d api publisher"; touch "$st/publisher_running" ;;
   *registry-summary*) cat "$st/summary.json" ;;
   *restore-check*) log "restore-check $*"; echo '{"passed": true}' ;;
+  *pg_roles*karta_monitor*) log "monitor role query"; cat "$st/monitor_role" 2>/dev/null || echo 1 ;;
   "exec -T db postgres --version") echo "postgres (PostgreSQL) 18.6" ;;
   *healthcheck*) ;;
   *) log "compose $*" ;;
 esac
+`
+
+// fakeRotate stands in for rotate-db-password.sh --current ROLE, with the
+// real script's exit statuses: $FAKE_STATE/rotate_ROLE is absent (3: the
+// role does not exist), nosecret (2) or fail (1); otherwise it succeeds.
+const fakeRotate = `#!/bin/sh
+echo "rotate $2" >> "$FAKE_STATE/calls"
+case "$(cat "$FAKE_STATE/rotate_$2" 2>/dev/null)" in
+  absent) echo "role karta_$2 does not exist here" >&2; exit 3 ;;
+  nosecret) echo "secrets/db_$2_password is missing" >&2; exit 2 ;;
+  fail) echo "karta_$2: the password was set, but logging in with it over TCP failed" >&2; exit 1 ;;
+esac
+echo "$2: password set"
 `
 
 type env struct {
@@ -130,7 +145,7 @@ func setup(t *testing.T) *env {
 		must(t, err)
 		must(t, os.WriteFile(filepath.Join(e.root, "scripts", s), b, 0o755))
 	}
-	write(t, filepath.Join(e.root, "scripts", "rotate-db-password.sh"), "#!/bin/sh\necho \"$2: password set\"\n", 0o755)
+	write(t, filepath.Join(e.root, "scripts", "rotate-db-password.sh"), fakeRotate, 0o755)
 	write(t, filepath.Join(e.root, "config", "regions", "x.json"), "{}\n", 0o644)
 	for _, s := range []string{"db_superuser_password", "db_importer_password", "db_api_password", "operator_tokens"} {
 		write(t, filepath.Join(e.root, "secrets", s), "secret-"+s+"\n", 0o600)
@@ -526,6 +541,119 @@ func TestRestoreReplace(t *testing.T) {
 			t.Errorf("calls: %v", calls)
 		}
 	})
+}
+
+// Only a monitor role that the restored cluster does not have may be
+// skipped (exit 3 from rotate-db-password.sh, confirmed by the restore's own
+// query). Any other failure setting a role's password stops the restore
+// before restore-check, finalization or serving.
+func TestRestoreRolePasswords(t *testing.T) {
+	for _, c := range []struct {
+		name, role, rotate, monitorRole string
+		ok                              bool
+		want                            string
+	}{
+		{"a backup without a monitor role is restored", "monitor", "absent", "0", true, "no monitor role in this backup"},
+		{"a present monitor role whose login fails stops the restore", "monitor", "fail", "", false, "setting the monitor role's password failed (exit 1)"},
+		{"a present monitor role without its secret stops the restore", "monitor", "nosecret", "", false, "setting the monitor role's password failed (exit 2)"},
+		{"exit 3 contradicted by the database stops the restore", "monitor", "absent", "1", false, "setting the monitor role's password failed (exit 3)"},
+		{"an absent api role stops the restore", "api", "absent", "0", false, "setting the api role's password failed (exit 3)"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := setup(t)
+			b := e.backup(true)
+			e.set("publisher_running", true)
+			write(t, filepath.Join(e.state, "rotate_"+c.role), c.rotate+"\n", 0o644)
+			if c.monitorRole != "" {
+				write(t, filepath.Join(e.state, "monitor_role"), c.monitorRole+"\n", 0o644)
+			}
+			out, code := e.run("restore.sh", nil, b)
+			calls := e.calls()
+			if (code == 0) != c.ok || !strings.Contains(out, c.want) {
+				t.Fatalf("exit %d, want ok=%v and %q: %s", code, c.ok, c.want, out)
+			}
+			if count(calls, "extract database") != 1 || count(calls, "rotate "+c.role) != 1 {
+				t.Errorf("calls: %v", calls)
+			}
+			checked, served := count(calls, "restore-check") == 1, count(calls, "compose up -d api publisher") == 1
+			if c.ok {
+				if !checked || !served || !e.has("publisher_running") {
+					t.Errorf("the restore was not verified and served: %v", calls)
+				}
+				return
+			}
+			if checked || served || e.has("publisher_running") {
+				t.Errorf("the restore went on after the %s role failed: %v", c.role, calls)
+			}
+			for _, after := range calls[index(calls, "rotate "+c.role)+1:] {
+				if after != "monitor role query" {
+					t.Errorf("%q ran after the %s role failed: %v", after, c.role, calls)
+				}
+			}
+			if !strings.Contains(out, "run the restore again with --replace") {
+				t.Errorf("no way forward given: %s", out)
+			}
+		})
+	}
+}
+
+// rotate-db-password.sh exits 3 only when the role does not exist. psql
+// exits 3 too, for an error under ON_ERROR_STOP: the stand-in database below
+// fails that way, and the script must report those failures as 1.
+func TestRotateExitStatus(t *testing.T) {
+	const fakeDB = `#!/bin/sh
+st=$FAKE_STATE
+is() { [ "$(cat "$st/$1" 2>/dev/null)" = fail ]; }
+case "$*" in
+  "exec -T db psql "*)
+    sql=$(cat)
+    case "$sql" in
+      *pg_roles*) ! is query || { echo "ERROR: canceling statement" >&2; exit 3; }; cat "$st/role_exists" ;;
+      *"ALTER ROLE"*) echo alter >> "$st/calls"; ! is alter || { echo "ERROR: permission denied" >&2; exit 3; } ;;
+      *) exit 99 ;;
+    esac ;;
+  "exec -T db sh -c "*) cat > /dev/null; echo login >> "$st/calls"; ! is login || exit 2 ;;
+  *) echo "unexpected: $*" >&2; exit 99 ;;
+esac
+`
+	for _, c := range []struct {
+		name, roleExists, fail string
+		secret                 bool
+		code                   int
+		altered                bool
+	}{
+		{"set and verified", "1", "", true, 0, true},
+		{"the role does not exist", "0", "", true, 3, false},
+		{"the role does not exist and there is no secret", "0", "", false, 3, false},
+		{"a present role without its secret", "1", "", false, 2, false},
+		{"the role query fails", "1", "query", true, 1, false},
+		{"the role query answers nothing", "", "", true, 1, false},
+		{"ALTER ROLE fails with psql's status 3", "1", "alter", true, 1, true},
+		{"the login with the new password fails", "1", "login", true, 1, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := setup(t)
+			b, err := os.ReadFile(filepath.Join("..", "..", "scripts", "rotate-db-password.sh"))
+			must(t, err)
+			write(t, filepath.Join(e.root, "scripts", "rotate-db-password.sh"), string(b), 0o755)
+			write(t, filepath.Join(e.bin, "compose-db"), fakeDB, 0o755)
+			if c.secret {
+				write(t, filepath.Join(e.root, "secrets", "db_monitor_password"), strings.Repeat("ab", 32)+"\n", 0o600)
+			}
+			write(t, filepath.Join(e.state, "role_exists"), c.roleExists+"\n", 0o644)
+			if c.fail != "" {
+				write(t, filepath.Join(e.state, c.fail), "fail\n", 0o644)
+			}
+			out, code := e.run("rotate-db-password.sh", []string{"COMPOSE=" + filepath.Join(e.bin, "compose-db")}, "--current", "monitor")
+			calls := e.calls()
+			if code != c.code {
+				t.Fatalf("exit %d, want %d: %s", code, c.code, out)
+			}
+			if altered := count(calls, "alter") == 1; altered != c.altered {
+				t.Errorf("ALTER ROLE run: %v, want %v (%v)", altered, c.altered, calls)
+			}
+		})
+	}
 }
 
 func index(calls []string, prefix string) int {

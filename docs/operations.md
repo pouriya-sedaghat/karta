@@ -570,7 +570,14 @@ failure:
    PostgreSQL replays to the backup's consistent end when it starts;
 6. set every role's password to the current `./secrets`
    (`rotate-db-password.sh --current`), because a physical backup carries
-   the old cluster's roles;
+   the old cluster's roles. Any failure stops the restore before it is
+   verified, finalized or served: a missing or invalid secret, a failed
+   `ALTER ROLE` or a failed login with the password. The one exception is
+   the optional monitor role when the restored cluster does not have it
+   (the script's exit 3, confirmed by the restore's own role query). Then
+   the restore goes on and says so (`make monitoring-role` creates the
+   role). After a failure, fix the cause and run the restore again with
+   `--replace`;
 7. restore the fetcher's outbox from the backup. If the backup has none,
    `--replace` empties the outbox instead, so that no fetcher state or
    delivery from another registry survives;
@@ -662,15 +669,18 @@ make rotate-db-password ROLE=api        # or importer, monitor, superuser
 A new random password is set with `ALTER ROLE` (passed on standard input,
 with statement logging off for that session), then written **in place**
 into `secrets/db_<role>_password` (the bind mount keeps seeing the same
-file), then verified with a TCP login. Every service reads its password
-file for each new connection, so **no restart** is needed: open connections
-keep working and new ones use the new password. Tested in tier A under load
-(2,995 requests, 0 errors, no container restarted), with the old password
-refused afterwards. Tier B, on the Chitgar deployment: `api`, `importer`
-and `monitor` rotated under load (12,825 requests, 0 errors). Then the
-roles' sessions were ended to force new connections, which used the new
-passwords; the old ones were refused and nothing restarted. This replaces "delete `./secrets` and `make reset`",
-which deleted all data.
+file), then verified with a TCP login. The script exits 3 only when the
+role does not exist, 2 for a missing or unusable secret file, and 1 for any
+other failure; a restore relies on this distinction. Every service reads
+its password file for each new connection, so **no restart** is needed:
+open connections keep working and new ones use the new password. Tested in
+tier A under load (2,995 requests, 0 errors, no container restarted), with
+the old password refused afterwards. Tier B, on the Chitgar deployment:
+`api`, `importer` and `monitor` rotated under load (12,825 requests, 0
+errors). Then the roles' sessions were ended to force new connections,
+which used the new passwords; the old ones were refused and nothing
+restarted. This replaces "delete `./secrets` and `make reset`", which
+deleted all data.
 
 ### Operator and monitoring tokens
 

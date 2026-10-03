@@ -19,7 +19,9 @@
 #   5. database: a new pgdata volume, the base backup and its WAL; PostgreSQL
 #      replays to the backup's consistent end when it starts
 #   6. set the role passwords to ./secrets (scripts/rotate-db-password.sh
-#      --current): a physical backup carries the backed-up cluster's roles
+#      --current): a physical backup carries the backed-up cluster's roles;
+#      any failure stops the restore, except a monitor role the backup does
+#      not have
 #   7. the fetcher's outbox (state and deliveries) from the backup; with
 #      --replace and a backup without one, the outbox is emptied so that no
 #      stale fetcher state or delivery survives
@@ -140,11 +142,23 @@ docker run --rm -v "$pgdata:/var/lib/postgresql" -v "$backup/db:/backup:ro" --en
   chmod 700 "$PGDATA"' || fail "extracting the base backup failed"
 $COMPOSE up -d --wait db > /dev/null || fail "PostgreSQL did not start on the restored data"
 
-# 6. The role passwords from ./secrets.
+# 6. The role passwords from ./secrets. Only the monitor role is optional
+# (make monitoring-role creates it), and only its absence is accepted: exit
+# 3 from rotate-db-password.sh, confirmed here. Any other failure (a secret
+# missing or invalid, ALTER ROLE or the login failing) stops the restore
+# before it is verified, finalized or served.
 for r in superuser importer api monitor; do
-  out=$(./scripts/rotate-db-password.sh --current $r 2>&1) && echo "restore: $out" || {
-    [ $r = monitor ] && echo "restore: no monitor role in this backup (make monitoring-role creates it)" || fail "$out"
-  }
+  status=0
+  out=$(./scripts/rotate-db-password.sh --current $r 2>&1) || status=$?
+  if [ $status -eq 0 ]; then
+    echo "restore: $out"
+  elif [ $r = monitor ] && [ $status -eq 3 ] && [ "$($COMPOSE exec -T db psql -v ON_ERROR_STOP=1 --no-psqlrc -qtA -U postgres -d postgres \
+      -c "SELECT count(*) FROM pg_roles WHERE rolname = 'karta_monitor'" 2>/dev/null)" = 0 ]; then
+    echo "restore: no monitor role in this backup (make monitoring-role creates it)"
+  else
+    fail "setting the $r role's password failed (exit $status): $out
+restore: the database is restored but not verified or served; fix the cause and run the restore again with --replace"
+  fi
 done
 
 # 7. The fetcher's outbox.
