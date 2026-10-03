@@ -334,7 +334,8 @@ manual one within a scan) wins; the other is refused as `not_newer`.
   `karta_online_next_attempt_timestamp_seconds`,
   `karta_online_consecutive_failures`, `karta_online_last_error{code}`,
   `karta_online_fetcher_state_age_seconds`, `karta_online_verified_serial`,
-  `karta_submissions{source,state}` and more.
+  `karta_submissions{source,state}`,
+  `karta_submission_last_finished_timestamp_seconds{source,state}` and more.
 * Alert on **data age** (`karta_data_stale`), not on check success: a
   source that answers but has nothing new, or an old release that keeps
   serving, does not make the data fresh. Also alert on a growing

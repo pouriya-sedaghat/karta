@@ -128,7 +128,23 @@ func (s *Service) Metrics(ctx context.Context) ([]byte, error) {
 		m.Header("karta_submissions", "Recorded submissions by source and state (registry; survives restarts).", "gauge")
 	}
 	for _, k := range keys {
-		m.Sample("karta_submissions", map[string]string{"source": k[0], "state": k[1]}, float64(subs[k]))
+		m.Sample("karta_submissions", map[string]string{"source": k[0], "state": k[1]}, float64(subs[k].N))
+	}
+	// A new failure shows here even when the count above stays the same (an
+	// older failure retried as it happens) and across publisher restarts
+	// (it is read from the registry, unlike karta_publications_total).
+	header := false
+	for _, k := range keys {
+		v := ts(subs[k].LastFinished)
+		if v == nil {
+			continue
+		}
+		if !header {
+			m.Header("karta_submission_last_finished_timestamp_seconds",
+				"When the latest submission now in this source and state finished (Unix time; registry; survives restarts).", "gauge")
+			header = true
+		}
+		m.Sample("karta_submission_last_finished_timestamp_seconds", map[string]string{"source": k[0], "state": k[1]}, *v)
 	}
 	states := make([]string, 0, len(rels))
 	for k := range rels {

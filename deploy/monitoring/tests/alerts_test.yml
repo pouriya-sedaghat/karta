@@ -321,9 +321,13 @@ tests:
     input_series:
       - series: 'karta_submissions{job="karta-publisher",instance="p",source="inbox",state="published"}'
         values: '1x20'
-      # the first failure appears at 10m
+      - series: 'karta_submission_last_finished_timestamp_seconds{job="karta-publisher",instance="p",source="inbox",state="published"}'
+        values: '0x20'
+      # the first failure finishes at 10m (600 s)
       - series: 'karta_submissions{job="karta-publisher",instance="p",source="inbox",state="failed"}'
         values: '_x2 1x20'
+      - series: 'karta_submission_last_finished_timestamp_seconds{job="karta-publisher",instance="p",source="inbox",state="failed"}'
+        values: '_x2 600x20'
     alert_rule_test:
       - eval_time: 5m
         alertname: KartaPublicationFailed
@@ -342,10 +346,13 @@ tests:
   - name: a further failure of a kind seen before is reported too
     interval: 5m
     input_series:
+      # two older rejections, the latest at 0 s; a third finishes at 70m (4200 s)
       - series: 'karta_submissions{job="karta-publisher",instance="p",source="online",state="rejected"}'
         values: '2x14 3x10'
+      - series: 'karta_submission_last_finished_timestamp_seconds{job="karta-publisher",instance="p",source="online",state="rejected"}'
+        values: '0x13 4200x11'
     alert_rule_test:
-      - eval_time: 60m
+      - eval_time: 65m
         alertname: KartaPublicationFailed
         exp_alerts: []
       - eval_time: 75m
@@ -355,6 +362,45 @@ tests:
             exp_annotations:
               summary: "A online submission ended rejected"
               runbook: docs/operations.md#kartapublicationfailed
+
+  # An older failed row is retried (it leaves "failed") while a new
+  # submission fails: the failed count stays 1. The publisher restarts right
+  # after the new failure (no scrape from 121m to 125m, and its in-process
+  # outcome counter starts again from 0). The new failure is still reported,
+  # from the registry's latest finish time.
+  - name: a new failure is reported although a retried older one keeps the count flat, across a publisher restart
+    interval: 1m
+    input_series:
+      - series: 'karta_submissions{job="karta-publisher",instance="p",source="inbox",state="failed"}'
+        values: '1x120 _x4 1x80'
+      - series: 'karta_submissions{job="karta-publisher",instance="p",source="inbox",state="published"}'
+        values: '3x120 _x4 4x80'
+      # the old failure finished at 10m (600 s); the new one at 120m 30s (7230 s)
+      - series: 'karta_submission_last_finished_timestamp_seconds{job="karta-publisher",instance="p",source="inbox",state="failed"}'
+        values: '600x120 _x4 7230x80'
+      - series: 'karta_publications_total{job="karta-publisher",instance="p",source="inbox",state="failed"}'
+        values: '1x120 _x4 0x80'
+    alert_rule_test:
+      - eval_time: 110m
+        alertname: KartaPublicationFailed
+        exp_alerts: []
+      - eval_time: 126m
+        alertname: KartaPublicationFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p, source: inbox, state: failed}
+            exp_annotations:
+              summary: "A inbox submission ended failed"
+              runbook: docs/operations.md#kartapublicationfailed
+      - eval_time: 3h
+        alertname: KartaPublicationFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, job: karta-publisher, instance: p, source: inbox, state: failed}
+            exp_annotations:
+              summary: "A inbox submission ended failed"
+              runbook: docs/operations.md#kartapublicationfailed
+      - eval_time: 3h5m
+        alertname: KartaPublicationFailed
+        exp_alerts: []
 
   - name: a publication running far beyond its deadline is critical
     interval: 1m

@@ -312,6 +312,7 @@ paths:
         `karta_online_next_attempt_timestamp_seconds`,
         `karta_online_consecutive_failures`, `karta_online_fetcher_state_age_seconds`,
         `karta_online_verified_serial`, `karta_submissions{source,state}`,
+        `karta_submission_last_finished_timestamp_seconds{source,state}`,
         `karta_staging_free_bytes`, `karta_db_volume_free_bytes`; the
         publication deadline and the running publication
         (`karta_publication_timeout_seconds`, `karta_publication_running_seconds`);

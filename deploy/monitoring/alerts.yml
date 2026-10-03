@@ -123,13 +123,14 @@ groups:
         annotations:
           summary: A publication was stopped at its deadline (KARTA_PUBLISH_TIMEOUT)
           runbook: docs/operations.md#kartapublicationtimedout
-      # New failed or rejected submissions in the last hour, including the
-      # first one of a kind (a series that did not exist an hour ago).
+      # A submission ended failed or rejected in the last hour. Read from
+      # the registry's latest finish time in each state, not from a count:
+      # karta_submissions stays the same when an older failure is retried as
+      # a new one fails, and karta_publications_total restarts with the
+      # publisher. A new outcome always becomes its state's latest finish
+      # time, and the registry keeps it across publisher restarts.
       - alert: KartaPublicationFailed
-        expr: |
-          (karta_submissions{state=~"failed|rejected"} - karta_submissions{state=~"failed|rejected"} offset 1h > 0)
-          or
-          (karta_submissions{state=~"failed|rejected"} unless karta_submissions{state=~"failed|rejected"} offset 1h)
+        expr: time() - karta_submission_last_finished_timestamp_seconds{state=~"failed|rejected"} < 3600
         labels: {severity: warning}
         annotations:
           summary: "A {{ $labels.source }} submission ended {{ $labels.state }}"

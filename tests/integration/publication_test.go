@@ -63,6 +63,24 @@ const (
 
 // --- operator API ------------------------------------------------------------
 
+// publisherMetric reads one sample of the publisher's metrics (scraped with
+// the monitoring token), by its exact series name and labels.
+func publisherMetric(t *testing.T, series string) (float64, bool) {
+	t.Helper()
+	r := op(t, http.MethodGet, "/v1/operator/metrics", secret(t, "operator_monitor_token"), nil)
+	expectStatus(t, r, http.StatusOK)
+	for _, line := range strings.Split(string(r.body), "\n") {
+		if v, ok := strings.CutPrefix(line, series+" "); ok {
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				t.Fatalf("%s: %v", line, err)
+			}
+			return f, true
+		}
+	}
+	return 0, false
+}
+
 func secret(t *testing.T, name string) string {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(repoRoot, "secrets", name))
@@ -947,6 +965,17 @@ func TestPublication(t *testing.T) {
 		}
 		waitReady(t, true, "ready")
 
+		// KartaPublicationFailed's input: the authorized rejection below
+		// leaves "rejected" while a new one enters it, so the rejected count
+		// stays the same; the latest finish time still moves to the new one.
+		const rejectedCount = `karta_submissions{source="inbox",state="rejected"}`
+		const lastRejected = `karta_submission_last_finished_timestamp_seconds{source="inbox",state="rejected"}`
+		countBefore, okCount := publisherMetric(t, rejectedCount)
+		lastBefore, okLast := publisherMetric(t, lastRejected)
+		if !okCount || !okLast || countBefore < float64(len(want)) {
+			t.Fatalf("before the retry: %s %v (%v), %s %v (%v)", rejectedCount, countBefore, okCount, lastRejected, lastBefore, okLast)
+		}
+
 		// Authorizing exactly the unauthorized digest publishes the same
 		// submission on the next scan; nothing else was authorized.
 		authorize(t, newer, "integration test: verified variant C")
@@ -963,6 +992,20 @@ func TestPublication(t *testing.T) {
 		waitManifest(t, relC)
 		if s := waitSubmission(t, "boundary-cut", time.Second); s.State != "rejected" {
 			t.Errorf("an unrelated rejection was re-evaluated: %+v", s)
+		}
+
+		newRejection := time.Now()
+		submit(t, "rejected-after-retry", []byte("not an OSM PBF file either"), nil, "")
+		if s := waitSubmission(t, "rejected-after-retry", 60*time.Second); s.State != "rejected" || s.code() != "malformed_snapshot" {
+			t.Fatalf("the new rejection: %+v", s)
+		}
+		countAfter, _ := publisherMetric(t, rejectedCount)
+		lastAfter, ok := publisherMetric(t, lastRejected)
+		if countAfter != countBefore {
+			t.Errorf("%s %v, was %v: one rejection left the state and one entered it", rejectedCount, countAfter, countBefore)
+		}
+		if !ok || lastAfter <= lastBefore || lastAfter < float64(newRejection.Unix())-1 {
+			t.Errorf("%s %v (was %v): not the new rejection, which finished after %d", lastRejected, lastAfter, lastBefore, newRejection.Unix())
 		}
 	})
 	if relC == "" {

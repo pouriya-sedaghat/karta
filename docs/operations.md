@@ -217,8 +217,10 @@ publication time, and the budget derived from it) is open.
 * **Publisher**, `GET /v1/operator/metrics` on the operator API (scope
   `status`): active release and data age (`karta_active_data_age_seconds`,
   `karta_data_stale`, `karta_data_stale_after_seconds` when configured),
-  releases and submissions by state, storage use and budget, staging and
-  database-volume free space, publication in progress
+  releases and submissions by state with each state's latest finish time
+  (`karta_submission_last_finished_timestamp_seconds{source,state}`, from
+  the registry, so it survives restarts), storage use and budget, staging
+  and database-volume free space, publication in progress
   (`karta_publication_running_seconds`, `karta_publication_timeout_seconds`),
   outcomes (`karta_publications_total{source,state}`), the duration
   histogram (`karta_publication_duration_seconds{source}`), timeouts
@@ -394,9 +396,16 @@ publication" for what to check and how to resubmit.
 
 #### KartaPublicationFailed
 
-A submission ended `failed` or `rejected`. Its reason code and reason are
-in `make op-status`; the runbook's "Rules" and failure-code tables say what
-each code means. The active release is unchanged.
+A submission ended `failed` or `rejected` in the last hour. The rule reads
+the registry's latest finish time in that state
+(`karta_submission_last_finished_timestamp_seconds`), not a count. So a new
+failure is reported even while an older one is retried and leaves the state
+(the count stays the same), and across publisher restarts (the process's
+own `karta_publications_total` starts again from 0). The alert clears an
+hour after the failure, or sooner if that submission is retried. Its reason
+code and reason are in `make op-status`; the runbook's "Rules" and
+failure-code tables say what each code means. The active release is
+unchanged.
 
 #### KartaPublicationOverrun
 

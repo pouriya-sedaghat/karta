@@ -1130,6 +1130,7 @@ func TestOperations(t *testing.T) {
 		for _, name := range []string{"karta_api_ready", "karta_api_readiness_info", "karta_api_requests_total",
 			"karta_api_request_duration_seconds_bucket", "karta_api_start_time_seconds", "karta_active_release",
 			"karta_publication_timeouts_total", "karta_publication_timeout_seconds", "karta_submissions",
+			"karta_submission_last_finished_timestamp_seconds",
 			"karta_release_storage_bytes", "karta_release_storage_budget_bytes", "karta_publisher_start_time_seconds",
 			"pg_up", "pg_wal_size_bytes", "pg_settings_max_wal_size_bytes",
 			"karta:guard_disk_free_ratio", "karta:guard_publication_overrun_seconds"} {
