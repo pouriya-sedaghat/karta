@@ -87,7 +87,7 @@ local controlled HTTPS test source (`tests/integration/sourceserver`, a
 test CA), with a manifest signed by a throwaway key generated for the run
 (`cmd/karta-sign sign`, serial 1, valid 24 h). This exercises the online
 path with real data; it is **not** a real provider, a production key, or a
-run on the owner's VM.
+target-host result.
 
 * `karta-sign sign` first ran the importer's input verification on the file
   (complete PBF scan, region box, sidecar, data timestamp) and signed SHA-256
