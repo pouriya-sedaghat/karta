@@ -154,10 +154,13 @@ func (h *Handoffer) deliver(ctx context.Context, d delivery) (*handedOff, error)
 	if list.Limits.RegionID != cfg.ID {
 		return nil, fmt.Errorf("the publisher serves region %q, the region file is %q", list.Limits.RegionID, cfg.ID)
 	}
-	open := 0
+	open, used := 0, map[string]bool{}
 	for _, r := range list.Records {
 		if r.Authorization.Open(h.now()) {
 			open++
+		}
+		if r.Authorization.IntakeName != nil {
+			used[*r.Authorization.IntakeName] = true
 		}
 	}
 	if open >= list.Limits.MaxOpen {
@@ -202,7 +205,7 @@ func (h *Handoffer) deliver(ctx context.Context, d delivery) (*handedOff, error)
 		return nil, refuse(CodeDigestMismatch, "%s has SHA-256 %s, the expected digest is %s: an incomplete, corrupted or different copy",
 			filepath.Base(d.path), digest, d.expectSHA256)
 	}
-	name := h.newName(cfg.ID, digest)
+	name := h.newName(cfg.ID, digest, used)
 	_, _, _, hidden, hiddenSide := h.paths(name)
 	discard := func() {
 		for _, p := range []string{tmp, hidden, hiddenSide} {
@@ -340,12 +343,17 @@ func (h *Handoffer) unchanged(d delivery, src *os.File, before os.FileInfo) erro
 	return nil
 }
 
-func (h *Handoffer) newName(regionID, digest string) string {
+// newName names a handoff by region, channel letter, time and digest
+// prefix, with a counter when the name is taken: by files in the handoff
+// directory, or by one of the credential's authorizations (used), such as a
+// handoff discarded within the same second. A name is never reused: the
+// publisher's records match a handoff to its submission by name.
+func (h *Handoffer) newName(regionID, digest string, used map[string]bool) string {
 	base := fmt.Sprintf("%s-%s%s-%s", regionID, h.cfg.Letter, h.now().UTC().Format("20060102T150405Z"), digest[:12])
 	name := base
 	for i := 1; i < 100; i++ {
 		vis, marker, _, hidden, _ := h.paths(name)
-		if !exists(vis) && !exists(marker) && !exists(hidden) {
+		if !used[name] && !exists(vis) && !exists(marker) && !exists(hidden) {
 			break
 		}
 		name = fmt.Sprintf("%s-%d", base, i)
@@ -612,9 +620,9 @@ func (h *Handoffer) sweep(mine map[string]bool, capTTL time.Duration) {
 	}
 }
 
-// waitOutcome follows a handoff until its submission is final, then cleans
-// it up (as reconcile does) and returns the record.
-func (h *Handoffer) waitOutcome(ctx context.Context, name string, every time.Duration, progress func(Record)) (Record, error) {
+// waitOutcome follows a handoff's authorization (id) until its submission
+// is final, then cleans it up (as reconcile does) and returns the record.
+func (h *Handoffer) waitOutcome(ctx context.Context, name string, id int64, every time.Duration, progress func(Record)) (Record, error) {
 	t := time.NewTicker(every)
 	defer t.Stop()
 	last := ""
@@ -622,7 +630,7 @@ func (h *Handoffer) waitOutcome(ctx context.Context, name string, every time.Dur
 		list, err := h.cfg.Client.List(ctx)
 		if err == nil {
 			for _, rec := range list.Records {
-				if rec.Authorization.IntakeName == nil || *rec.Authorization.IntakeName != name {
+				if rec.Authorization.ID != id {
 					continue
 				}
 				st := ""

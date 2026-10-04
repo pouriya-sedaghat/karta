@@ -100,7 +100,7 @@ func Submit(ctx context.Context, h *Handoffer, o SubmitOptions, log *slog.Logger
 	if poll <= 0 {
 		poll = 2 * time.Second
 	}
-	rec, err := h.waitOutcome(ctx, ho.Name, poll, progress)
+	rec, err := h.waitOutcome(ctx, ho.Name, ho.AuthorizationID, poll, progress)
 	res.Submission = rec.Submission
 	return res, err
 }

@@ -939,7 +939,7 @@ func TestHandoffNamesCarryTheirChannel(t *testing.T) {
 	for letter, channel := range map[string]string{LetterWatch: registry.ChannelIntakeWatch, LetterSubmit: registry.ChannelIntakeSubmit} {
 		h := &Handoffer{cfg: HandoffConfig{Dir: t.TempDir(), Letter: letter}, now: time.Now}
 		for _, region := range []string{"iran", "tehran-chitgar"} {
-			name := h.newName(region, digest)
+			name := h.newName(region, digest, nil)
 			p, ok := registry.ParseHandoffName(name)
 			if !ok || p.RegionID != region || p.Channel != channel || p.DigestPrefix != digest[:12] {
 				t.Errorf("%s: parsed %+v %v", name, p, ok)
@@ -952,4 +952,90 @@ func TestHandoffNamesCarryTheirChannel(t *testing.T) {
 			t.Errorf("%q parsed as %+v", bad, p)
 		}
 	}
+}
+
+// A command that crashed after authorizing, rerun within the same second:
+// the rerun discards the interrupted handoff and must not hand the file off
+// under the same name again (the publisher matches a handoff to its
+// submission by name), and the outcome it waits for is its own
+// authorization's.
+func TestARerunNeverReusesAHandoffName(t *testing.T) {
+	data := fixtureA(t)
+	fixed := time.Now().UTC().Truncate(time.Second)
+	crashed := "fixture-c" + fixed.Format("20060102T150405Z") + "-" + digest(data)[:12]
+	setup := func(t *testing.T) (*rig, *Handoffer) {
+		t.Helper()
+		r := newRig(t)
+		h, err := NewHandoffer(HandoffConfig{Dir: r.handoff, RegionPath: repoFile(t, "config/regions/fixture.json"), Client: r.w.h.cfg.Client,
+			Letter: LetterSubmit, MaxInputBytes: 1 << 30, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return fixed }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r, h
+	}
+	// finishAll gives every visible handoff a published outcome once it has
+	// a ready marker.
+	finishAll := func(r *rig, stop <-chan struct{}) {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+			for _, n := range r.handoffs() {
+				r.api.finish(n, "published", "")
+			}
+		}
+	}
+
+	t.Run("a name an authorization holds is not reused", func(t *testing.T) {
+		_, h := setup(t)
+		if n := h.newName("fixture", digest(data), map[string]bool{crashed: true}); n != crashed+"-1" {
+			t.Fatalf("named %s next to an authorization of %s", n, crashed)
+		}
+	})
+
+	t.Run("the rerun after a crash", func(t *testing.T) {
+		r, h := setup(t)
+		_, _, _, hidden, _ := h.paths(crashed)
+		if err := os.WriteFile(hidden, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		a := r.api.addAuthorization(crashed, digest(data), int64(len(data)))
+		file := filepath.Join(r.root, "iran.osm.pbf")
+		if err := os.WriteFile(file, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stop := make(chan struct{})
+		defer close(stop)
+		go finishAll(r, stop)
+		res, err := Submit(context.Background(), h, SubmitOptions{File: file, ExpectSHA256: digest(data), Wait: true, Poll: 50 * time.Millisecond},
+			slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		if err != nil || res.Name == crashed || res.AuthorizationID == a.ID || res.Submission == nil || res.Submission.State != "published" {
+			t.Fatalf("the rerun: %+v %v (the interrupted handoff was %s, authorization %d)", res, err, crashed, a.ID)
+		}
+		for _, x := range r.api.authorizations() {
+			if x.ID == a.ID && x.RevokedAt == nil {
+				t.Error("the interrupted handoff's authorization stays open")
+			}
+		}
+	})
+
+	t.Run("an earlier authorization of the same name does not decide the outcome", func(t *testing.T) {
+		r, h := setup(t)
+		old := r.api.addAuthorization(crashed, digest(data), int64(len(data)))
+		r.api.mu.Lock()
+		now := time.Now()
+		r.api.auths[0].RevokedAt = &now
+		r.api.mu.Unlock()
+		cur := r.api.addAuthorization(crashed, digest(data), int64(len(data)))
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			r.api.finish(crashed, "published", "")
+		}()
+		rec, err := h.waitOutcome(context.Background(), crashed, cur.ID, 50*time.Millisecond, nil)
+		if err != nil || rec.Authorization.ID != cur.ID || rec.Submission == nil || rec.Submission.State != "published" {
+			t.Fatalf("followed %+v %v (closed %d, current %d)", rec, err, old.ID, cur.ID)
+		}
+	})
 }

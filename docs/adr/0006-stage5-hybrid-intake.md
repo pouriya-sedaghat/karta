@@ -622,7 +622,13 @@ What the implementation settled within the decisions above, for review:
   channel its name says wrote it, so an `intake_submit` row can neither
   admit a watcher handoff nor lift the watcher's pause after a rollback
   (integration test with a paused watcher handoff, a separate submit
-  credential and a submit row written past the API).
+  credential and a submit row written past the API). CI on these fixes
+  found a command rerun within the same second as its crashed run reusing
+  the discarded handoff's name; since records find a handoff's submission
+  by name, a name is now never reused (one that any of the credential's
+  authorizations holds gets a counter, like one taken by files), and the
+  command follows its own authorization id for the outcome (fixed-clock
+  unit test).
 * **Evidence.** Tier A only: unit tests with race detection for every new
   package, script tests, promtool rule tests with negative controls, and
   `TestIntake` and `TestBridge` against the Compose stack (fixtures, the
