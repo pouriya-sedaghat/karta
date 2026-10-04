@@ -433,6 +433,11 @@ The direct manual path (inbox with a pin or an operator authorization, or
    ```
 
    The running publisher picks it up at its next request; no restart.
+   For now, keep generated token files under the private `secrets/` directory
+   (mode 0700). The script makes a generated token file readable by the
+   container user (mode 0644); a custom `TOKEN_FILE` under a directory other
+   host users can traverse could expose that credential. Do not use such a
+   custom path for the VM rehearsal; its path handling needs a separate fix.
 3. Submit with an **independent expectation** from the source copy: its
    SHA-256 (and size) as recorded where the file came from, or the
    producer's completion marker:
