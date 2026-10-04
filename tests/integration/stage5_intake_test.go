@@ -103,6 +103,8 @@ type submitResult struct {
 		SHA256          string `json:"sha256"`
 		AuthorizationID int64  `json:"authorization_id"`
 		Submission      *struct {
+			ID         int64   `json:"id"`
+			Name       string  `json:"name"`
 			State      string  `json:"state"`
 			ReasonCode *string `json:"reason_code"`
 			ReleaseID  *string `json:"release_id"`
@@ -296,7 +298,9 @@ type intakeRecord struct {
 		CreatedBy    string     `json:"created_by"`
 		RevokedAt    *time.Time `json:"revoked_at"`
 		RevokeReason *string    `json:"revoke_reason"`
+		IntakeName   *string    `json:"intake_name"`
 	} `json:"authorization"`
+	Submission *submission `json:"submission"`
 }
 
 func intakeRecords(t *testing.T, token string) []intakeRecord {
@@ -439,7 +443,7 @@ func TestIntake(t *testing.T) {
 		if r := op(t, http.MethodPost, fmt.Sprintf("/v1/operator/intake/authorizations/%d/close", a.Authorization.ID), bob, map[string]any{"reason": "not mine"}); r.status != http.StatusNotFound {
 			t.Errorf("bob closed alice's authorization: %d %s", r.status, r.body)
 		}
-		expectStatus(t, intakeAuthorize(t, bob, x, nil), http.StatusCreated)
+		expectStatus(t, intakeAuthorize(t, bob, x, map[string]any{"name": handoffName("c", x, 1)}), http.StatusCreated)
 		r = op(t, http.MethodPost, "/v1/operator/authorizations/"+digestOf(x)+"/revoke", admin, map[string]any{"reason": "stop button"})
 		expectStatus(t, r, http.StatusOK)
 		if n := openRecords(intakeRecords(t, alice)) + openRecords(intakeRecords(t, bob)); n != 0 {
@@ -688,15 +692,18 @@ func TestIntake(t *testing.T) {
 		// Its own command name for the same digest is allowed, and admits
 		// only a command handoff of that name.
 		expectStatus(t, intakeAuthorize(t, bob, dataP, map[string]any{"name": handoffName("c", dataP, 3)}), http.StatusCreated)
-		// Even a submit row naming the watcher handoff (written past the
-		// API, as a pre-fix registry could hold) does not admit it.
+		// Not even a row written past the API can name the watcher's
+		// handoff: the registry holds each handoff name once (the
+		// publisher's channel binding behind it is tested in
+		// internal/registry, TestDBScopeBindsAHandoffToItsChannel).
 		ctx := context.Background()
 		reg := superuser(t, "karta_registry")
 		defer reg.Close(ctx)
-		if _, err := reg.Exec(ctx, `INSERT INTO registry.authorizations (region_id, sha256, size_bytes, reason, created_by, expires_at, channel, intake_name)
+		_, err := reg.Exec(ctx, `INSERT INTO registry.authorizations (region_id, sha256, size_bytes, reason, created_by, expires_at, channel, intake_name)
 VALUES ('fixture', $1, $2, 'test: a submit row naming a watcher handoff', 'test-bob-direct', now() + interval '1 hour', 'intake_submit', $3)`,
-			digestOf(dataP), len(dataP), name); err != nil {
-			t.Fatal(err)
+			digestOf(dataP), len(dataP), name)
+		if err == nil || !strings.Contains(err.Error(), "authorizations_intake_name_unique") {
+			t.Fatalf("a second row naming the watcher's handoff was stored: %v", err)
 		}
 		// The watcher completes its handoff; the pause holds.
 		startWatcher(t, nil)
@@ -951,4 +958,122 @@ WHERE sha256 = $1 AND created_by IN ('test-bob', 'test-bob-direct') AND revoked_
 			t.Errorf("karta_intake_watcher_stopped %v %v (%v)", v, ok, st.StoppedAt)
 		}
 	})
+
+	// Two people's commands deliver the same bytes in the same second (a
+	// fixed clock). The first handoff's submission is final and its files
+	// are gone when the second starts, and the second credential cannot
+	// list the first's records: it must still get its own name, its own
+	// submission and its own outcome.
+	dataK := variant(t, at("2026-09-25T00:00:00Z"), nil, nil)
+	fixed := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	firstK := "fixture-c" + fixed.Format("20060102T150405Z") + "-" + digestOf(dataK)[:12]
+	carol := s.registerPerson(t, "test-carol")
+	t.Run("two people delivering the same bytes in the same second get their own handoffs and outcomes", func(t *testing.T) {
+		clock := []string{"KARTA_TEST_INTAKE_CLOCK=" + fixed.Format(time.RFC3339)}
+		f := commandFile(t, "k", dataK)
+		first, code, stderr := runSubmit(t, clock, "test-alice", f, "--expect-sha256", digestOf(dataK))
+		if code != 0 || first.Result.Name != firstK || first.Result.Submission == nil || first.Result.Submission.State != "published" {
+			t.Fatalf("alice: exit %d %+v %s", code, first, stderr)
+		}
+		if left := handoffFiles(t, firstK); len(left) != 0 {
+			t.Fatalf("alice's handoff files remain: %v", left)
+		}
+		second, code, stderr := runSubmit(t, clock, "test-carol", f, "--expect-sha256", digestOf(dataK))
+		if code != 0 || second.Result.Name != firstK+"-1" || second.Result.AuthorizationID == first.Result.AuthorizationID ||
+			second.Result.Submission == nil || second.Result.Submission.ID == first.Result.Submission.ID ||
+			second.Result.Submission.Name != firstK+"-1" || second.Result.Submission.State != "duplicate" {
+			t.Fatalf("carol: exit %d %+v (alice's: %+v) %s", code, second, first, stderr)
+		}
+		// The publisher took carol's own handoff (its files were not removed
+		// because of alice's outcome), and everything is cleaned up now.
+		var own *submission
+		for _, sub := range intakeStatus(t).Submissions {
+			if sub.ID == second.Result.Submission.ID {
+				c := sub.submission
+				own = &c
+			}
+		}
+		if own == nil || own.Name != firstK+"-1" || own.code() != "duplicate_active" {
+			t.Errorf("the publisher's record of carol's handoff: %+v", own)
+		}
+		if left := handoffFiles(t, firstK); len(left) != 0 {
+			t.Errorf("handoff files remain: %v", left)
+		}
+		for _, r := range intakeRecords(t, carol) {
+			if r.Authorization.IntakeName != nil && *r.Authorization.IntakeName == firstK {
+				t.Errorf("carol holds alice's handoff name: %+v", r)
+			}
+		}
+	})
+
+	t.Run("a handoff name another credential used is refused, open or closed", func(t *testing.T) {
+		// Closed: alice's handoff above.
+		r := intakeAuthorize(t, carol, dataK, map[string]any{"name": firstK})
+		if r.status != http.StatusConflict || r.reasonCode(t) != "handoff_name_taken" {
+			t.Fatalf("carol authorized alice's closed handoff name: %d %s", r.status, r.body)
+		}
+		// Open: a fresh authorization of alice's.
+		y := variant(t, at("2026-09-26T00:00:00Z"), nil, nil)
+		openName := handoffName("c", y, 7)
+		var a struct {
+			Authorization struct {
+				ID int64 `json:"id"`
+			} `json:"authorization"`
+		}
+		ra := intakeAuthorize(t, alice, y, map[string]any{"name": openName})
+		expectStatus(t, ra, http.StatusCreated)
+		ra.json(t, &a)
+		r = intakeAuthorize(t, carol, y, map[string]any{"name": openName})
+		if r.status != http.StatusConflict || r.reasonCode(t) != "handoff_name_taken" {
+			t.Fatalf("carol authorized alice's open handoff name: %d %s", r.status, r.body)
+		}
+		if strings.Contains(string(r.body), "test-alice") {
+			t.Errorf("the refusal names the other credential: %s", r.body)
+		}
+		// No ambiguous attribution: carol has no row of either name, and
+		// alice's rows are as they were (the closed one with its own
+		// submission, the open one still open).
+		for _, rec := range intakeRecords(t, carol) {
+			if n := rec.Authorization.IntakeName; n != nil && (*n == firstK || *n == openName) {
+				t.Errorf("carol holds %s", *n)
+			}
+		}
+		seen := 0
+		for _, rec := range intakeRecords(t, alice) {
+			switch n := rec.Authorization.IntakeName; {
+			case n != nil && *n == firstK:
+				seen++
+				if rec.Authorization.RevokedAt == nil || rec.Submission == nil || rec.Submission.Name != firstK || rec.Submission.State != "published" {
+					t.Errorf("alice's closed handoff: %+v %+v", rec.Authorization, rec.Submission)
+				}
+			case n != nil && *n == openName:
+				seen++
+				if rec.Authorization.RevokedAt != nil || rec.Authorization.ID != a.Authorization.ID {
+					t.Errorf("alice's open authorization changed: %+v", rec.Authorization)
+				}
+			}
+		}
+		if seen != 2 {
+			t.Errorf("alice's records of %s and %s: %d", firstK, openName, seen)
+		}
+		expectStatus(t, op(t, http.MethodPost, fmt.Sprintf("/v1/operator/intake/authorizations/%d/close", a.Authorization.ID), alice,
+			map[string]any{"reason": "test cleanup"}), http.StatusOK)
+	})
+}
+
+// handoffFiles lists the handoff directory's files of a name (with any
+// counter suffix).
+func handoffFiles(t *testing.T, name string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(intakeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if n := strings.TrimPrefix(e.Name(), "."); strings.HasPrefix(n, name+".") || strings.HasPrefix(n, name+"-") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
 }

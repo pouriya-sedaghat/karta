@@ -235,6 +235,9 @@ func (w *Watcher) consider(ctx context.Context, e landingEntry) LandingEntry {
 		d.sidecarPath, d.sidecarWant = filepath.Join(w.cfg.landing(), e.Name+SidecarSuffix), e.Sidecar
 	}
 	d.beforeAuthorize = func(name, digest string, size int64) error {
+		// A retry under another name (the first was taken) replaces the
+		// pending record.
+		w.dropPending(e.Name, nil)
 		w.state.Handoffs = append(w.state.Handoffs, Handoff{Name: name, From: e.Name, SHA256: digest, SizeBytes: size, Channel: "intake_watch",
 			HandedOffAt: w.now().UTC(), LandingFingerprint: fp})
 		return w.save()

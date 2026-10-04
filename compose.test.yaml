@@ -127,6 +127,7 @@ services:
       KARTA_INTAKE_RESERVE_MB: "1"
       KARTA_MAX_INPUT_MB: "64"
       KARTA_FAILPOINTS: ${KARTA_TEST_INTAKE_FAILPOINTS:-}
+      KARTA_FAILPOINT_CLOCK: ${KARTA_TEST_INTAKE_CLOCK:-}
     volumes: !override
       - ${KARTA_INTAKE_HOST_DIR:?set by make test-integration}:/data/intake
       - ./config/regions:/config/regions:ro

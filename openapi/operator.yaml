@@ -381,10 +381,14 @@ paths:
         without `KARTA_INTAKE_DIR`; `409 intake_limit_reached` beyond
         `KARTA_INTAKE_MAX_OPEN`; `409 intake_refused` (`reason_code`
         `region_mismatch`, `too_large`, `validity_beyond_cap`,
-        `handoff_name_mismatch`) outside the publisher's bounds, or
-        (`digest_revoked`) for a digest an operator revoked, until an
-        operator authorizes it again. Serialized with operator authorize and
-        revoke of the same digest. Audited as `intake_authorize`.
+        `handoff_name_mismatch`) outside the publisher's bounds,
+        (`handoff_name_taken`) for a name that an earlier authorization of
+        any credential (open or closed) or an intake submission already
+        carries, since a handoff name is never reused (the request changes
+        nothing; ask again under another name), or (`digest_revoked`) for a
+        digest an operator revoked, until an operator authorizes it again.
+        Serialized with operator authorize and revoke of the same digest.
+        Audited as `intake_authorize`.
       requestBody:
         required: true
         content:
@@ -423,8 +427,9 @@ paths:
       operationId: operatorIntakeList
       description: |
         Scope `intake_watch` or `intake_submit`. The caller's open
-        authorizations and those closed in the last week, each with the
-        newest intake submission carrying its handoff name, and the limits the
+        authorizations and those closed in the last week (at most 50), each
+        with the newest intake submission carrying its handoff name and
+        recorded after the authorization was created, and the limits the
         publisher enforces. Nothing else is visible.
       responses:
         "200":
@@ -660,8 +665,8 @@ components:
               type: string
               description: |
                 For `policy_refused`, the rule that refused (older_than_active, not_newer, region_changed, excessive_data_loss,
-                counts_unavailable, region_config); for `intake_refused`, region_mismatch, too_large, validity_beyond_cap or
-                digest_revoked or handoff_name_mismatch.
+                counts_unavailable, region_config); for `intake_refused`, region_mismatch, too_large, validity_beyond_cap,
+                digest_revoked, handoff_name_mismatch or handoff_name_taken.
             request_id: { type: string }
     SwitchBody:
       type: object

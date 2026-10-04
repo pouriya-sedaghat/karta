@@ -123,3 +123,60 @@ func TestLock(t *testing.T) {
 	}
 	b.Close()
 }
+
+func TestNeverReplace(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, s string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	read := func(p string) string {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return "missing"
+		}
+		return string(b)
+	}
+	// A move to a free name.
+	src, dst := write("a", "mine"), filepath.Join(dir, "b")
+	if err := RenameNoReplace(src, dst); err != nil || read(dst) != "mine" || read(src) != "missing" {
+		t.Fatalf("move: %v %q %q", err, read(dst), read(src))
+	}
+	// An existing destination is never replaced, and the source stays.
+	src, other := write("c", "mine"), write("d", "theirs")
+	if err := RenameNoReplace(src, other); !errors.Is(err, ErrExists) || read(other) != "theirs" || read(src) != "mine" {
+		t.Fatalf("over an existing file: %v %q %q", err, read(other), read(src))
+	}
+	// Nor through a symlink at the destination.
+	link := filepath.Join(dir, "l")
+	if err := os.Symlink(other, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenameNoReplace(src, link); !errors.Is(err, ErrExists) || read(other) != "theirs" {
+		t.Fatalf("over a symlink: %v %q", err, read(other))
+	}
+	// A crash between link and unlink: both names are one file, and a
+	// repeat completes the move.
+	src = write("e", "mine")
+	half := filepath.Join(dir, "f")
+	if err := os.Link(src, half); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenameNoReplace(src, half); err != nil || read(half) != "mine" || read(src) != "missing" {
+		t.Fatalf("repeat after a crash: %v", err)
+	}
+	// WriteNew writes a new file, and refuses an existing one.
+	fresh := filepath.Join(dir, "g")
+	if err := WriteNew(fresh, []byte("new"), 0o644); err != nil || read(fresh) != "new" {
+		t.Fatalf("new file: %v", err)
+	}
+	if err := WriteNew(other, []byte("new"), 0o644); !errors.Is(err, ErrExists) || read(other) != "theirs" {
+		t.Fatalf("over an existing file: %v %q", err, read(other))
+	}
+	if _, err := os.Lstat(filepath.Join(dir, ".tmp-d")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary file left: %v", err)
+	}
+}

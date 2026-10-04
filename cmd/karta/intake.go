@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/pouriya-sedaghat/karta/internal/config"
+	"github.com/pouriya-sedaghat/karta/internal/failpoint"
 	"github.com/pouriya-sedaghat/karta/internal/intake"
 )
 
@@ -45,8 +46,12 @@ func intakeHandoff(c config.Intake, letter string) (*intake.Handoffer, error) {
 	if err != nil {
 		return nil, err
 	}
+	now, err := failpoint.Clock()
+	if err != nil {
+		return nil, err
+	}
 	return intake.NewHandoffer(intake.HandoffConfig{Dir: c.HandoffDir, RegionPath: c.RegionFile, Client: client, Letter: letter, TTL: c.TTL,
-		MaxInputBytes: c.MaxInputBytes, ReserveBytes: c.ReserveBytes, Log: logger(c.LogLevel)})
+		MaxInputBytes: c.MaxInputBytes, ReserveBytes: c.ReserveBytes, Log: logger(c.LogLevel), Now: now})
 }
 
 func writerGID(c config.Intake) *uint32 {

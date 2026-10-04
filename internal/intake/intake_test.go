@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,6 +24,7 @@ import (
 	"github.com/pouriya-sedaghat/karta/internal/inbox"
 	"github.com/pouriya-sedaghat/karta/internal/pbfwrite"
 	"github.com/pouriya-sedaghat/karta/internal/registry"
+	"github.com/pouriya-sedaghat/karta/internal/safefile"
 )
 
 const testToken = "4444444444444444444444444444444444444444444444444444444444444444"
@@ -42,6 +44,13 @@ type fakeAPI struct {
 	requests []string
 	// revoked digests are refused as an operator's revoke would make them.
 	revoked map[string]bool
+	// taken are handoff names the registry holds without this credential
+	// listing them (another credential's, or older than the listing): like
+	// the names of any authorization, they are refused as handoff_name_taken.
+	taken map[string]bool
+	// onAuthorize, when set, runs (unlocked) before an authorization is
+	// recorded.
+	onAuthorize func(name string)
 }
 
 func newFakeAPI() *fakeAPI {
@@ -83,6 +92,19 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.revoked[req.SHA256] {
 			writeJSON(409, map[string]any{"error": map[string]string{"code": "intake_refused", "reason_code": "digest_revoked", "message": "revoked"}})
 			return
+		}
+		used := f.taken[req.Name]
+		for _, a := range f.auths {
+			used = used || *a.IntakeName == req.Name
+		}
+		if used {
+			writeJSON(409, map[string]any{"error": map[string]string{"code": "intake_refused", "reason_code": CodeNameTaken, "message": "taken"}})
+			return
+		}
+		if hook := f.onAuthorize; hook != nil {
+			f.mu.Unlock()
+			hook(req.Name)
+			f.mu.Lock()
 		}
 		if req.RegionID != f.region || float64(req.TTLSeconds) > f.maxTTL || req.SizeBytes < 1 {
 			writeJSON(409, map[string]any{"error": map[string]string{"code": "intake_refused", "message": "bounds"}})
@@ -778,9 +800,14 @@ func TestWatcherRecoversInterruptedHandoffs(t *testing.T) {
 		if err := os.WriteFile(p, data[:100], 0o600); err != nil {
 			t.Fatal(err)
 		}
+		// A marker write interrupted between its link and unlink.
+		m := filepath.Join(r.handoff, ".tmp-fixture-w20260101T000000Z-000000000000.osm.pbf.ready")
+		if err := os.WriteFile(m, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		r.scan()
-		if exists(p) {
-			t.Fatal("a temporary copy survived")
+		if exists(p) || exists(m) {
+			t.Fatal("a temporary file survived")
 		}
 	})
 }
@@ -939,9 +966,9 @@ func TestHandoffNamesCarryTheirChannel(t *testing.T) {
 	for letter, channel := range map[string]string{LetterWatch: registry.ChannelIntakeWatch, LetterSubmit: registry.ChannelIntakeSubmit} {
 		h := &Handoffer{cfg: HandoffConfig{Dir: t.TempDir(), Letter: letter}, now: time.Now}
 		for _, region := range []string{"iran", "tehran-chitgar"} {
-			name := h.newName(region, digest, nil)
+			name, err := h.newName(region, digest, nil)
 			p, ok := registry.ParseHandoffName(name)
-			if !ok || p.RegionID != region || p.Channel != channel || p.DigestPrefix != digest[:12] {
+			if err != nil || !ok || p.RegionID != region || p.Channel != channel || p.DigestPrefix != digest[:12] {
 				t.Errorf("%s: parsed %+v %v", name, p, ok)
 			}
 		}
@@ -990,7 +1017,7 @@ func TestARerunNeverReusesAHandoffName(t *testing.T) {
 
 	t.Run("a name an authorization holds is not reused", func(t *testing.T) {
 		_, h := setup(t)
-		if n := h.newName("fixture", digest(data), map[string]bool{crashed: true}); n != crashed+"-1" {
+		if n, err := h.newName("fixture", digest(data), map[string]bool{crashed: true}); err != nil || n != crashed+"-1" {
 			t.Fatalf("named %s next to an authorization of %s", n, crashed)
 		}
 	})
@@ -1036,6 +1063,226 @@ func TestARerunNeverReusesAHandoffName(t *testing.T) {
 		rec, err := h.waitOutcome(context.Background(), crashed, cur.ID, 50*time.Millisecond, nil)
 		if err != nil || rec.Authorization.ID != cur.ID || rec.Submission == nil || rec.Submission.State != "published" {
 			t.Fatalf("followed %+v %v (closed %d, current %d)", rec, err, old.ID, cur.ID)
+		}
+	})
+}
+
+// submitHandoffer is the command's Handoffer on the rig's handoff directory
+// and fake publisher, with a fixed clock.
+func submitHandoffer(t *testing.T, r *rig, now time.Time) *Handoffer {
+	t.Helper()
+	h, err := NewHandoffer(HandoffConfig{Dir: r.handoff, RegionPath: repoFile(t, "config/regions/fixture.json"), Client: r.w.h.cfg.Client,
+		Letter: LetterSubmit, MaxInputBytes: 1 << 30, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// dirFiles maps each regular file in dir to its content and inode, so a
+// replaced file shows even with the same content.
+func dirFiles(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]string{}
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[e.Name()] = fmt.Sprintf("%d:%s", fi.Sys().(*syscall.Stat_t).Ino, b)
+	}
+	return out
+}
+
+func (f *fakeAPI) authorizeRequests() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.requests {
+		if r == "POST /v1/operator/intake/authorizations" {
+			n++
+		}
+	}
+	return n
+}
+
+// The name allocator never hands out a taken name: with every candidate up
+// to the last suffix taken (by any file of the name, or by an
+// authorization), it fails, and a delivery then changes no file.
+func TestNameAllocationFailsClosed(t *testing.T) {
+	data := fixtureA(t)
+	fixed := time.Date(2026, 10, 4, 5, 0, 0, 0, time.UTC)
+	base := "fixture-c20261004T050000Z-" + digest(data)[:12]
+	candidate := func(i int) string {
+		if i == 0 {
+			return base
+		}
+		return fmt.Sprintf("%s-%d", base, i)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	submitFile := func(t *testing.T, r *rig) string {
+		t.Helper()
+		f := filepath.Join(r.root, "k.osm.pbf")
+		if err := os.WriteFile(f, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	t.Run("every candidate has a file of some kind, the last included", func(t *testing.T) {
+		r := newRig(t)
+		h := submitHandoffer(t, r, fixed)
+		for i := 0; i <= maxNameSuffix; i++ {
+			vis, marker, side, hidden, hiddenSide := h.paths(candidate(i))
+			p := []string{vis, marker, side, hidden, hiddenSide}[i%5]
+			if err := os.WriteFile(p, []byte(fmt.Sprintf("another handoff's file %d", i)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before := dirFiles(t, r.handoff)
+		if n, err := h.newName("fixture", digest(data), nil); !errors.Is(err, ErrNamesExhausted) || n != "" {
+			t.Fatalf("allocated %q (%v) with every name taken", n, err)
+		}
+		_, err := Submit(context.Background(), h, SubmitOptions{File: submitFile(t, r), ExpectSHA256: digest(data)}, log, nil)
+		if !errors.Is(err, ErrNamesExhausted) {
+			t.Fatalf("a delivery with every name taken: %v", err)
+		}
+		if after := dirFiles(t, r.handoff); fmt.Sprint(after) != fmt.Sprint(before) {
+			t.Fatalf("the handoff directory changed:\nbefore %v\nafter  %v", before, after)
+		}
+		if n := r.api.authorizeRequests(); n != 0 {
+			t.Fatalf("%d authorization requests with every name taken", n)
+		}
+	})
+	t.Run("files and authorizations together; the last suffix is checked too", func(t *testing.T) {
+		r := newRig(t)
+		h := submitHandoffer(t, r, fixed)
+		used := map[string]bool{}
+		for i := 0; i < maxNameSuffix; i++ {
+			if i%2 == 0 {
+				used[candidate(i)] = true
+				continue
+			}
+			vis, _, _, _, _ := h.paths(candidate(i))
+			if err := os.WriteFile(vis, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n, err := h.newName("fixture", digest(data), used); err != nil || n != candidate(maxNameSuffix) {
+			t.Fatalf("only the last is free: %q %v", n, err)
+		}
+		used[candidate(maxNameSuffix)] = true
+		if n, err := h.newName("fixture", digest(data), used); !errors.Is(err, ErrNamesExhausted) {
+			t.Fatalf("the last suffix taken too: %q %v", n, err)
+		}
+	})
+	t.Run("the publisher refuses every candidate", func(t *testing.T) {
+		r := newRig(t)
+		h := submitHandoffer(t, r, fixed)
+		r.api.taken = map[string]bool{}
+		for i := 0; i <= maxNameSuffix; i++ {
+			r.api.taken[candidate(i)] = true
+		}
+		_, err := Submit(context.Background(), h, SubmitOptions{File: submitFile(t, r), ExpectSHA256: digest(data)}, log, nil)
+		if !errors.Is(err, ErrNamesExhausted) {
+			t.Fatalf("every name refused: %v", err)
+		}
+		if n := r.api.authorizeRequests(); n != maxNameSuffix+1 {
+			t.Errorf("%d authorization requests, want one per candidate", n)
+		}
+		if left := dirFiles(t, r.handoff); len(left) != 0 || len(r.api.authorizations()) != 0 {
+			t.Fatalf("left behind: files %v, authorizations %+v", left, r.api.authorizations())
+		}
+	})
+}
+
+// A file that appears under the chosen name after it was checked (written
+// outside the handoff lock) is never replaced: the handoff fails and the
+// file stays as it was.
+func TestAHandoffNeverReplacesAFile(t *testing.T) {
+	data := fixtureA(t)
+	for _, which := range []string{"snapshot", "ready marker"} {
+		t.Run(which, func(t *testing.T) {
+			r := newRig(t)
+			h := submitHandoffer(t, r, time.Now())
+			var planted string
+			r.api.onAuthorize = func(name string) {
+				vis, marker, _, _, _ := h.paths(name)
+				planted = vis
+				if which == "ready marker" {
+					planted = marker
+				}
+				if err := os.WriteFile(planted, []byte("another writer's file"), 0o644); err != nil {
+					t.Error(err)
+				}
+			}
+			f := filepath.Join(r.root, "k.osm.pbf")
+			if err := os.WriteFile(f, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Submit(context.Background(), h, SubmitOptions{File: f, ExpectSHA256: digest(data)}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			if !errors.Is(err, safefile.ErrExists) {
+				t.Fatalf("handed off over an existing %s: %v", which, err)
+			}
+			if b, err := os.ReadFile(planted); err != nil || string(b) != "another writer's file" {
+				t.Fatalf("the existing %s was replaced: %q %v", which, b, err)
+			}
+		})
+	}
+}
+
+// A name the publisher's registry holds but this credential does not list
+// (another credential's, or older than its listing) is refused as taken; the
+// intake hands off under the next name without relying on the listing, and
+// the watcher's pending record follows the name.
+func TestATakenNameIsRetriedUnderTheNextName(t *testing.T) {
+	data := fixtureA(t)
+	fixed := time.Date(2026, 10, 4, 5, 0, 0, 0, time.UTC)
+	t.Run("the command", func(t *testing.T) {
+		r := newRig(t)
+		h := submitHandoffer(t, r, fixed)
+		base := "fixture-c20261004T050000Z-" + digest(data)[:12]
+		r.api.taken = map[string]bool{base: true}
+		f := filepath.Join(r.root, "k.osm.pbf")
+		if err := os.WriteFile(f, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res, err := Submit(context.Background(), h, SubmitOptions{File: f, ExpectSHA256: digest(data)}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		if err != nil || res.Name != base+"-1" {
+			t.Fatalf("%+v %v", res, err)
+		}
+		if hs, as := r.handoffs(), r.api.authorizations(); len(hs) != 1 || hs[0] != base+"-1" || len(as) != 1 || *as[0].IntakeName != base+"-1" {
+			t.Fatalf("handoffs %v, authorizations %+v", hs, as)
+		}
+	})
+	t.Run("the watcher", func(t *testing.T) {
+		r := newRig(t)
+		r.w.h.now = func() time.Time { return fixed }
+		base := "fixture-w20261004T050000Z-" + digest(data)[:12]
+		r.api.taken = map[string]bool{base: true}
+		r.put("l.osm.pbf", data)
+		r.put("l.osm.pbf.complete", completion("l", data))
+		st := r.scan()
+		if e := r.entry(st, "l"); e.State != StateDelivered {
+			t.Fatalf("landing entry %+v", e)
+		}
+		if len(st.Handoffs) != 1 || st.Handoffs[0].Name != base+"-1" || st.Handoffs[0].AuthorizationID == 0 {
+			t.Fatalf("pending records %+v", st.Handoffs)
+		}
+		if hs := r.handoffs(); len(hs) != 1 || hs[0] != base+"-1" {
+			t.Fatalf("handoffs %v", hs)
 		}
 	})
 }

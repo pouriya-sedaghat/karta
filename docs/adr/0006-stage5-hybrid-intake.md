@@ -4,7 +4,7 @@ Status: proposed with the Stage 5 draft PR, 2026-10-03. Builds on
 [ADR 0001](../architecture.md) and ADRs [0003](0003-stage2-publication.md),
 [0004](0004-stage3-online-updates.md) and [0005](0005-stage4-operations.md);
 the brief is [prompts/iran-hybrid-intake.md](../../prompts/iran-hybrid-intake.md).
-It records a stored-data migration (registry schema version 4), additive
+It records stored-data migrations (registry schema versions 4 and 5), additive
 operator API changes, a tightening of manual activation, and two new trust
 boundaries, as ADR 0001 requires before each. The public API is unchanged.
 
@@ -91,15 +91,20 @@ watcher token cannot present its deliveries as deliberate ones.
   names (refused unless it is the publisher's region), and the handoff name
   it will use. At most `KARTA_INTAKE_MAX_OPEN` (default 2) open, unexpired
   authorizations per credential. The same credential repeating the same
-  digest, size and name gets its existing row back (idempotent after a
+  digest, size and name gets its existing open row back (idempotent after a
   crash); a different size or name closes only that credential's own row.
-  It never touches another principal's row.
+  It never touches another principal's row. A handoff name is used once:
+  a name that any authorization (of any credential, open or closed, however
+  old) or intake submission already carries is refused
+  (`handoff_name_taken`, changing nothing), and the intake then tries the
+  next name (counter 1 to 99).
 * `POST /v1/operator/intake/authorizations/{id}/close` closes one of the
   caller's own authorizations; another principal's id is `404`.
 * `GET /v1/operator/intake/authorizations` lists the caller's own
   authorizations with the latest intake submission carrying each handoff
-  name: the narrow read the intake needs to follow its outcomes, nothing
-  else (no audit, no other submissions, no releases).
+  name and recorded after the authorization was created: the narrow read
+  the intake needs to follow its outcomes, nothing else (no audit, no other
+  submissions, no releases).
 
 Refused unless the publisher has the intake feed enabled (`KARTA_INTAKE_DIR`),
 so a deployment that did not opt in accepts no intake authorization. Every
@@ -491,8 +496,22 @@ own rule group.
 
 Existing rows become `channel = operator`; no release database changes. A Stage
 4 publisher refuses a version 4 registry (newer than it supports), the safe
-outcome; a Stage 4 API reads it as before. Restore checks compare against
-schema version 4.
+outcome; a Stage 4 API reads it as before.
+
+## Registry schema version 5 (stored-data migration)
+
+* A unique index on `authorizations.intake_name` (rows with a name, open or
+  closed): a handoff name identifies one authorization for good, so the
+  records' submission-by-name lookup is never ambiguous.
+* Rows that already share a name (possible only on a version 4 registry
+  written by earlier Stage 5 code) cannot be attributed to one handoff: the
+  migration closes all of them (keeping an existing revocation's details),
+  renames all but the first to `<name>~shared-<id>` (no handoff name can
+  carry `~`, so the publisher admits nothing under it and the intake ignores
+  it), and records one `intake_name_deduplicate` audit entry per name.
+
+A publisher of the version 4 code refuses a version 5 registry (newer than it
+supports). Restore checks compare against schema version 5.
 
 ## Operator API changes (additive)
 
@@ -629,6 +648,38 @@ What the implementation settled within the decisions above, for review:
   authorizations holds gets a counter, like one taken by files), and the
   command follows its own authorization id for the outcome (fixed-clock
   unit test).
+* **Third review (owner's finding).** That fix was incomplete: the intake
+  checked names only against files and the records its own credential can
+  list (at most 50, closed ones for a week), while the records attach
+  submissions by name without ownership. Two `intake_submit` credentials
+  could use one name for one digest in one second once the first handoff's
+  files were gone, and the second would then report the first's outcome and
+  remove its own files; the allocator also returned its last candidate
+  (`-99`) without checking it. Now the registry holds the invariant: schema
+  version 5 adds a unique index on `authorizations.intake_name` (open and
+  closed rows), and `AuthorizeIntake` refuses a name that any authorization
+  or intake submission already carries, before it changes anything
+  (`handoff_name_taken`, audited; a concurrent request of another digest
+  with the same prefix meets the index and is refused the same way). The
+  records attach only a submission recorded after the authorization was
+  created. The intake treats `handoff_name_taken` as "try the next name"
+  (the watcher's pending record follows the name), fails with an explicit
+  error instead of returning a taken candidate when all hundred are taken,
+  and moves and writes its handoff files without ever replacing one (link,
+  then unlink; a marker is linked into place), so a file that appears under
+  the chosen name is left alone and the handoff fails. Tests: PostgreSQL
+  (another credential's closed and open name, a refusal that supersedes
+  nothing, a name with a submission, a name outside the 50-record listing
+  and older than a week, the index refusing a row written past the checks,
+  submissions recorded before the authorization, the version 5 upgrade of
+  rows that already share a name, and the channel binding with a submit row
+  naming a watcher handoff, which the index now keeps out of the stack
+  test), unit (every candidate taken through `-99` by files or refusals,
+  a file planted under the chosen name, a taken name not in the listing,
+  for the command and the watcher), and `TestIntake` with two submit
+  credentials delivering the same bytes under a fixed clock
+  (`KARTA_FAILPOINT_CLOCK`, a test facility like `KARTA_FAILPOINTS`) and
+  API requests for another credential's open and closed names.
 * **Evidence.** Tier A only: unit tests with race detection for every new
   package, script tests, promtool rule tests with negative controls, and
   `TestIntake` and `TestBridge` against the Compose stack (fixtures, the

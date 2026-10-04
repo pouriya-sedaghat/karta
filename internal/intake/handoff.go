@@ -33,6 +33,19 @@ const (
 // authorizations: the delivery waits for a free slot.
 var ErrQueueFull = errors.New("the intake credential holds its maximum of open authorizations; the delivery waits")
 
+// ErrNamesExhausted means every handoff name of this region, channel, second
+// and digest is taken: the delivery fails without a handoff and is retried
+// later, under a later second's names.
+var ErrNamesExhausted = errors.New("no free handoff name")
+
+// maxNameSuffix is the highest counter a handoff name carries
+// (registry.ParseHandoffName accepts 1 to 99).
+const maxNameSuffix = 99
+
+// CodeNameTaken is the publisher's refusal of a handoff name already used
+// (publish.CodeIntakeNameTaken): the intake tries the next name.
+const CodeNameTaken = "handoff_name_taken"
+
 // HandoffConfig configures the handoff shared by the watcher and the command.
 type HandoffConfig struct {
 	// Dir is the intake's handoff directory (the publisher's KARTA_INTAKE_DIR).
@@ -205,22 +218,19 @@ func (h *Handoffer) deliver(ctx context.Context, d delivery) (*handedOff, error)
 		return nil, refuse(CodeDigestMismatch, "%s has SHA-256 %s, the expected digest is %s: an incomplete, corrupted or different copy",
 			filepath.Base(d.path), digest, d.expectSHA256)
 	}
-	name := h.newName(cfg.ID, digest, used)
-	_, _, _, hidden, hiddenSide := h.paths(name)
-	discard := func() {
-		for _, p := range []string{tmp, hidden, hiddenSide} {
-			_ = os.Remove(p)
-		}
-	}
-	if err := os.Rename(tmp, hidden); err != nil {
-		discard()
-		return nil, err
-	}
-	_ = safefile.SyncDir(h.cfg.Dir)
 	failpoint.Hit("intake.after_hash")
-	if err := precheck(hidden, cfg, d.sidecarWant != nil); err != nil {
-		discard()
+	if err := precheck(tmp, cfg, d.sidecarWant != nil); err != nil {
+		_ = os.Remove(tmp)
 		return nil, err
+	}
+	// copyAt and sideAt are where this delivery's own files are now; a
+	// failure removes those and nothing else.
+	copyAt, sideAt := tmp, ""
+	discard := func() {
+		_ = os.Remove(copyAt)
+		if sideAt != "" {
+			_ = os.Remove(sideAt)
+		}
 	}
 	if d.sidecarWant != nil {
 		b, err := readSmall(d.sidecarPath, d.sidecarWant, MaxSidecarBytes)
@@ -228,60 +238,93 @@ func (h *Handoffer) deliver(ctx context.Context, d delivery) (*handedOff, error)
 			discard()
 			return nil, err
 		}
-		if err := safefile.WriteAtomic(hiddenSide, b, 0o644); err != nil {
+		sideTmp := filepath.Join(h.cfg.Dir, ".part-"+h.cfg.Letter+"-"+randomHex(8)+".provenance.json")
+		if err := safefile.WriteNew(sideTmp, b, 0o644); err != nil {
 			discard()
 			return nil, storage(err)
 		}
-	}
-	if d.beforeAuthorize != nil {
-		if err := d.beforeAuthorize(name, digest, size); err != nil {
-			discard()
-			return nil, err
-		}
+		sideAt = sideTmp
 	}
 	ttl := h.cfg.TTL
 	if capTTL := time.Duration(list.Limits.MaxTTLSeconds * float64(time.Second)); ttl <= 0 || ttl > capTTL {
 		ttl = capTTL
 	}
-	a, _, err := h.cfg.Client.Authorize(ctx, AuthorizeRequest{SHA256: digest, SizeBytes: size, RegionID: cfg.ID,
-		TTLSeconds: int64(ttl / time.Second), Name: name, Reason: truncateRunes(d.reason, 500)})
-	if err != nil {
-		discard()
+	for {
+		name, err := h.newName(cfg.ID, digest, used)
+		if err != nil {
+			discard()
+			return nil, err
+		}
+		// The copy moves under the name's hidden paths, never over a file
+		// that is there (which would not be this delivery's).
+		_, _, _, hidden, hiddenSide := h.paths(name)
+		if err := safefile.RenameNoReplace(copyAt, hidden); err != nil {
+			discard()
+			return nil, err
+		}
+		copyAt = hidden
+		if sideAt != "" {
+			if err := safefile.RenameNoReplace(sideAt, hiddenSide); err != nil {
+				discard()
+				return nil, err
+			}
+			sideAt = hiddenSide
+		}
+		_ = safefile.SyncDir(h.cfg.Dir)
+		if d.beforeAuthorize != nil {
+			if err := d.beforeAuthorize(name, digest, size); err != nil {
+				discard()
+				return nil, err
+			}
+		}
+		a, _, err := h.cfg.Client.Authorize(ctx, AuthorizeRequest{SHA256: digest, SizeBytes: size, RegionID: cfg.ID,
+			TTLSeconds: int64(ttl / time.Second), Name: name, Reason: truncateRunes(d.reason, 500)})
 		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.Code == "intake_limit_reached" {
-			return nil, ErrQueueFull
+		if errors.As(err, &apiErr) && apiErr.Code == "intake_refused" && apiErr.ReasonCode == CodeNameTaken {
+			// The publisher's registry holds the name (another credential's
+			// handoff, or one of ours outside the records we can list): a
+			// name is never reused, so the next one is tried.
+			h.cfg.Log.Info("handoff name already used; trying the next one", "name", name)
+			used[name] = true
+			continue
 		}
-		if errors.As(err, &apiErr) && apiErr.Code == "intake_refused" && apiErr.ReasonCode != "" {
-			// A final refusal (a revoked digest, another region, a size or
-			// validity out of bounds): not retried at every scan.
-			return nil, refuse(apiErr.ReasonCode, "the publisher refused the authorization: %s", apiErr.Message)
+		if err != nil {
+			discard()
+			if errors.As(err, &apiErr) && apiErr.Code == "intake_limit_reached" {
+				return nil, ErrQueueFull
+			}
+			if errors.As(err, &apiErr) && apiErr.Code == "intake_refused" && apiErr.ReasonCode != "" {
+				// A final refusal (a revoked digest, another region, a size or
+				// validity out of bounds): not retried at every scan.
+				return nil, refuse(apiErr.ReasonCode, "the publisher refused the authorization: %s", apiErr.Message)
+			}
+			return nil, err
 		}
-		return nil, err
+		failpoint.Hit("intake.after_authorize")
+		if err := h.complete(name, digest); err != nil {
+			return nil, err
+		}
+		return &handedOff{Name: name, SHA256: digest, Size: size, AuthorizationID: a.ID, Channel: a.Channel, At: h.now().UTC()}, nil
 	}
-	failpoint.Hit("intake.after_authorize")
-	if err := h.complete(name, digest); err != nil {
-		return nil, err
-	}
-	return &handedOff{Name: name, SHA256: digest, Size: size, AuthorizationID: a.ID, Channel: a.Channel, At: h.now().UTC()}, nil
 }
 
-// complete renames the hidden copy (and sidecar) into place and writes the
-// ready marker last.
+// complete moves the hidden copy (and sidecar) into place and writes the
+// ready marker last, never replacing an existing file (safefile.ErrExists).
 func (h *Handoffer) complete(name, digest string) error {
 	vis, marker, side, hidden, hiddenSide := h.paths(name)
 	if _, err := os.Lstat(hiddenSide); err == nil {
-		if err := os.Rename(hiddenSide, side); err != nil {
+		if err := safefile.RenameNoReplace(hiddenSide, side); err != nil {
 			return err
 		}
 	}
 	if _, err := os.Lstat(hidden); err == nil {
-		if err := os.Rename(hidden, vis); err != nil {
+		if err := safefile.RenameNoReplace(hidden, vis); err != nil {
 			return err
 		}
 	}
 	_ = safefile.SyncDir(h.cfg.Dir)
 	failpoint.Hit("intake.before_marker")
-	if err := safefile.WriteAtomic(marker, []byte(digest+"  "+name+inbox.SnapshotSuffix+"\n"), 0o644); err != nil {
+	if err := safefile.WriteNew(marker, []byte(digest+"  "+name+inbox.SnapshotSuffix+"\n"), 0o644); err != nil {
 		return storage(err)
 	}
 	failpoint.Hit("intake.after_marker")
@@ -344,21 +387,38 @@ func (h *Handoffer) unchanged(d delivery, src *os.File, before os.FileInfo) erro
 }
 
 // newName names a handoff by region, channel letter, time and digest
-// prefix, with a counter when the name is taken: by files in the handoff
-// directory, or by one of the credential's authorizations (used), such as a
-// handoff discarded within the same second. A name is never reused: the
-// publisher's records match a handoff to its submission by name.
-func (h *Handoffer) newName(regionID, digest string, used map[string]bool) string {
+// prefix, with a counter up to maxNameSuffix when the name is taken: by any
+// file of the name in the handoff directory, or in used (the credential's
+// listed authorizations, and names the publisher refused as taken). It fails
+// with ErrNamesExhausted rather than return a taken name. The publisher's
+// registry is what guarantees a name is never reused (it refuses a used
+// name, handoff_name_taken); this only avoids asking for names known to be
+// taken.
+func (h *Handoffer) newName(regionID, digest string, used map[string]bool) (string, error) {
 	base := fmt.Sprintf("%s-%s%s-%s", regionID, h.cfg.Letter, h.now().UTC().Format("20060102T150405Z"), digest[:12])
-	name := base
-	for i := 1; i < 100; i++ {
-		vis, marker, _, hidden, _ := h.paths(name)
-		if !used[name] && !exists(vis) && !exists(marker) && !exists(hidden) {
-			break
+	for i := 0; i <= maxNameSuffix; i++ {
+		name := base
+		if i > 0 {
+			name = fmt.Sprintf("%s-%d", base, i)
 		}
-		name = fmt.Sprintf("%s-%d", base, i)
+		if !used[name] && !h.occupied(name) {
+			return name, nil
+		}
 	}
-	return name
+	return "", fmt.Errorf("%w: %s and %s-1 to -%d are taken by files in the handoff directory or by authorizations", ErrNamesExhausted, base, base,
+		maxNameSuffix)
+}
+
+// occupied reports whether any file of a handoff name exists (or cannot be
+// checked).
+func (h *Handoffer) occupied(name string) bool {
+	vis, marker, side, hidden, hiddenSide := h.paths(name)
+	for _, p := range []string{vis, marker, side, hidden, hiddenSide} {
+		if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+	}
+	return false
 }
 
 // precheck is the advisory check before authorizing: the PBF header must
@@ -548,11 +608,15 @@ func (h *Handoffer) reconcile(ctx context.Context, resume func(Record) bool) (Re
 			sum, n, err := fileDigest(p)
 			ok := err == nil && sum == a.SHA256 && a.SizeBytes != nil && n == *a.SizeBytes && a.Open(now) && resume != nil && resume(rec)
 			if ok {
-				if err := h.complete(name, sum); err != nil {
+				err := h.complete(name, sum)
+				if err == nil {
+					h.cfg.Log.Info("completed a handoff interrupted after its authorization", "name", name, "authorization_id", a.ID)
+					continue
+				}
+				if !errors.Is(err, safefile.ErrExists) {
 					return res, err
 				}
-				h.cfg.Log.Info("completed a handoff interrupted after its authorization", "name", name, "authorization_id", a.ID)
-				continue
+				h.cfg.Log.Warn("an interrupted handoff cannot be completed without replacing a file; discarding it", "name", name, "err", err)
 			}
 			removeAll()
 			closeIt("the handoff was interrupted before its marker and is not resumed")
@@ -567,8 +631,9 @@ func (h *Handoffer) reconcile(ctx context.Context, resume func(Record) bool) (Re
 	return res, nil
 }
 
-// sweep removes crash leftovers: temporary copies (nobody copies while the
-// lock is held) and hidden copies older than the validity cap that no
+// sweep removes crash leftovers: temporary copies and files (nobody copies
+// or writes a marker while the lock is held) and hidden copies older than
+// the validity cap that no
 // authorization of the caller names; and visible handoffs older than twice
 // the cap that no authorization of the caller names, whoever made them (a
 // removed credential's, or one whose command never ran again): every
@@ -588,7 +653,7 @@ func (h *Handoffer) sweep(mine map[string]bool, capTTL time.Duration) {
 		n := e.Name()
 		p := filepath.Join(h.cfg.Dir, n)
 		switch {
-		case strings.HasPrefix(n, ".part-"):
+		case strings.HasPrefix(n, ".part-"), strings.HasPrefix(n, ".tmp-"):
 			_ = os.Remove(p)
 		case strings.HasPrefix(n, ".") && strings.Contains(n, ".hashed"):
 			base := strings.TrimPrefix(n, ".")

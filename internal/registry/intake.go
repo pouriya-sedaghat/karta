@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Errors of intake authorizations.
@@ -21,7 +22,15 @@ var (
 	// ErrIntakeBlocked is a digest an operator revoked: only an operator can
 	// authorize it again.
 	ErrIntakeBlocked = errors.New("an operator revoked this digest; only an operator can authorize it again")
+	// ErrIntakeNameTaken is a handoff name already used, by an authorization
+	// of any credential (open or closed) or by a submission the publisher
+	// recorded: the intake chooses another name.
+	ErrIntakeNameTaken = errors.New("the handoff name is already used; a handoff name is never reused")
 )
+
+// intakeNameIndex is the unique index that makes a handoff name identify one
+// authorization (schema version 5).
+const intakeNameIndex = "authorizations_intake_name_unique"
 
 // intakeLockKey serialises the open-authorization count of one intake
 // credential (transaction scope, with the credential's hash as second key).
@@ -83,7 +92,9 @@ type IntakeRequest struct {
 // the credential's own open row for the digest, if any, is closed first;
 // rows of operators and of other intake credentials are never touched.
 // Expired rows of the credential are closed, and the request is refused
-// with ErrIntakeLimit when the credential already holds MaxOpen open ones.
+// with ErrIntakeLimit when the credential already holds MaxOpen open ones,
+// and with ErrIntakeNameTaken (changing nothing) when its handoff name is
+// already used.
 func AuthorizeIntake(ctx context.Context, db TxBeginner, r IntakeRequest) (*Authorization, bool, error) {
 	if r.Channel != ChannelIntakeWatch && r.Channel != ChannelIntakeSubmit {
 		return nil, false, fmt.Errorf("channel %q is not an intake channel", r.Channel)
@@ -102,7 +113,7 @@ func AuthorizeIntake(ctx context.Context, db TxBeginner, r IntakeRequest) (*Auth
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2))`, intakeLockKey, r.CreatedBy); err != nil {
 		return nil, false, err
 	}
-	audit := func(outcome, why string, detail map[string]any) error {
+	entry := func(outcome, why string, detail map[string]any) AuditEntry {
 		if detail == nil {
 			detail = map[string]any{}
 		}
@@ -111,8 +122,11 @@ func AuthorizeIntake(ctx context.Context, db TxBeginner, r IntakeRequest) (*Auth
 		if why != "" {
 			detail["refused"] = why
 		}
-		return Audit(ctx, tx, AuditEntry{Actor: r.CreatedBy, Source: "operator_api", Action: "intake_authorize", Target: r.SHA256,
-			Outcome: outcome, Reason: r.Reason, RequestID: r.RequestID, Detail: detail})
+		return AuditEntry{Actor: r.CreatedBy, Source: "operator_api", Action: "intake_authorize", Target: r.SHA256,
+			Outcome: outcome, Reason: r.Reason, RequestID: r.RequestID, Detail: detail}
+	}
+	audit := func(outcome, why string, detail map[string]any) error {
+		return Audit(ctx, tx, entry(outcome, why, detail))
 	}
 	var blockedBy string
 	switch err := tx.QueryRow(ctx, `SELECT blocked_by FROM registry.intake_blocks WHERE region_id = $1 AND sha256 = $2`,
@@ -141,19 +155,44 @@ WHERE created_by = $1 AND channel <> 'operator' AND revoked_at IS NULL AND expir
 WHERE region_id = $1 AND sha256 = $2 AND created_by = $3 AND channel <> 'operator' AND revoked_at IS NULL FOR UPDATE`,
 		r.RegionID, r.SHA256, r.CreatedBy))
 	switch {
-	case err == nil && existing.Channel == r.Channel && existing.SizeBytes != nil && *existing.SizeBytes == r.SizeBytes &&
+	case errors.Is(err, pgx.ErrNoRows):
+		existing = nil
+	case err != nil:
+		return nil, false, err
+	case existing.Channel == r.Channel && existing.SizeBytes != nil && *existing.SizeBytes == r.SizeBytes &&
 		existing.IntakeName != nil && *existing.IntakeName == r.Name:
 		if err := audit(OutcomeNoop, "", map[string]any{"authorization_id": existing.ID}); err != nil {
 			return nil, false, err
 		}
 		return existing, false, tx.Commit(ctx)
-	case err == nil:
+	}
+	// A handoff name identifies one handoff for good: refused if any
+	// authorization (of any credential, open or closed) or any intake
+	// submission already carries it, so no record can show another
+	// handoff's outcome. The unique index is the invariant; this check
+	// refuses before anything changes and gives the refusal an audit
+	// record.
+	var nameUsed string
+	if err := tx.QueryRow(ctx, `SELECT CASE
+    WHEN EXISTS (SELECT 1 FROM registry.authorizations WHERE intake_name = $1) THEN 'authorization'
+    WHEN EXISTS (SELECT 1 FROM registry.submissions WHERE source = 'intake' AND name = $1) THEN 'submission'
+    ELSE '' END`, r.Name).Scan(&nameUsed); err != nil {
+		return nil, false, err
+	}
+	if nameUsed != "" {
+		if err := audit(OutcomeRejected, "the handoff name is already used by an earlier "+nameUsed, nil); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, err
+		}
+		return nil, false, fmt.Errorf("%w (%s)", ErrIntakeNameTaken, r.Name)
+	}
+	if existing != nil {
 		if _, err := tx.Exec(ctx, `UPDATE registry.authorizations SET revoked_at = now(), revoked_by = $2, revoke_reason = 'superseded'
 WHERE id = $1`, existing.ID, r.CreatedBy); err != nil {
 			return nil, false, err
 		}
-	case !errors.Is(err, pgx.ErrNoRows):
-		return nil, false, err
 	}
 	var open int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM registry.authorizations
@@ -176,6 +215,18 @@ WHERE created_by = $1 AND channel <> 'operator' AND revoked_at IS NULL`, r.Creat
 INSERT INTO registry.authorizations (region_id, sha256, size_bytes, reason, created_by, expires_at, channel, intake_name)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING `+authColumns,
 		r.RegionID, r.SHA256, r.SizeBytes, truncate(r.Reason, 2000), r.CreatedBy, r.ExpiresAt, r.Channel, r.Name))
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == intakeNameIndex {
+		// A concurrent request for another digest with the same 12-digit
+		// prefix (so the same name) holds another digest lock: the index
+		// refuses the later one. The transaction is aborted, so the
+		// refusal is recorded outside it.
+		_ = tx.Rollback(ctx)
+		if err := Audit(ctx, db, entry(OutcomeRejected, "the handoff name was taken by a concurrent authorization", nil)); err != nil {
+			return nil, false, err
+		}
+		return nil, false, fmt.Errorf("%w (%s)", ErrIntakeNameTaken, r.Name)
+	}
 	if err != nil {
 		return nil, false, err
 	}
@@ -233,8 +284,10 @@ type IntakeRecord struct {
 
 // ListIntakeAuthorizations returns a credential's own intake authorizations:
 // the open ones and those closed in the last week, newest first, each with
-// the latest intake submission of its handoff name (nil if the publisher has
-// not seen it yet).
+// the latest intake submission of its handoff name recorded after the
+// authorization was created (nil if the publisher has not seen the handoff
+// yet). A name is never reused (schema version 5), and a submission recorded
+// before the authorization existed is never its handoff's.
 func ListIntakeAuthorizations(ctx context.Context, q Querier, region, createdBy string, limit int) ([]IntakeRecord, error) {
 	rows, err := q.Query(ctx, `SELECT `+authColumns+` FROM registry.authorizations
 WHERE region_id = $1 AND created_by = $2 AND channel <> 'operator'
@@ -262,7 +315,7 @@ ORDER BY (revoked_at IS NULL) DESC, id DESC LIMIT $3`, region, createdBy, limit)
 			continue
 		}
 		s, err := scanSubmission(q.QueryRow(ctx, `SELECT `+submissionColumns+` FROM registry.submissions
-WHERE source = 'intake' AND name = $1 ORDER BY id DESC LIMIT 1`, *name))
+WHERE source = 'intake' AND name = $1 AND created_at >= $2 ORDER BY id DESC LIMIT 1`, *name, out[i].Authorization.CreatedAt))
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 		case err != nil:

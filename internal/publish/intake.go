@@ -56,6 +56,10 @@ const (
 	// CodeIntakeName is a handoff name that is not one of the caller's
 	// channel, the publisher's region and the requested digest.
 	CodeIntakeName = "handoff_name_mismatch"
+	// CodeIntakeNameTaken is a handoff name already used by an earlier
+	// authorization (of any credential, open or closed) or submission: the
+	// intake retries under another name.
+	CodeIntakeNameTaken = "handoff_name_taken"
 )
 
 func (s *Service) intakeEnabled() bool { return s.cfg.IntakeDir != "" }
@@ -131,9 +135,13 @@ func (s *Service) IntakeAuthorize(ctx context.Context, p Principal, channel stri
 	a, created, err := registry.AuthorizeIntake(ctx, s.reg, registry.IntakeRequest{RegionID: cfg.ID, SHA256: r.SHA256, SizeBytes: r.SizeBytes,
 		ExpiresAt: s.now().Add(r.TTL), Channel: channel, Name: r.Name, CreatedBy: p.Name, Reason: r.Reason, RequestID: p.RequestID,
 		MaxOpen: s.cfg.IntakeMaxOpen})
-	if errors.Is(err, registry.ErrIntakeBlocked) {
+	switch {
+	case errors.Is(err, registry.ErrIntakeBlocked):
 		// Audited by the registry; reported as a bounded refusal.
 		return nil, false, &IntakeRefusal{Code: CodeIntakeRevoked, Msg: err.Error()}
+	case errors.Is(err, registry.ErrIntakeNameTaken):
+		// Audited by the registry. The message does not say who holds it.
+		return nil, false, &IntakeRefusal{Code: CodeIntakeNameTaken, Msg: err.Error()}
 	}
 	return a, created, err
 }

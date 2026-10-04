@@ -116,6 +116,9 @@ func logFailpoints(log *slog.Logger) {
 		log.Warn("FAULT INJECTION ENABLED (KARTA_FAILPOINTS): this process exits at these points; never use in a deployment",
 			"failpoints", on, "unknown", unknown)
 	}
+	if v := os.Getenv(failpoint.ClockVariable); v != "" {
+		log.Warn("FIXED CLOCK ENABLED ("+failpoint.ClockVariable+"): handoff names use this time; never use in a deployment", "clock", v)
+	}
 }
 
 func serve() int {

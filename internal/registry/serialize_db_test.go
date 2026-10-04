@@ -19,6 +19,16 @@ import (
 
 func scratchRegistry(t *testing.T) (*pgxpool.Pool, *pgx.Conn, string) {
 	t.Helper()
+	pool, admin, name := scratchDB(t)
+	if err := Migrate(context.Background(), pool); err != nil {
+		t.Fatal(err)
+	}
+	return pool, admin, name
+}
+
+// scratchDB is an empty scratch database, dropped afterwards.
+func scratchDB(t *testing.T) (*pgxpool.Pool, *pgx.Conn, string) {
+	t.Helper()
 	dsn := os.Getenv("KARTA_TEST_PG_DSN")
 	if dsn == "" {
 		t.Skip("KARTA_TEST_PG_DSN is not set (make test-integration sets it): these tests need PostgreSQL")
@@ -46,9 +56,6 @@ func scratchRegistry(t *testing.T) (*pgxpool.Pool, *pgx.Conn, string) {
 		_, _ = admin.Exec(context.Background(), "DROP DATABASE "+name+" WITH (FORCE)")
 		_ = admin.Close(context.Background())
 	})
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
 	return pool, admin, name
 }
 

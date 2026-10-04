@@ -1,7 +1,8 @@
 // Package safefile holds the small file-handling rules the Stage 5 intake
 // and bridge processes share: reading bounded regular files without
 // following symlinks or blocking on FIFOs, durable atomic replacement
-// (temporary file, fsync, rename, directory fsync) and strict JSON
+// (temporary file, fsync, rename, directory fsync), moves and writes that
+// never replace an existing file, and strict JSON
 // decoding (no unknown fields, no repeated keys, nothing after the value).
 package safefile
 
@@ -68,28 +69,8 @@ func SyncDir(dir string) error {
 // directory is synced. A reader sees the old or the new content, never a
 // part.
 func WriteAtomic(path string, b []byte, mode os.FileMode) error {
-	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
-	_ = os.Remove(tmp)
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, mode) // #nosec G304 -- the caller's own directory
+	tmp, err := writeTemp(path, b, mode)
 	if err != nil {
-		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Chmod(tmp, mode); err != nil { // independent of the umask
-		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -97,6 +78,78 @@ func WriteAtomic(path string, b []byte, mode os.FileMode) error {
 		return err
 	}
 	return SyncDir(filepath.Dir(path))
+}
+
+// ErrExists is a destination that already exists: RenameNoReplace and
+// WriteNew never replace a file.
+var ErrExists = errors.New("the destination already exists")
+
+// WriteNew durably writes b to path like WriteAtomic, but path must not exist
+// yet (ErrExists): the temporary file is linked into place, never renamed
+// over an existing one.
+func WriteNew(path string, b []byte, mode os.FileMode) error {
+	tmp, err := writeTemp(path, b, mode)
+	if err != nil {
+		return err
+	}
+	if err := os.Link(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%s: %w", path, ErrExists)
+		}
+		return err
+	}
+	if err := os.Remove(tmp); err != nil {
+		return err
+	}
+	return SyncDir(filepath.Dir(path))
+}
+
+// RenameNoReplace moves src to dst in the same filesystem and fails with
+// ErrExists if dst exists: dst is linked to src, then src is removed, so an
+// existing dst is never replaced. A crash between the two leaves both names
+// on one file; a repeat finds that dst is src and only removes src.
+func RenameNoReplace(src, dst string) error {
+	if err := os.Link(src, dst); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		a, aerr := os.Lstat(src)
+		b, berr := os.Lstat(dst)
+		if aerr != nil || berr != nil || !os.SameFile(a, b) {
+			return fmt.Errorf("%s: %w", dst, ErrExists)
+		}
+	}
+	return os.Remove(src)
+}
+
+// writeTemp writes b to a synced temporary file next to path, with mode.
+func writeTemp(path string, b []byte, mode os.FileMode) (string, error) {
+	tmp := filepath.Join(filepath.Dir(path), ".tmp-"+filepath.Base(path))
+	_ = os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, mode) // #nosec G304 -- the caller's own directory
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Chmod(tmp, mode); err != nil { // independent of the umask
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return tmp, nil
 }
 
 // MaxJSONDepth bounds the nesting of strictly decoded documents.

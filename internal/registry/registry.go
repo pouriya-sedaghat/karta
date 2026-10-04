@@ -280,14 +280,48 @@ CREATE TABLE registry.intake_blocks (
     PRIMARY KEY (region_id, sha256)
 );
 `,
+	5: `
+-- Stage 5: an intake handoff name identifies one handoff for good. The
+-- intake's records find a handoff's submission by its name, so a name is
+-- never reused, by any credential, whether its authorization is open or
+-- closed. Rows that already share a name (written before this rule) cannot
+-- be attributed to one handoff: all of them are closed, and all but the
+-- first are renamed to a name no handoff can carry, so the publisher admits
+-- nothing under them and the intake ignores them.
+WITH shared AS (
+    SELECT id, intake_name, row_number() OVER (PARTITION BY intake_name ORDER BY id) AS n
+    FROM registry.authorizations
+    WHERE intake_name IN (SELECT intake_name FROM registry.authorizations WHERE intake_name IS NOT NULL
+                          GROUP BY intake_name HAVING count(*) > 1)
+), closed AS (
+    UPDATE registry.authorizations a
+    SET revoked_at = COALESCE(a.revoked_at, now()), revoked_by = COALESCE(a.revoked_by, 'registry migration 5'),
+        revoke_reason = COALESCE(a.revoke_reason, 'handoff name shared with another authorization'),
+        intake_name = CASE WHEN shared.n = 1 THEN a.intake_name ELSE a.intake_name || '~shared-' || a.id END
+    FROM shared WHERE a.id = shared.id
+    RETURNING a.id, shared.intake_name
+)
+INSERT INTO registry.audit (actor, source, action, target, outcome, reason, detail)
+SELECT 'registry migration 5', 'system', 'intake_name_deduplicate', intake_name, 'succeeded',
+    'authorizations sharing a handoff name were closed; all but the first were renamed',
+    jsonb_build_object('authorization_ids', jsonb_agg(id ORDER BY id))
+FROM closed GROUP BY intake_name;
+CREATE UNIQUE INDEX authorizations_intake_name_unique ON registry.authorizations (intake_name) WHERE intake_name IS NOT NULL;
+`,
 }
 
 // SchemaVersion is the registry schema this build writes.
-const SchemaVersion = 4
+const SchemaVersion = 5
 
 // Migrate brings the registry schema to SchemaVersion (idempotent; safe to
 // run concurrently from several processes).
 func Migrate(ctx context.Context, db TxBeginner) error {
+	return migrateTo(ctx, db, SchemaVersion)
+}
+
+// migrateTo applies the migrations up to version target (tests stop at an
+// older version to check an upgrade).
+func migrateTo(ctx context.Context, db TxBeginner, target int) error {
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return err
@@ -311,7 +345,7 @@ CREATE TABLE IF NOT EXISTS registry.schema_migrations (
 	if current > SchemaVersion {
 		return fmt.Errorf("registry schema version %d is newer than this build supports (%d)", current, SchemaVersion)
 	}
-	for v := current + 1; v <= SchemaVersion; v++ {
+	for v := current + 1; v <= target; v++ {
 		if _, err := tx.Exec(ctx, migrations[v]); err != nil {
 			return fmt.Errorf("registry migration %d: %w", v, err)
 		}
