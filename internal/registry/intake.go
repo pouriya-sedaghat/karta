@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -25,6 +26,38 @@ var (
 // intakeLockKey serialises the open-authorization count of one intake
 // credential (transaction scope, with the credential's hash as second key).
 const intakeLockKey int32 = 0x6b617269 // "kari"
+
+// afterIntakeBlockCheck, when set (tests only), runs inside AuthorizeIntake
+// after the block check passed and before the row is written: a concurrency
+// test holds the transaction there.
+var afterIntakeBlockCheck func()
+
+// handoffNamePattern is an intake handoff name:
+// <region>-<w|c><UTC time>-<first 12 hex digits of the SHA-256>[-<n>]; the
+// letter says which intake channel wrote it (internal/intake, newName).
+var handoffNamePattern = regexp.MustCompile(`^([a-z0-9][a-z0-9-]{0,62})-([wc])([0-9]{8}T[0-9]{6}Z)-([0-9a-f]{12})(?:-([1-9][0-9]?))?$`)
+
+// HandoffName is a parsed intake handoff name.
+type HandoffName struct {
+	RegionID string
+	// Channel is ChannelIntakeWatch ("w") or ChannelIntakeSubmit ("c").
+	Channel      string
+	DigestPrefix string
+}
+
+// ParseHandoffName parses an intake handoff name; ok is false for any name
+// the intake does not produce.
+func ParseHandoffName(name string) (HandoffName, bool) {
+	m := handoffNamePattern.FindStringSubmatch(name)
+	if m == nil {
+		return HandoffName{}, false
+	}
+	ch := ChannelIntakeWatch
+	if m[2] == "c" {
+		ch = ChannelIntakeSubmit
+	}
+	return HandoffName{RegionID: m[1], Channel: ch, DigestPrefix: m[4]}, true
+}
 
 // IntakeRequest is a local intake credential's request for an
 // authorization. The channel comes from the credential's scope, never from
@@ -60,6 +93,12 @@ func AuthorizeIntake(ctx context.Context, db TxBeginner, r IntakeRequest) (*Auth
 		return nil, false, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	// The digest lock first (serialized with operator authorize and revoke
+	// of the digest), then the credential's (its open-row count). Nothing
+	// takes them in the other order.
+	if err := lockDigest(ctx, tx, r.RegionID, r.SHA256); err != nil {
+		return nil, false, err
+	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2))`, intakeLockKey, r.CreatedBy); err != nil {
 		return nil, false, err
 	}
@@ -89,6 +128,9 @@ func AuthorizeIntake(ctx context.Context, db TxBeginner, r IntakeRequest) (*Auth
 		return nil, false, fmt.Errorf("%w (%s)", ErrIntakeBlocked, why)
 	case !errors.Is(err, pgx.ErrNoRows):
 		return nil, false, err
+	}
+	if afterIntakeBlockCheck != nil {
+		afterIntakeBlockCheck()
 	}
 	// Expired rows of this credential are closed; they authorize nothing.
 	if _, err := tx.Exec(ctx, `UPDATE registry.authorizations SET revoked_at = now(), revoked_by = $1, revoke_reason = 'expired'

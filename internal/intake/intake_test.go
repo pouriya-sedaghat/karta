@@ -22,6 +22,7 @@ import (
 
 	"github.com/pouriya-sedaghat/karta/internal/inbox"
 	"github.com/pouriya-sedaghat/karta/internal/pbfwrite"
+	"github.com/pouriya-sedaghat/karta/internal/registry"
 )
 
 const testToken = "4444444444444444444444444444444444444444444444444444444444444444"
@@ -928,5 +929,27 @@ func TestReconcileSweepsStaleHandoffs(t *testing.T) {
 	left := strings.Join(dirNames(t, r.handoff), " ")
 	if strings.Contains(left, "0123456789ab") || !strings.Contains(left, "ba9876543210.osm.pbf.ready") {
 		t.Fatalf("handoff directory after the sweep: %s", left)
+	}
+}
+
+// The handoff names the intake writes are the ones the publisher parses to
+// bind an authorization to its channel: w for the watcher, c for the command.
+func TestHandoffNamesCarryTheirChannel(t *testing.T) {
+	digest := strings.Repeat("0a", 32)
+	for letter, channel := range map[string]string{LetterWatch: registry.ChannelIntakeWatch, LetterSubmit: registry.ChannelIntakeSubmit} {
+		h := &Handoffer{cfg: HandoffConfig{Dir: t.TempDir(), Letter: letter}, now: time.Now}
+		for _, region := range []string{"iran", "tehran-chitgar"} {
+			name := h.newName(region, digest)
+			p, ok := registry.ParseHandoffName(name)
+			if !ok || p.RegionID != region || p.Channel != channel || p.DigestPrefix != digest[:12] {
+				t.Errorf("%s: parsed %+v %v", name, p, ok)
+			}
+		}
+	}
+	for _, bad := range []string{"manual-check", "iran-x20261004T000000Z-0a0a0a0a0a0a", "iran-w20261004T000000Z-0A0A0A0A0A0A",
+		"iran-w20261004T000000Z-0a0a0a0a0a", "-w20261004T000000Z-0a0a0a0a0a0a", "iran-w2026-10-04-0a0a0a0a0a0a"} {
+		if p, ok := registry.ParseHandoffName(bad); ok {
+			t.Errorf("%q parsed as %+v", bad, p)
+		}
 	}
 }

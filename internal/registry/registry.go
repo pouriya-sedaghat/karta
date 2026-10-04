@@ -973,6 +973,9 @@ func Authorize(ctx context.Context, db TxBeginner, a Authorization, requestID st
 		return nil, false, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := lockDigest(ctx, tx, a.RegionID, a.SHA256); err != nil {
+		return nil, false, err
+	}
 	existing, err := scanAuth(tx.QueryRow(ctx, `SELECT `+authColumns+` FROM registry.authorizations
 WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL AND channel = 'operator' FOR UPDATE`, a.RegionID, a.SHA256))
 	switch {
@@ -1029,6 +1032,12 @@ func Revoke(ctx context.Context, db TxBeginner, region, digest, actor, reason, r
 		return false, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	// Serialized with intake authorizations of the digest: one that already
+	// checked for a block commits its row before this UPDATE runs (and is
+	// closed by it), any other one waits and then sees the block.
+	if err := lockDigest(ctx, tx, region, digest); err != nil {
+		return false, err
+	}
 	rows, err := tx.Query(ctx, `UPDATE registry.authorizations SET revoked_at = now(), revoked_by = $3, revoke_reason = $4
 WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL RETURNING id, channel`, region, digest, actor, reason)
 	if err != nil {
@@ -1073,15 +1082,31 @@ ON CONFLICT (region_id, sha256) DO UPDATE SET blocked_at = now(), blocked_by = E
 // the watcher's activation pause.
 const authPrecedence = `CASE channel WHEN 'operator' THEN 0 WHEN 'intake_submit' THEN 1 ELSE 2 END, id DESC`
 
+// digestLockKey serializes, per region and digest, every change that decides
+// whether the digest is authorized: an operator's authorize and revoke and an
+// intake authorization (transaction-scoped advisory lock, the region and
+// digest hashed into the second key; a collision only serializes more).
+const digestLockKey int32 = 0x6b617264 // "kard"
+
+func lockDigest(ctx context.Context, tx pgx.Tx, region, digest string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2))`, digestLockKey, region+"/"+digest)
+	return err
+}
+
 // AuthScope selects the authorizations that may admit a submission. An
 // operator's authorization admits its digest through every feed; an intake
-// authorization admits only the intake handoff it was created for, never the
-// same bytes dropped into the inbox, given to `karta import` or delivered
-// online.
+// authorization admits only the intake handoff it was created for, by its
+// name and its channel, never the same bytes dropped into the inbox, given to
+// `karta import` or delivered online, and never a handoff of the other
+// intake channel.
 type AuthScope struct {
 	// IntakeName is the handoff name of a submission from the intake feed,
 	// "" for every other feed (operator authorizations only).
 	IntakeName string
+	// IntakeChannel is the channel the handoff's name says wrote it
+	// (ChannelIntakeWatch or ChannelIntakeSubmit); an intake authorization
+	// of another channel does not admit it.
+	IntakeChannel string
 	// Lock takes a share lock on the row found, inside an activation
 	// transaction: a revoke that commits first is seen, one that waits
 	// commits after the switch.
@@ -1089,9 +1114,9 @@ type AuthScope struct {
 }
 
 // scopeClause restricts a query to the rows of an AuthScope whose
-// IntakeName is parameter n.
+// IntakeName is parameter n and IntakeChannel parameter n+1.
 func scopeClause(n int) string {
-	return fmt.Sprintf(`(channel = 'operator' OR ($%d <> '' AND channel <> 'operator' AND intake_name = $%d))`, n, n)
+	return fmt.Sprintf(`(channel = 'operator' OR ($%d <> '' AND channel = $%d AND channel <> 'operator' AND intake_name = $%d))`, n, n+1, n)
 }
 
 // Authorized returns an open, unexpired authorization in scope that covers
@@ -1105,7 +1130,8 @@ func Authorized(ctx context.Context, q Querier, region, digest string, size int6
 	}
 	a, err := scanAuth(q.QueryRow(ctx, `SELECT `+authColumns+` FROM registry.authorizations
 WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())
-  AND (size_bytes IS NULL OR size_bytes = $3) AND `+scopeClause(4)+` ORDER BY `+authPrecedence+` LIMIT 1`+lock, region, digest, size, scope.IntakeName))
+  AND (size_bytes IS NULL OR size_bytes = $3) AND `+scopeClause(4)+` ORDER BY `+authPrecedence+` LIMIT 1`+lock, region, digest, size,
+		scope.IntakeName, scope.IntakeChannel))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -1121,7 +1147,7 @@ WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL AND (expires_at IS N
 // digest is not authorized (revoked, expired) when Authorized finds nothing.
 func LatestAuthorization(ctx context.Context, q Querier, region, digest string, scope AuthScope) (*Authorization, error) {
 	a, err := scanAuth(q.QueryRow(ctx, `SELECT `+authColumns+` FROM registry.authorizations
-WHERE region_id = $1 AND sha256 = $2 AND `+scopeClause(3)+` ORDER BY id DESC LIMIT 1`, region, digest, scope.IntakeName))
+WHERE region_id = $1 AND sha256 = $2 AND `+scopeClause(3)+` ORDER BY id DESC LIMIT 1`, region, digest, scope.IntakeName, scope.IntakeChannel))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}

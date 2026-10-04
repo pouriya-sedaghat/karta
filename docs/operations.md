@@ -543,7 +543,8 @@ signed.
 
 The signer has not written its state for 30 minutes: stopped, failing
 closed at start (a lost or older state, a missing key, a clock behind its
-last signature) or stuck. Its logs name the reason. For a state problem
+last signature, a published manifest it cannot verify as its own or that
+conflicts with its persisted envelope) or stuck. Its logs name the reason. For a state problem
 follow the runbook ("The bridge signer refuses to start").
 
 #### KartaBridgeSignerFailing

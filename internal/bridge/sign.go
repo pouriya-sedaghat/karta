@@ -33,6 +33,12 @@ const (
 	CodeAssetMissing    = "asset_missing"
 	CodeNoAcquisition   = "acquisition_record_missing"
 	CodeNoHeaderBox     = "no_header_box"
+	// CodePublishedUntrusted is a published manifest that does not verify
+	// with the signer's own keys and region: it is not adopted (fail closed).
+	CodePublishedUntrusted = "published_manifest_untrusted"
+	// CodeEnvelopeConflict is a published manifest with the serial of the
+	// signer's persisted envelope but other bytes (fail closed).
+	CodeEnvelopeConflict = "published_envelope_conflict"
 )
 
 // Published file names (what serve serves).
@@ -120,9 +126,13 @@ func NewSigner(cfg SignConfig, log *slog.Logger, raise *Raise) (*Signer, error) 
 	if err != nil {
 		return nil, fmt.Errorf("%w: the signer state exists but cannot be read (%v); restore it, then if needed raise the high-water serial", ErrFailClosed, err)
 	}
-	published, err := s.publishedSerial()
+	pubRaw, pub, err := s.readPublished()
 	if err != nil {
-		return nil, fmt.Errorf("%w: the published manifest cannot be read: %v", ErrFailClosed, err)
+		return nil, err
+	}
+	published := int64(0)
+	if pub != nil {
+		published = pub.Serial
 	}
 	if st != nil {
 		s.state = *st
@@ -152,7 +162,7 @@ func NewSigner(cfg SignConfig, log *slog.Logger, raise *Raise) (*Signer, error) 
 		return nil, err
 	}
 	_, _ = inbox.CleanStaging(filepath.Join(cfg.Publish, stagingDirName), nil)
-	if err := s.reconcilePublished(); err != nil {
+	if err := s.reconcilePublished(pubRaw, pub); err != nil {
 		return nil, err
 	}
 	if err := s.save(); err != nil {
@@ -172,44 +182,67 @@ func (s *Signer) Close() error {
 	return err
 }
 
-// reconcilePublished makes the current manifest agree with the published
-// one. An envelope persisted but not yet published (a crash or a failed
-// write in between) is published as it is, but only if it is newer than
-// what is published: an older state's pending envelope (a restored backup,
-// after a raise) never replaces a newer manifest. When the published
-// manifest is newer than the state knows, it becomes the current one (the
-// publish volume is written only by the signer), so renewal and the
-// not-newer rule work from what Karta can actually see.
-func (s *Signer) reconcilePublished() error {
+// readPublished reads the published manifest (nil if there is none) and
+// verifies it as one of the signer's own: a valid signature by one of its
+// keys (none claiming one of them without verifying) and bound to its region
+// (id and box). Anything else fails closed: the signer never takes a serial,
+// a snapshot or an envelope from a publication it cannot prove it made.
+func (s *Signer) readPublished() ([]byte, *online.Manifest, error) {
 	raw, err := safefile.ReadRegular(filepath.Join(s.cfg.Publish, ManifestFile), online.MaxEnvelopeBytes)
-	var pub *online.Manifest
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
-		return fmt.Errorf("%w: the published manifest cannot be read: %v", ErrFailClosed, err)
-	default:
-		if pub, err = online.ParseUnverified(raw); err != nil {
-			return fmt.Errorf("%w: the published manifest cannot be parsed: %v", ErrFailClosed, err)
-		}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil, nil
 	}
-	published := int64(0)
-	if pub != nil {
-		published = pub.Serial
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: the published manifest cannot be read: %v", ErrFailClosed, err)
 	}
+	cfg, err := region.Load(s.cfg.RegionPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: the region file cannot be read to check the published manifest: %v", ErrFailClosed, err)
+	}
+	m, _, err := online.VerifySignedBy(raw, s.PublicKeys(), cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w (%s): the published manifest is not a valid publication of this signer (keys %v, region %q): %v; "+
+			"find out who wrote it, then restore the signer's own manifest or remove it (docs/runbook.md)", ErrFailClosed, CodePublishedUntrusted,
+			s.keyIDs(), cfg.ID, err)
+	}
+	return raw, m, nil
+}
+
+func (s *Signer) keyIDs() []string {
+	ids := make([]string, 0, len(s.keys))
+	for _, k := range s.keys {
+		ids = append(ids, k.KeyID)
+	}
+	return ids
+}
+
+// reconcilePublished makes the current manifest agree with the verified
+// published one (pub, nil if none). An envelope persisted but not yet
+// published (a crash or a failed write in between) is published as it is,
+// but only if it is newer than what is published: an older state's pending
+// envelope (a restored backup, after a raise) never replaces a newer
+// manifest. A published manifest with the persisted envelope's serial but
+// other bytes fails closed. A published manifest newer than the state knows
+// becomes the current one, so renewal and the not-newer rule work from what
+// Karta can actually see.
+func (s *Signer) reconcilePublished(raw []byte, pub *online.Manifest) error {
 	c := s.state.Current
 	switch {
-	case c != nil && c.Serial > published:
-		if s.now().Before(c.ExpiresAt) && (!c.Promoted || string(raw) != c.Envelope) {
+	case pub == nil || (c != nil && c.Serial > pub.Serial):
+		if c != nil && s.now().Before(c.ExpiresAt) && (!c.Promoted || string(raw) != c.Envelope) {
 			if err := s.promote(); err != nil {
 				return err
 			}
 			s.log.Info("published the current manifest, which was not published", "serial", c.Serial)
 		}
-	case c != nil && c.Serial == published && string(raw) == c.Envelope:
-		if !c.Promoted {
-			c.Promoted = true
+	case c != nil && c.Serial == pub.Serial:
+		if string(raw) != c.Envelope {
+			return fmt.Errorf("%w (%s): the published manifest has serial %d, the serial of the envelope this signer persisted, but other "+
+				"bytes (published SHA-256 %s, persisted %s): a serial is never bound to two envelopes; find out how it was written",
+				ErrFailClosed, CodeEnvelopeConflict, pub.Serial, safefile.SHA256Hex(raw), c.EnvelopeSHA256)
 		}
-	case pub != nil:
+		c.Promoted = true
+	default:
 		prev := int64(0)
 		if c != nil {
 			prev = c.Serial
@@ -217,13 +250,16 @@ func (s *Signer) reconcilePublished() error {
 		var ids []string
 		var env online.Envelope
 		if json.Unmarshal(raw, &env) == nil {
+			own := s.PublicKeys()
 			for _, sig := range env.Signatures {
-				ids = append(ids, sig.KeyID)
+				if _, ok := own[sig.KeyID]; ok {
+					ids = append(ids, sig.KeyID)
+				}
 			}
 		}
 		s.state.Current = &Signed{Serial: pub.Serial, SHA256: pub.Snapshot.SHA256, SizeBytes: pub.Snapshot.SizeBytes,
 			DataTimestamp: pub.Snapshot.DataTimestamp, IssuedAt: pub.IssuedAt, ExpiresAt: pub.ExpiresAt, EnvelopeSHA256: safefile.SHA256Hex(raw),
-			KeyIDs: ids, Envelope: string(raw), Promoted: true, Reason: "adopted: the published manifest is newer than the state"}
+			KeyIDs: ids, Envelope: string(raw), Promoted: true, Reason: "adopted: the published manifest (verified) is newer than the state"}
 		found := false
 		for i := range s.state.Assets {
 			if s.state.Assets[i].SHA256 == pub.Snapshot.SHA256 {
@@ -236,8 +272,8 @@ func (s *Signer) reconcilePublished() error {
 		if !found {
 			s.state.Assets = append(s.state.Assets, AssetRef{SHA256: pub.Snapshot.SHA256, ExpiresAt: pub.ExpiresAt})
 		}
-		s.log.Warn("adopted the published manifest as the current one (the state knew only an older one)", "published_serial", pub.Serial,
-			"state_serial", prev, "high_water", s.state.HighWater)
+		s.log.Warn("adopted the verified published manifest as the current one (the state knew only an older one)", "published_serial",
+			pub.Serial, "state_serial", prev, "high_water", s.state.HighWater)
 	}
 	return nil
 }
@@ -250,12 +286,12 @@ func (s *Signer) publishPending() error {
 	if c == nil || c.Promoted || !s.now().Before(c.ExpiresAt) {
 		return nil
 	}
-	published, err := s.publishedSerial()
+	raw, pub, err := s.readPublished()
 	if err != nil {
 		return err
 	}
-	if c.Serial <= published {
-		return s.reconcilePublished()
+	if pub != nil && c.Serial <= pub.Serial {
+		return s.reconcilePublished(raw, pub)
 	}
 	if err := s.promote(); err != nil {
 		return err
@@ -266,21 +302,6 @@ func (s *Signer) publishPending() error {
 
 // State returns a copy of the signer state.
 func (s *Signer) State() SignerState { return s.state }
-
-func (s *Signer) publishedSerial() (int64, error) {
-	b, err := safefile.ReadRegular(filepath.Join(s.cfg.Publish, ManifestFile), online.MaxEnvelopeBytes)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	m, err := online.ParseUnverified(b)
-	if err != nil {
-		return 0, err
-	}
-	return m.Serial, nil
-}
 
 func (s *Signer) clockCheck() error {
 	if c := s.state.Current; c != nil && s.now().Add(s.cfg.MaxFutureSkew).Before(c.IssuedAt) {
@@ -347,6 +368,12 @@ func (s *Signer) RunOnce(ctx context.Context) {
 		s.log.Error(msg, "err", err)
 	}
 	if err := s.publishPending(); err != nil {
+		if errors.Is(err, ErrFailClosed) {
+			// Something else wrote the publish volume: sign nothing.
+			s.setError(failClosedCode(err), err)
+			s.log.Error("not signing", "err", err)
+			return
+		}
 		fail(codeOr(online.CodeOf(err), "publish"), err, "could not publish the current manifest; retrying")
 	}
 	entries, err := inbox.Scan(s.cfg.Spool, 1000)
@@ -377,6 +404,16 @@ func (s *Signer) RunOnce(ctx context.Context) {
 	if !failed {
 		s.state.LastError = nil
 	}
+}
+
+// failClosedCode names a fail-closed refusal for the state and metrics.
+func failClosedCode(err error) string {
+	for _, c := range []string{CodePublishedUntrusted, CodeEnvelopeConflict, CodeStateBehind, CodeClockBehind} {
+		if strings.Contains(err.Error(), "("+c+")") {
+			return c
+		}
+	}
+	return "fail_closed"
 }
 
 func codeOr(code, def string) string {

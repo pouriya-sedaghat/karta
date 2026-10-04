@@ -53,6 +53,9 @@ const (
 	// CodeIntakeRevoked is a digest an operator revoked: the intake cannot
 	// authorize it again until an operator authorizes it.
 	CodeIntakeRevoked = "digest_revoked"
+	// CodeIntakeName is a handoff name that is not one of the caller's
+	// channel, the publisher's region and the requested digest.
+	CodeIntakeName = "handoff_name_mismatch"
 )
 
 func (s *Service) intakeEnabled() bool { return s.cfg.IntakeDir != "" }
@@ -116,6 +119,14 @@ func (s *Service) IntakeAuthorize(ctx context.Context, p Principal, channel stri
 	case r.TTL > s.cfg.IntakeMaxAge:
 		return refuse(&IntakeRefusal{Code: CodeIntakeTTL, Msg: fmt.Sprintf("a validity of %s is beyond the cap of %s (KARTA_INTAKE_AUTHORIZATION_MAX_AGE)",
 			r.TTL, s.cfg.IntakeMaxAge)})
+	}
+	// The name binds the authorization to one handoff of the caller's own
+	// channel: a command credential cannot authorize a watcher handoff (and
+	// so cannot lift the watcher's pause), nor the reverse.
+	if h, ok := registry.ParseHandoffName(r.Name); !ok || len(r.SHA256) < 12 || h.RegionID != cfg.ID || h.Channel != channel ||
+		h.DigestPrefix != r.SHA256[:12] {
+		return refuse(&IntakeRefusal{Code: CodeIntakeName, Msg: fmt.Sprintf("%q is not a handoff name of this credential's channel (%s), region "+
+			"%q and digest: <region>-<w|c><UTC time>-<first 12 hex digits of the SHA-256>, w for intake_watch, c for intake_submit", r.Name, channel, cfg.ID)})
 	}
 	a, created, err := registry.AuthorizeIntake(ctx, s.reg, registry.IntakeRequest{RegionID: cfg.ID, SHA256: r.SHA256, SizeBytes: r.SizeBytes,
 		ExpiresAt: s.now().Add(r.TTL), Channel: channel, Name: r.Name, CreatedBy: p.Name, Reason: r.Reason, RequestID: p.RequestID,

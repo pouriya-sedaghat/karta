@@ -308,7 +308,7 @@ testsource: ## Build the controlled HTTPS source image of the Stage 3 tests (tes
 	docker build $(BUILD_SECRET) -q -f tests/integration/sourceserver/Dockerfile -t karta-testsource:local . > /dev/null
 
 .PHONY: test-integration
-test-integration: secrets data-dirs testsource ## Full-stack integration tests on an isolated compose project (committed fixtures, local controlled HTTPS source only)
+test-integration: secrets data-dirs testsource ## Registry concurrency tests (PostgreSQL) and full-stack integration tests on an isolated compose project (committed fixtures, local controlled HTTPS source only)
 	@mkdir -p $(ARTIFACTS)
 	@tmp=$$(mktemp -d) && chmod 755 $$tmp && mkdir -m 755 $$tmp/inbox $$tmp/online $$tmp/sources $$tmp/docroot $$tmp/tls \
 	    $$tmp/intake $$tmp/landing $$tmp/bridge && \
@@ -317,9 +317,11 @@ test-integration: secrets data-dirs testsource ## Full-stack integration tests o
 	    KARTA_INTAKE_HOST_DIR=$$tmp/intake KARTA_INTAKE_LANDING_HOST_DIR=$$tmp/landing KARTA_TEST_BRIDGE_DIR=$$tmp/bridge && \
 	  { $(TEST_COMPOSE) --profile online --profile intake down -v --remove-orphans >/dev/null 2>&1 || true; } && \
 	  $(TEST_COMPOSE) up -d --wait db && $(TEST_COMPOSE) up -d api publisher && \
+	  KARTA_TEST_PG_DSN="host=127.0.0.1 port=$${KARTA_TEST_DB_PORT:-55433} user=postgres dbname=postgres sslmode=disable password=$$(cat secrets/db_superuser_password)" \
+	    go test -race -count=1 -timeout 5m -v -run '^TestDB' ./internal/registry/ ; dbstatus=$$?; \
 	  KARTA_TEST_COMPOSE="$(TEST_COMPOSE)" KARTA_TEST_ARTIFACTS=$(CURDIR)/$(ARTIFACTS) \
 	    go test -tags integration -count=1 -timeout 60m -v $(if $(RUN),-run '$(RUN)') ./tests/integration/ ; \
-	  status=$$?; for s in api publisher fetcher source intake-watch; do \
+	  status=$$?; [ $$dbstatus -eq 0 ] || status=$$dbstatus; for s in api publisher fetcher source intake-watch; do \
 	    $(TEST_COMPOSE) --profile online --profile intake logs --no-color $$s > $(CURDIR)/$(ARTIFACTS)/integration-$$s.log 2>&1 || true; done; \
 	  $(TEST_COMPOSE) --profile online --profile intake down -v --remove-orphans; \
 	  docker network rm $(TEST_PROJECT)_bridge $(TEST_PROJECT)_bridge-egress >/dev/null 2>&1 || true; rm -rf -- "$$tmp"; exit $$status

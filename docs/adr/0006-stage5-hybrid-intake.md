@@ -84,7 +84,8 @@ watcher token cannot present its deliveries as deliberate ones.
 **Capability.** Both scopes reach only `/v1/operator/intake/*`:
 
 * `POST /v1/operator/intake/authorizations` creates one authorization for an
-  exact SHA-256 with a **required** size, a **required** lifetime
+  exact SHA-256 with a **required** size, for a handoff name of the caller's
+  own channel (`w` watcher, `c` command), region and digest, a **required** lifetime
   (`ttl_seconds`; the publisher sets `expires_at` from its own clock) no
   longer than `KARTA_INTAKE_AUTHORIZATION_MAX_AGE`, the region the request
   names (refused unless it is the publisher's region), and the handoff name
@@ -597,6 +598,31 @@ What the implementation settled within the decisions above, for review:
   with the published manifest and adopts it when it is newer), and two
   signers could share a state directory (now a lock, also for acquire);
   `bridge-serve` had no write deadline or concurrency bound.
+* **Second review (owner's blockers).** Three more defects were fixed:
+  (1) intake authorization, operator authorize and operator revoke of one
+  region and digest are serialized by a transaction-scoped advisory lock
+  (taken first; the intake then takes its per-credential lock), so an intake
+  request that passed its block check before a revoke committed is closed by
+  that revoke, never left effective; a deterministic PostgreSQL test holds
+  the intake transaction after its block check
+  (`internal/registry/serialize_db_test.go`, run by `make test-integration`).
+  (2) The signer trusts a published manifest only after
+  `online.VerifySignedBy` (a signature by one of its own keys, none claiming
+  them without verifying, and the region's id and box; no validity window,
+  since a publication found after a restore may have expired); anything else
+  fails closed (`published_manifest_untrusted`), and so does a published
+  manifest with the persisted envelope's serial but other bytes
+  (`published_envelope_conflict`), at start and during a run.
+  `online.ParseUnverified` is no longer used for any signer decision.
+  (3) An intake authorization is bound to the handoff's channel as well as
+  its name: handoff names carry the channel letter
+  (`<region>-<w|c><UTC time>-<digest prefix>`), the API refuses a name of
+  another channel, region or digest (`handoff_name_mismatch`), and the
+  publisher admits an intake handoff only with an authorization of the
+  channel its name says wrote it, so an `intake_submit` row can neither
+  admit a watcher handoff nor lift the watcher's pause after a rollback
+  (integration test with a paused watcher handoff, a separate submit
+  credential and a submit row written past the API).
 * **Evidence.** Tier A only: unit tests with race detection for every new
   package, script tests, promtool rule tests with negative controls, and
   `TestIntake` and `TestBridge` against the Compose stack (fixtures, the

@@ -282,12 +282,19 @@ func (s *Service) onlineFeed() feed {
 
 // authScope is what may admit a submission of a feed: an operator's
 // authorization for every feed, and for the intake feed also the intake
-// authorization created for exactly that handoff name.
+// authorization created for exactly that handoff name by the channel the
+// name says wrote it (a watcher handoff only by intake_watch, a command
+// handoff only by intake_submit). A name the intake does not produce gets
+// operator authorizations only.
 func authScope(source, name string) registry.AuthScope {
-	if source == SourceIntake {
-		return registry.AuthScope{IntakeName: name}
+	if source != SourceIntake {
+		return registry.AuthScope{}
 	}
-	return registry.AuthScope{}
+	h, ok := registry.ParseHandoffName(name)
+	if !ok {
+		return registry.AuthScope{}
+	}
+	return registry.AuthScope{IntakeName: name, IntakeChannel: h.Channel}
 }
 
 // authorizer looks up authorizations in scope for digests not pinned in

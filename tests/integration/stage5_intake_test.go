@@ -10,6 +10,7 @@
 package integration
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -319,10 +320,18 @@ func openRecords(rs []intakeRecord) int {
 	return n
 }
 
+// handoffName is an intake handoff name for data, of the watcher (letter
+// "w") or the command ("c"); n varies the time part.
+func handoffName(letter string, data []byte, n int) string {
+	return fmt.Sprintf("fixture-%s20261004T%06dZ-%s", letter, n, digestOf(data)[:12])
+}
+
+// intakeAuthorize asks for an intake authorization of data; the default
+// name is a command (intake_submit) handoff name.
 func intakeAuthorize(t *testing.T, token string, data []byte, extra map[string]any) response {
 	t.Helper()
 	body := map[string]any{"sha256": digestOf(data), "size_bytes": len(data), "region_id": "fixture", "ttl_seconds": 3600,
-		"name": "manual-check", "reason": "integration check"}
+		"name": handoffName("c", data, 0), "reason": "integration check"}
 	for k, v := range extra {
 		if v == nil {
 			delete(body, k)
@@ -406,6 +415,11 @@ func TestIntake(t *testing.T) {
 			"no size":                   {map[string]any{"size_bytes": nil}, http.StatusBadRequest, ""},
 			"beyond the cap":            {map[string]any{"ttl_seconds": 400 * 24 * 3600}, http.StatusBadRequest, ""},
 			"larger than the input cap": {map[string]any{"size_bytes": 1 << 40}, http.StatusConflict, "too_large"},
+			// The name binds the row to one handoff of the caller's channel.
+			"a watcher handoff's name":       {map[string]any{"name": handoffName("w", x, 0)}, http.StatusConflict, "handoff_name_mismatch"},
+			"another digest's name":          {map[string]any{"name": handoffName("c", dataA, 0)}, http.StatusConflict, "handoff_name_mismatch"},
+			"another region's name":          {map[string]any{"name": "tehran-chitgar-c20261004T000000Z-" + digestOf(x)[:12]}, http.StatusConflict, "handoff_name_mismatch"},
+			"a name the intake never writes": {map[string]any{"name": "manual-check"}, http.StatusConflict, "handoff_name_mismatch"},
 		} {
 			r := intakeAuthorize(t, alice, x, c.extra)
 			if r.status != c.status || (c.code != "" && r.reasonCode(t) != c.code) {
@@ -435,7 +449,7 @@ func TestIntake(t *testing.T) {
 
 	t.Run("an intake authorization admits only its own handoff; an operator revoke blocks the intake", func(t *testing.T) {
 		z := variant(t, at("2026-02-03T00:00:00Z"), nil, nil)
-		expectStatus(t, intakeAuthorize(t, alice, z, map[string]any{"name": "z-handoff"}), http.StatusCreated)
+		expectStatus(t, intakeAuthorize(t, alice, z, map[string]any{"name": handoffName("c", z, 1)}), http.StatusCreated)
 		// The same bytes in the untrusted inbox are not admitted by it.
 		submit(t, "z-inbox", z, nil, "")
 		if sub := waitSubmission(t, "z-inbox", 60*time.Second); sub.State != "rejected" || sub.code() != "unauthorized_digest" {
@@ -447,14 +461,14 @@ func TestIntake(t *testing.T) {
 		// The operator's revoke is the stop button: the intake cannot
 		// authorize the digest again until an operator authorizes it.
 		expectStatus(t, op(t, http.MethodPost, "/v1/operator/authorizations/"+digestOf(z)+"/revoke", admin, map[string]any{"reason": "blocked"}), http.StatusOK)
-		for _, tok := range []string{alice, bob, watchTok} {
-			r := intakeAuthorize(t, tok, z, map[string]any{"name": "z-again"})
+		for tok, letter := range map[string]string{alice: "c", bob: "c", watchTok: "w"} {
+			r := intakeAuthorize(t, tok, z, map[string]any{"name": handoffName(letter, z, 2)})
 			if r.status != http.StatusConflict || r.reasonCode(t) != "digest_revoked" {
 				t.Errorf("re-authorized after an operator revoke: %d %s", r.status, r.body)
 			}
 		}
 		authorize(t, z, "reviewed: released again")
-		r := intakeAuthorize(t, alice, z, map[string]any{"name": "z-again"})
+		r := intakeAuthorize(t, alice, z, map[string]any{"name": handoffName("c", z, 2)})
 		expectStatus(t, r, http.StatusCreated)
 		expectStatus(t, op(t, http.MethodPost, "/v1/operator/authorizations/"+digestOf(z)+"/revoke", admin, map[string]any{"reason": "cleanup"}), http.StatusOK)
 	})
@@ -641,6 +655,62 @@ func TestIntake(t *testing.T) {
 		if code != 0 || res.Result.Submission == nil || res.Result.Submission.State != "published" {
 			t.Errorf("a command delivery during the pause: exit %d %+v %s", code, res, stderr)
 		}
+	})
+
+	dataP := variant(t, at("2026-06-15T00:00:00Z"), nil, nil)
+	t.Run("a submit credential cannot authorize a paused watcher handoff or lift the pause", func(t *testing.T) {
+		if v := intakeStatus(t); v.Intake.AutoActivate {
+			t.Fatalf("setup: the watcher is not paused: %+v", v.Intake)
+		}
+		active := status(t).activeID()
+		// The watcher hands P off and stops before its ready marker: the
+		// handoff's name is visible, the publisher does not have it yet.
+		startWatcher(t, map[string]string{"KARTA_TEST_INTAKE_FAILPOINTS": "intake.before_marker"})
+		land(t, "p", dataP, completionFor("p", dataP))
+		if code := watcherExit(t, 60*time.Second); code != 99 {
+			t.Fatalf("the watcher exited %d", code)
+		}
+		name := ""
+		entries, _ := os.ReadDir(intakeDir)
+		for _, e := range entries {
+			if n := e.Name(); strings.HasSuffix(n, ".osm.pbf") && strings.Contains(n, "-w") && strings.Contains(n, digestOf(dataP)[:12]) {
+				name = strings.TrimSuffix(n, ".osm.pbf")
+			}
+		}
+		if name == "" {
+			t.Fatal("no visible watcher handoff of P")
+		}
+		// A separate submit credential (bob) asks for that handoff: refused.
+		r := intakeAuthorize(t, bob, dataP, map[string]any{"name": name})
+		if r.status != http.StatusConflict || r.reasonCode(t) != "handoff_name_mismatch" {
+			t.Fatalf("a submit credential authorized a watcher handoff: %d %s", r.status, r.body)
+		}
+		// Its own command name for the same digest is allowed, and admits
+		// only a command handoff of that name.
+		expectStatus(t, intakeAuthorize(t, bob, dataP, map[string]any{"name": handoffName("c", dataP, 3)}), http.StatusCreated)
+		// Even a submit row naming the watcher handoff (written past the
+		// API, as a pre-fix registry could hold) does not admit it.
+		ctx := context.Background()
+		reg := superuser(t, "karta_registry")
+		defer reg.Close(ctx)
+		if _, err := reg.Exec(ctx, `INSERT INTO registry.authorizations (region_id, sha256, size_bytes, reason, created_by, expires_at, channel, intake_name)
+VALUES ('fixture', $1, $2, 'test: a submit row naming a watcher handoff', 'test-bob-direct', now() + interval '1 hour', 'intake_submit', $3)`,
+			digestOf(dataP), len(dataP), name); err != nil {
+			t.Fatal(err)
+		}
+		// The watcher completes its handoff; the pause holds.
+		startWatcher(t, nil)
+		sub, _ := waitDigest(t, digestOf(dataP), 90*time.Second)
+		if sub.State != "ready" || sub.code() != "intake_activation_paused" || status(t).activeID() != active {
+			t.Fatalf("P through a paused watcher: %+v (active %s, was %s)", sub, status(t).activeID(), active)
+		}
+		if _, err := reg.Exec(ctx, `UPDATE registry.authorizations SET revoked_at = now(), revoked_by = 'test', revoke_reason = 'test cleanup'
+WHERE sha256 = $1 AND created_by IN ('test-bob', 'test-bob-direct') AND revoked_at IS NULL`, digestOf(dataP)); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("an operator resumes the watcher", func(t *testing.T) {
 		if r := op(t, http.MethodPost, "/v1/operator/intake/resume", monitor, map[string]any{"reason": "x"}); r.status != http.StatusForbidden {
 			t.Errorf("monitor resumed the watcher: %d", r.status)
 		}

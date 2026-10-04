@@ -585,7 +585,7 @@ None of these affects online updates or direct manual publication.
 | landing entry | `digest_revoked` | an operator revoked this digest: only an operator's `authorize` releases it again |
 | landing entry | `region_mismatch`, `malformed_snapshot`, `timestamp_missing` | the advisory header check failed before any authorization |
 | preflight | `landing_missing`, `not_a_directory`, `symlink`, `wrong_owner`, `writable_by_others`, `writable_by_group`, `unsupported_filesystem`, `parent_*` | fix the landing area (above) |
-| API | `intake_disabled`, `intake_limit_reached`, `intake_refused` (`region_mismatch`, `too_large`, `validity_beyond_cap`, `digest_revoked`), `credentials_unavailable` | the intake is off; too many open authorizations for the credential; the request is outside the publisher's bounds, or the digest was revoked by an operator; the credentials file does not parse |
+| API | `intake_disabled`, `intake_limit_reached`, `intake_refused` (`region_mismatch`, `too_large`, `validity_beyond_cap`, `handoff_name_mismatch`, `digest_revoked`), `credentials_unavailable` | the intake is off; too many open authorizations for the credential; the request is outside the publisher's bounds, names a handoff of another channel, region or digest (a command credential can never authorize a watcher handoff), or the digest was revoked by an operator; the credentials file does not parse |
 | submission | `authorization_revoked`, `authorization_expired`, `unauthorized_digest` | the authorization was revoked, expired (also while queued) or never covered the digest, checked again at the switch: the built release stays `ready`, the pointer is unchanged; a fresh authorization (or a new delivery) re-evaluates it and activates the ready release without a rebuild |
 | submission | `intake_activation_paused` | watcher activation is paused: `intake-resume`, or activate the ready release explicitly |
 
@@ -661,7 +661,15 @@ The signer fails closed (exit status 4, `KartaBridgeSignerStalled`) when its
 state is missing although a manifest is published, or its high-water serial
 is below the published manifest's (`state_behind_published`, for example
 after restoring an older backup of `bridge-state`), or the clock is earlier
-than the last `issued_at` (`clock_behind`). For a state problem:
+than the last `issued_at` (`clock_behind`). It also refuses, at start and
+while running, a published manifest it cannot prove it made: one that does
+not verify with its own keys and region (`published_manifest_untrusted`),
+or one with the serial of its persisted envelope but other bytes
+(`published_envelope_conflict`). Only `bridge-sign` writes the publish
+volume, so either means something else wrote it: find out what, then put the
+signer's own manifest back from a backup of the publish volume, or remove
+`manifest.json` (the signer then publishes its persisted envelope or the
+next one). For a state problem:
 
 1. read the serial Karta accepted: `make op-status`, `online.verified.serial`
    (and the published manifest's serial in `make bridge-status`);
@@ -675,8 +683,9 @@ The raise is recorded in the signer state and never lowers the serial; the
 next manifest uses the following serial. At start the signer reconciles
 with the published manifest: an envelope the restored state had not yet
 published is published only if it is newer, and a newer published manifest
-becomes the signer's current one, so renewal continues from what Karta can
-see and nothing already published is signed again. For the clock,
+becomes the signer's current one (only after it verifies with the signer's
+keys and region), so renewal continues from what Karta can see and nothing
+already published is signed again. For the clock,
 fix the time; nothing is signed meanwhile and the current manifest stays
 valid until it expires.
 
@@ -691,7 +700,7 @@ valid until it expires.
 | `http_status`, `tls_error`, `destination_refused`, `redirect_refused`, `too_large`, `timeout`, `stalled`, `network_error`, `insufficient_storage` | as for the fetcher ("Failure codes" above) |
 | `not_newer` (held) | different bytes whose data are not newer than the last signed snapshot: inspect; nothing to undo |
 | `malformed_snapshot`, `region_mismatch`, `timestamp_missing` (held) | the download failed Karta's checks; a `region_mismatch` after a Geofabrik boundary change needs a reviewed region-file update |
-| `state_behind_published`, `clock_behind` | fail closed: "The bridge signer refuses to start" |
+| `state_behind_published`, `clock_behind`, `published_manifest_untrusted`, `published_envelope_conflict` | fail closed: "The bridge signer refuses to start" |
 | `asset_missing` | the asset of the current manifest is gone: not renewed; restore the publish volume or let the next download re-sign |
 | `serial_exhausted` | the serial reached 999,999,999,999: a new bridge identity and key are needed |
 

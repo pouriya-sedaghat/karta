@@ -1072,3 +1072,151 @@ func TestServeBounds(t *testing.T) {
 		}
 	})
 }
+
+// writePublished replaces the published manifest with m signed by signers.
+func writePublished(t *testing.T, b *brig, m online.Manifest, signers ...online.Signer) []byte {
+	t.Helper()
+	env, err := online.Sign(m, signers...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env = append(env, '\n')
+	if err := os.WriteFile(filepath.Join(b.publish, ManifestFile), env, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+// A published manifest the signer cannot prove it made is never adopted,
+// whatever its serial: a foreign key, a signature that claims the signer's
+// key id but does not verify, or the signer's key over another region.
+func TestSignerRefusesToAdoptAnUnverifiedPublication(t *testing.T) {
+	ctx := context.Background()
+	_, foreign, _ := ed25519.GenerateKey(rand.Reader)
+	for name, c := range map[string]func(m *online.Manifest, own online.Signer) []online.Signer{
+		"a foreign key": func(_ *online.Manifest, _ online.Signer) []online.Signer {
+			return []online.Signer{{KeyID: "intruder", Key: foreign}}
+		},
+		"a forged signature with the signer's key id": func(_ *online.Manifest, _ online.Signer) []online.Signer {
+			return []online.Signer{{KeyID: "bridge-test-a", Key: foreign}}
+		},
+		"the signer's key over another region": func(m *online.Manifest, own online.Signer) []online.Signer {
+			m.RegionID = "elsewhere"
+			return []online.Signer{own}
+		},
+		"the signer's key over another box": func(m *online.Manifest, own online.Signer) []online.Signer {
+			m.BBox = online.BBox{0, 0, 1, 1}
+			return []online.Signer{own}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newBrig(t, fixture(t, "karta-fixture-a.osm.pbf"), nil)
+			if err := b.a.CheckOnce(ctx); err != nil {
+				t.Fatal(err)
+			}
+			s := b.mustSigner()
+			s.RunOnce(ctx) // serial 1
+			stateBefore, _ := os.ReadFile(filepath.Join(b.state, stateFileName))
+			m := b.manifest()
+			m.Serial = 7 // newer than the state: what an adoption would take
+			signers := c(&m, online.Signer{KeyID: "bridge-test-a", Key: b.keys[0]})
+			forged := writePublished(t, b, m, signers...)
+			for _, raise := range []*Raise{nil, {To: 7, Reason: "Karta verified 7"}} {
+				_, err := b.signer(raise)
+				if !errors.Is(err, ErrFailClosed) || !strings.Contains(err.Error(), CodePublishedUntrusted) {
+					t.Fatalf("raise %v: %v", raise, err)
+				}
+			}
+			if got, _ := os.ReadFile(filepath.Join(b.publish, ManifestFile)); !bytes.Equal(got, forged) {
+				t.Error("the refused manifest was replaced")
+			}
+			if after, _ := os.ReadFile(filepath.Join(b.state, stateFileName)); !bytes.Equal(after, stateBefore) {
+				t.Error("the state changed although the publication was refused")
+			}
+		})
+	}
+}
+
+// The published manifest has the serial of the persisted envelope but other
+// bytes (even validly signed by the signer's own key): fail closed, at the
+// start and during a run, and sign nothing.
+func TestSignerFailsClosedOnASameSerialDifferentEnvelope(t *testing.T) {
+	ctx := context.Background()
+	b := newBrig(t, fixture(t, "karta-fixture-a.osm.pbf"), nil)
+	if err := b.a.CheckOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s := b.mustSigner()
+	s.RunOnce(ctx) // serial 1, published
+	own := online.Signer{KeyID: "bridge-test-a", Key: b.keys[0]}
+	m := b.manifest()
+	m.IssuedAt = m.IssuedAt.Add(time.Second) // the same serial, other bytes, a valid signature
+	writePublished(t, b, m, own)
+	if _, err := b.signer(nil); !errors.Is(err, ErrFailClosed) || !strings.Contains(err.Error(), CodeEnvelopeConflict) {
+		t.Fatalf("at start: %v", err)
+	}
+	// During a run: a pending envelope (its publication failed) and a
+	// foreign write of that serial meanwhile.
+	b2 := newBrig(t, fixture(t, "karta-fixture-a.osm.pbf"), nil)
+	if err := b2.a.CheckOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s2 := b2.mustSigner()
+	s2.RunOnce(ctx) // serial 1
+	spoolNewer(t, b2, time.Now().UTC().Add(-time.Hour))
+	unblock := blockManifestWrite(t, b2)
+	s2.RunOnce(ctx) // serial 2 persisted, not published
+	unblock()
+	pending := s2.State().Current
+	if pending.Promoted || pending.Serial != 2 {
+		t.Fatalf("setup: %+v", pending)
+	}
+	m2, err := online.ParseUnverified([]byte(pending.Envelope))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2.IssuedAt = m2.IssuedAt.Add(time.Second)
+	other := writePublished(t, b2, *m2, online.Signer{KeyID: "bridge-test-a", Key: b2.keys[0]})
+	hw := s2.State().HighWater
+	b2.clock = pending.ExpiresAt.Add(-time.Minute) // renewal would be due
+	s2.RunOnce(ctx)
+	st := s2.State()
+	if st.LastError == nil || st.LastError.Code != CodeEnvelopeConflict || st.HighWater != hw {
+		t.Fatalf("during a run: error %+v, high water %d (was %d)", st.LastError, st.HighWater, hw)
+	}
+	if got, _ := os.ReadFile(filepath.Join(b2.publish, ManifestFile)); !bytes.Equal(got, other) {
+		t.Error("the signer overwrote or renewed over the conflicting manifest")
+	}
+}
+
+// A genuinely newer, valid publication of the signer (its state restored
+// from an older backup) is verified and adopted exactly as published.
+func TestSignerAdoptsAVerifiedNewerPublication(t *testing.T) {
+	ctx := context.Background()
+	b := newBrig(t, fixture(t, "karta-fixture-a.osm.pbf"), nil)
+	b.addKey("bridge-test-b")
+	b.writeSignerConf(nil)
+	if err := b.a.CheckOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s := b.mustSigner()
+	s.RunOnce(ctx) // serial 1
+	old, _ := os.ReadFile(filepath.Join(b.state, stateFileName))
+	n := spoolNewer(t, b, time.Now().UTC().Add(-time.Hour))
+	s.RunOnce(ctx) // serial 2: newer data, both keys
+	published, _ := os.ReadFile(filepath.Join(b.publish, ManifestFile))
+	if err := os.WriteFile(filepath.Join(b.state, stateFileName), old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := b.signer(&Raise{To: 2, Reason: "state restored; Karta verified 2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := s.State().Current
+	if c == nil || c.Serial != 2 || c.SHA256 != sha(n) || c.Envelope != string(published) || !c.Promoted || len(c.KeyIDs) != 2 {
+		t.Fatalf("adopted %+v", c)
+	}
+	if got, _ := os.ReadFile(filepath.Join(b.publish, ManifestFile)); !bytes.Equal(got, published) {
+		t.Error("the verified publication was rewritten")
+	}
+}

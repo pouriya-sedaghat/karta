@@ -370,15 +370,21 @@ paths:
         credential repeating the same digest, size and name gets its open
         authorization back (`200`, `created: false`); a different size or name
         closes only that credential's own row first. Authorizations of
-        operators and of other intake credentials are never touched. An
-        intake authorization admits only the intake handoff of that name,
-        never the same bytes through the inbox, `karta import` or an online
-        source. `409 intake_disabled` without `KARTA_INTAKE_DIR`; `409
-        intake_limit_reached` beyond `KARTA_INTAKE_MAX_OPEN`; `409
-        intake_refused` (`reason_code` `region_mismatch`, `too_large`,
-        `validity_beyond_cap`) outside the publisher's bounds, or
+        operators and of other intake credentials are never touched. `name`
+        must be a handoff name of the caller's own channel, the publisher's
+        region and the requested digest
+        (`<region>-<w|c><UTC time>-<first 12 hex digits of sha256>`, `w` for
+        `intake_watch`, `c` for `intake_submit`). An intake authorization
+        admits only the intake handoff of that name written by that channel:
+        never a handoff of the other channel, nor the same bytes through the
+        inbox, `karta import` or an online source. `409 intake_disabled`
+        without `KARTA_INTAKE_DIR`; `409 intake_limit_reached` beyond
+        `KARTA_INTAKE_MAX_OPEN`; `409 intake_refused` (`reason_code`
+        `region_mismatch`, `too_large`, `validity_beyond_cap`,
+        `handoff_name_mismatch`) outside the publisher's bounds, or
         (`digest_revoked`) for a digest an operator revoked, until an
-        operator authorizes it again. Audited as `intake_authorize`.
+        operator authorizes it again. Serialized with operator authorize and
+        revoke of the same digest. Audited as `intake_authorize`.
       requestBody:
         required: true
         content:
@@ -655,7 +661,7 @@ components:
               description: |
                 For `policy_refused`, the rule that refused (older_than_active, not_newer, region_changed, excessive_data_loss,
                 counts_unavailable, region_config); for `intake_refused`, region_mismatch, too_large, validity_beyond_cap or
-                digest_revoked.
+                digest_revoked or handoff_name_mismatch.
             request_id: { type: string }
     SwitchBody:
       type: object
