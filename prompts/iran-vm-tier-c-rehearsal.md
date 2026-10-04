@@ -1,7 +1,8 @@
 # Draft brief: full-Iran rehearsal on the owner's Windows-hosted VM (tier C)
 
-Status: **draft, revised after Claude Code's brief review (2026-10-04)**, for
-Codex review and owner decisions. This is a measurement and recovery
+Status: **repository review complete; pending owner inputs and a read-only VM
+inventory**. Claude Code reviewed this brief on 2026-10-04 and Codex checked
+the revised claims against the merged code. No VM results are claimed. This is a measurement and recovery
 rehearsal of the merged Stage 5 code, not a new implementation stage or a
 production acceptance test. The production host does not yet exist. The
 baseline is `main` at merge commit `ab7dca3` (PR #12); both jobs of its CI
@@ -32,8 +33,9 @@ host. Agree on the VM work and its data source in that session.
 Measure one **fixed, exact Geofabrik Iran PBF** through Karta's common
 verification/build path. Exercise protected local intake first; if the host
 preflight and owner-approved writer boundary permit it, exercise the watcher
-separately. Confirm that serving remains available across a publication and
-rollback, and measure disk, memory, CPU, WAL, time and request latency. Record
+separately. Confirm serving during a publication, and, only with two separately
+accepted releases, across a rollback. Measure disk, memory, CPU, WAL, time
+and request latency. Record
 both successes and refusals. Keep Stage 3/5 online source and bridge disabled
 unless a separate, clearly scoped test with a throwaway key and controlled
 source is approved; no production key or automatic Geofabrik polling here.
@@ -48,8 +50,9 @@ Geofabrik replication sequence 4920, timestamp 2026-09-27T20:23:36Z, header
 box `44.023033,24.039475,63.35413,39.790447`. These are **claims, never
 verified**: the file was not available. No Iran PBF is in Git or was seen by
 this review. If the owner still holds that exact file, it is the natural
-fixed snapshot: its digest was recorded from the source copy before any VM
-transfer, and a match also verifies the Chitgar sidecar's claim. Otherwise
+fixed snapshot: the Chitgar sidecar's digest claim predates the proposed VM transfer, but
+its origin remains unverified until the owner supplies the file and its
+independent record. A matching VM hash corroborates that recorded claim. Otherwise
 the owner names another dated file and records its SHA-256 and size before
 the transfer. A mismatch with the record stops the run.
 
@@ -231,29 +234,34 @@ If a Karta database exists on the VM:
    the release database size, feature counts and the validation output.
    Report a refusal (`insufficient_storage`, timeout, OOM) as a result; do
    not weaken checks to force the build through.
-5. **Thresholds, and a validated activation.** Derive `min_counts`,
-   `max_drop_fraction`, Persian searches and tile checks from the inspected
-   release, and review the region file in a branch/PR. **The reviewed
-   checks never run on the no-activate release**: thresholds are not part
-   of the release id, and a resubmission of the same digest reuses the
-   `ready` release without validating it again. Owner and Codex choose:
-   a. the reviewed file also changes the release identity (for example the
-      default view on Tehran instead of the desert centre). The intake
-      delivery of the same digest then builds and validates a **new**
-      release with the reviewed checks, a real intake build, and the
-      no-activate release stays as a ready rollback target. This needs disk
-      for two Iran releases plus WAL, and a budget of at least the first
-      release + max(8.6 GiB, 1.25 × the first release);
-   b. the identity stays the same. The intake delivery then activates the
-      no-activate release unvalidated (label it "ready-release activation;
-      reviewed checks not exercised"). It still needs the budget of 5a,
-      because the capacity check comes first. Exercise the reviewed checks
-      in a fresh isolated project instead.
-   Then make one delivery as the named `intake_submit` holder, with the
-   independent digest and size (`make intake-submit … SHA256=… SIZE=…`),
-   with `KARTA_INTAKE_DIR=/data/intake` and the publisher on region `iran`.
-   The file must be world-readable. Record the audit trail and the outcome.
-   Avoid the last-resort `ATTEST` path.
+5. **Thresholds and a validated activation.** Derive `min_counts`,
+   `max_drop_fraction`, representative Persian searches and tile checks
+   from the inspected release, and review the region file in a branch/PR.
+   The no-activate release was built under the draft's empty checks. The
+   release id omits the validation policy, and a resubmission with the same
+   identity returns that `ready` release without rerunning the new checks.
+   **Do not count its activation as acceptance under the reviewed policy.**
+   Choose the route based on the actual reviewed configuration:
+
+   * If a legitimate reviewed change to the default view or other served
+     identity value yields a new release id, the named intake delivery of
+     the same pinned snapshot can make a fresh build with the reviewed
+     checks. Do not change the view merely to force a new id. Budget for
+     two full Iran databases, WAL and the candidate estimate.
+   * If the identity remains unchanged, build the snapshot anew with the
+     reviewed checks in a separate isolated project. Alternatively,
+     implement and review a code fix that revalidates an existing `ready`
+     release before activation. A repeated submission in the first project
+     only demonstrates reuse or refusal; it does not prove the new checks.
+
+   In either case, use an independently recorded SHA-256 and size and a
+   named `intake_submit` credential (`make intake-submit … SHA256=… SIZE=…`).
+   Set `KARTA_INTAKE_DIR=/data/intake` and the publisher's region to
+   `iran`; the input file must be readable by container UID 65532.
+   Record authorization, audit, report and outcome. Avoid the last-resort
+   `ATTEST` path. A draft-policy `ready` release is not a validated
+   rollback target for the reviewed policy merely because the API allows
+   switching to it.
 6. **Watcher, only if in scope and Docker Engine runs in the guest.** Put
    the landing area on the VM's local POSIX filesystem, owned by the landing
    account. Files must be owned by that account with mode 0644: a copy made
@@ -269,20 +277,27 @@ If a Karta database exists on the VM:
    authorization and build nothing. A new delivery of bytes already built
    still copies, stages and scans the whole file and must pass the capacity
    check before it is reported as a duplicate.
-7. **Serving, publication and rollback.** With an active Iran release, run a
-   bounded load with
+7. **Serving, publication and optional rollback.** With an active
+   reviewed Iran release, run a bounded load with
    `scripts/capacity-run.sh tier-c-vm-iran-… -duration … -concurrency …`
-   (`BASE` and `COMPOSE` set; `-follow` across a switch). `karta-load` draws
-   tiles uniformly from the manifest bounds, mostly sparse land at Iran
-   scale, and its default queries are Tehran-centric. That makes the load
-   synthetic, not a traffic model. A publication or rollback under load
-   needs a second Iran release (5a); without one there is no same-region
-   rollback target: report that rather than rolling back to another region.
-   Record request counts, errors, p50/p95/p99 latency and resource use.
-   Check release pinning, the active pointer, the audit trail, the pause of
-   watcher activation after a rollback, and serving after network loss. Do
-   not claim a performance objective until the owner chooses workload and
-   limits.
+   (`BASE` and `COMPOSE` set; use `-follow` only across a real switch).
+   `karta-load` samples tiles uniformly across Iran's bounds and defaults
+   to Tehran-centric searches, so its workload is synthetic, not a
+   production traffic model. Record requests, errors, p50/p95/p99 latency
+   and resource use during serving and any publication.
+
+   A meaningful full-Iran rollback under load needs two separately
+   reviewed and accepted releases. Prefer a second dated Iran snapshot
+   with independent provenance and enough disk. A legitimate output
+   revision of the same PBF can test the control-plane switch, but report
+   explicitly that it is not a data-version rollback. The draft-policy
+   no-activate release alone does not satisfy this acceptance condition.
+   If there is only one accepted release, omit the full-Iran rollback
+   experiment and rely on the fixture CI for that behavior. Check the
+   active pointer, audit and release pinning; check watcher activation
+   pause only if a rollback was actually performed. Test serving after
+   network loss. Do not claim a performance objective until the owner
+   chooses the workload and limits.
 8. **Backup and isolated restore.** Run `make backup` of the rehearsal
    project to the agreed location. Restore it into a second isolated project
    with other ports (runbook, "Backup and restore") and confirm
@@ -299,7 +314,7 @@ Deliver a concise report with:
   they match the recorded claim;
 * the budget, abort thresholds and any override, with their values;
 * before and after storage, and backup verification;
-* the region configuration diff, and which option of step 5 was used;
+* the region configuration diff and how the reviewed checks were executed;
 * the full import report and the sampled metrics;
 * the command and watcher outcomes;
 * serving and rollback observations;
