@@ -2,7 +2,7 @@
 
 Status: **repository review complete; SSH inventory supplied by the owner;
 pending Windows/source evidence and measured-run decisions**. Claude Code reviewed this brief on 2026-10-04 and Codex checked
-the revised claims against the merged code. No VM results are claimed.
+the revised claims against the merged code. No measured Karta results are claimed.
 This is a measurement and recovery rehearsal of the merged Stage 5 code, not a new implementation stage or a
 production acceptance test. The production host does not yet exist. The
 baseline is `main` at merge commit `ab7dca3` (PR #12); both jobs of its CI
@@ -28,16 +28,16 @@ GB of old build cache and eight build records remain. Root-owned Docker
 directories were not read directly, though Docker's object listings were
 queried. No cache cleanup is necessary for the inventory.
 
-The reported VM copy of `iran-261002.osm.pbf` is 229,655,710
-bytes, SHA-256
+The reported VM copy of `iran-261002.osm.pbf` is 229,655,710 bytes,
+SHA-256
 `4cbf2a95cffee119615e6862fd2257817356c263c15729477e21a4f5b8aedc5d`.
 Its header reports 2026-10-02T20:21:34Z, sequence 4925 and box
 44.0230330,24.0394750 to 63.3541300,39.7904470. Only the header was
 read; an independent digest from the original Windows file and full-file
 structural verification remain open. The reported MD5 has not been compared
-with Geofabrik's sidecar. Never mount the user's home directory into a container: it
-contains unrelated private files, and its reported 0750 mode blocks the
-container UID. Stage verified bytes in a dedicated input directory for the run.
+with Geofabrik's sidecar. Never mount the user's home directory into a container: it contains
+unrelated private files, and its reported 0750 mode blocks the container
+UID. Stage verified bytes in a dedicated input directory for the run.
 
 Chrony was synchronized at inventory time, but the journal reportedly
 shows 13 forward time jumps and a gap consistent with guest suspension or
@@ -71,8 +71,8 @@ separately accepted releases exist. Neither path is production acceptance.
 
 The owner reports downloading `iran-261002.osm.pbf` on 2026-10-03. At the
 time of this brief revision, Geofabrik's Iran listing names this dated PBF
-as 229,655,710 bytes, modified 2026-10-02 22:37 UTC. The VM copy's size, SHA-256 and header have been reported above. Record
-SHA-256 and size from the original Windows copy, compare them with the VM
+as 229,655,710 bytes, modified 2026-10-02 22:37 UTC. The VM copy's
+size, SHA-256 and header have been reported above. Record SHA-256 and size from the original Windows copy, compare them with the VM
 copy, and record Geofabrik's MD5 as distributor metadata (not authentication).
 The dated filename does not prove that the local bytes are complete.
 
