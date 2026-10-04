@@ -93,6 +93,14 @@ type Publisher struct {
 	// StaleAfter is the data age after which the active release counts as
 	// stale (0 = no threshold configured).
 	StaleAfter time.Duration
+	// IntakeDir is the local intake's handoff directory, mounted read-only
+	// ("" = the intake is off, the default; intake credentials are refused).
+	IntakeDir string
+	// IntakeMaxAge caps the validity of an intake authorization; 0 means
+	// the derived default (publish.DefaultIntakeMaxAge).
+	IntakeMaxAge time.Duration
+	// IntakeMaxOpen bounds the open intake authorizations per credential.
+	IntakeMaxOpen int
 }
 
 // Fetcher configures `karta fetcher`, the online source poller.
@@ -332,6 +340,12 @@ func LoadPublisher(getenv func(string) string) (Publisher, error) {
 		}
 	}
 	c.StaleAfter = r.dur("KARTA_DATA_STALE_AFTER", 0, 0, 366*24*time.Hour)
+	c.IntakeDir = r.dir("KARTA_INTAKE_DIR", "")
+	c.IntakeMaxAge = r.dur("KARTA_INTAKE_AUTHORIZATION_MAX_AGE", 0, 0, 366*24*time.Hour)
+	if c.IntakeMaxAge != 0 && c.IntakeMaxAge < time.Minute {
+		r.errs = append(r.errs, errors.New("KARTA_INTAKE_AUTHORIZATION_MAX_AGE must be at least 1m"))
+	}
+	c.IntakeMaxOpen = r.int("KARTA_INTAKE_MAX_OPEN", 2, 1, 20)
 	return c, errors.Join(r.errs...)
 }
 
@@ -405,4 +419,135 @@ func validBaseURL(s string) error {
 		return errors.New("want http(s)://host[:port][/path] without query, fragment or credentials")
 	}
 	return nil
+}
+
+// Intake configures `karta intake` (Stage 5): the protected-folder watcher
+// and the authenticated submission command.
+type Intake struct {
+	// HandoffDir is the intake's handoff directory (the publisher's
+	// KARTA_INTAKE_DIR).
+	HandoffDir string
+	RegionFile string
+	// OperatorURL and TokenFile reach the operator API with an intake
+	// credential (scope intake_watch or intake_submit).
+	OperatorURL string
+	TokenFile   string
+	Timeout     time.Duration
+	// TTL is the validity asked for (0: the publisher's cap).
+	TTL           time.Duration
+	MaxInputBytes int64
+	ReserveBytes  int64
+	LogLevel      string
+	// The watcher's landing area.
+	LandingDir string
+	LandingUID int
+	// WriterGID is the one group allowed to write the landing area (-1:
+	// none).
+	WriterGID int
+	Settle    time.Duration
+	Poll      time.Duration
+}
+
+// LoadIntake reads the intake configuration; watch also needs the landing
+// area.
+func LoadIntake(getenv func(string) string, watch bool) (Intake, error) {
+	r := &reader{getenv: getenv}
+	c := Intake{
+		HandoffDir:    r.dir("KARTA_INTAKE_DIR", ""),
+		RegionFile:    r.str("KARTA_REGION_FILE", ""),
+		OperatorURL:   r.str("KARTA_OPERATOR_URL", "http://127.0.0.1:8081"),
+		TokenFile:     r.str("KARTA_OPERATOR_TOKEN_FILE", ""),
+		Timeout:       r.dur("KARTA_OPERATOR_CLIENT_TIMEOUT", time.Minute, time.Second, 10*time.Minute),
+		TTL:           r.dur("KARTA_INTAKE_AUTHORIZATION_TTL", 0, 0, 366*24*time.Hour),
+		MaxInputBytes: int64(r.int("KARTA_MAX_INPUT_MB", 4096, 1, 1<<22)) << 20,
+		ReserveBytes:  int64(r.int("KARTA_INTAKE_RESERVE_MB", 64, 0, 1<<22)) << 20,
+		LogLevel:      r.logLevel(),
+		LandingDir:    r.str("KARTA_INTAKE_LANDING_DIR", ""),
+		LandingUID:    r.int("KARTA_INTAKE_LANDING_UID", -1, -1, 1<<31-1),
+		WriterGID:     r.int("KARTA_INTAKE_WRITER_GID", -1, -1, 1<<31-1),
+		Settle:        r.dur("KARTA_INTAKE_SETTLE", 10*time.Second, 0, time.Hour),
+		Poll:          r.dur("KARTA_INTAKE_POLL_INTERVAL", 10*time.Second, time.Second, time.Hour),
+	}
+	for _, v := range []struct{ key, val string }{
+		{"KARTA_INTAKE_DIR", c.HandoffDir}, {"KARTA_REGION_FILE", c.RegionFile}, {"KARTA_OPERATOR_TOKEN_FILE", c.TokenFile},
+	} {
+		if v.val == "" {
+			r.errs = append(r.errs, fmt.Errorf("%s is required", v.key))
+		}
+	}
+	if c.RegionFile != "" {
+		r.regular("KARTA_REGION_FILE", c.RegionFile)
+	}
+	if watch {
+		if c.LandingDir == "" {
+			r.errs = append(r.errs, errors.New("KARTA_INTAKE_LANDING_DIR is required (the protected landing area)"))
+		}
+		if c.LandingUID < 0 {
+			r.errs = append(r.errs, errors.New("KARTA_INTAKE_LANDING_UID is required (the landing owner's numeric UID)"))
+		}
+	}
+	return c, errors.Join(r.errs...)
+}
+
+// Bridge configures `karta bridge` (Stage 5): the acquire, sign and serve
+// processes of the controlled source bridge.
+type Bridge struct {
+	SourceFile    string
+	SignerFile    string
+	RegionFile    string
+	SpoolDir      string
+	PublishDir    string
+	StateDir      string
+	MaxInputBytes int64
+	ReserveBytes  int64
+	MaxFutureSkew time.Duration
+	SignPoll      time.Duration
+	ListenAddr    string
+	TLSCert       string
+	TLSKey        string
+	// MetricsListenAddr serves the bridge's own metrics ("" = off) to the
+	// credentials in MetricsTokensFile (scope status).
+	MetricsListenAddr string
+	MetricsTokensFile string
+	LogLevel          string
+}
+
+// LoadBridge reads the configuration of one bridge role (acquire, sign,
+// serve or status).
+func LoadBridge(getenv func(string) string, role string) (Bridge, error) {
+	r := &reader{getenv: getenv}
+	c := Bridge{
+		SourceFile:        r.str("KARTA_BRIDGE_SOURCE_FILE", ""),
+		SignerFile:        r.str("KARTA_BRIDGE_SIGNER_FILE", ""),
+		RegionFile:        r.str("KARTA_REGION_FILE", ""),
+		SpoolDir:          r.str("KARTA_BRIDGE_SPOOL_DIR", ""),
+		PublishDir:        r.str("KARTA_BRIDGE_PUBLISH_DIR", ""),
+		StateDir:          r.str("KARTA_BRIDGE_STATE_DIR", ""),
+		MaxInputBytes:     int64(r.int("KARTA_MAX_INPUT_MB", 4096, 1, 1<<22)) << 20,
+		ReserveBytes:      int64(r.int("KARTA_BRIDGE_RESERVE_MB", 64, 0, 1<<22)) << 20,
+		MaxFutureSkew:     r.dur("KARTA_MAX_FUTURE_SKEW", 10*time.Minute, 0, 24*time.Hour),
+		SignPoll:          r.dur("KARTA_BRIDGE_SIGN_POLL", 5*time.Second, time.Second, time.Hour),
+		ListenAddr:        r.str("KARTA_BRIDGE_LISTEN_ADDR", ":8443"),
+		TLSCert:           r.str("KARTA_BRIDGE_TLS_CERT", ""),
+		TLSKey:            r.str("KARTA_BRIDGE_TLS_KEY", ""),
+		MetricsListenAddr: r.str("KARTA_BRIDGE_METRICS_LISTEN_ADDR", ""),
+		MetricsTokensFile: r.str("KARTA_BRIDGE_METRICS_TOKENS_FILE", ""),
+		LogLevel:          r.logLevel(),
+	}
+	need := map[string][]struct{ key, val string }{
+		"acquire": {{"KARTA_BRIDGE_SOURCE_FILE", c.SourceFile}, {"KARTA_BRIDGE_SPOOL_DIR", c.SpoolDir}},
+		"sign": {{"KARTA_BRIDGE_SIGNER_FILE", c.SignerFile}, {"KARTA_REGION_FILE", c.RegionFile}, {"KARTA_BRIDGE_SPOOL_DIR", c.SpoolDir},
+			{"KARTA_BRIDGE_PUBLISH_DIR", c.PublishDir}, {"KARTA_BRIDGE_STATE_DIR", c.StateDir}},
+		"serve":  {{"KARTA_BRIDGE_PUBLISH_DIR", c.PublishDir}, {"KARTA_BRIDGE_TLS_CERT", c.TLSCert}, {"KARTA_BRIDGE_TLS_KEY", c.TLSKey}},
+		"status": {{"KARTA_BRIDGE_SPOOL_DIR", c.SpoolDir}, {"KARTA_BRIDGE_PUBLISH_DIR", c.PublishDir}},
+	}
+	for _, v := range need[role] {
+		if v.val == "" {
+			r.errs = append(r.errs, fmt.Errorf("%s is required", v.key))
+		}
+	}
+	if role == "serve" && c.MetricsListenAddr != "" && c.MetricsTokensFile == "" {
+		r.errs = append(r.errs, errors.New("KARTA_BRIDGE_METRICS_TOKENS_FILE is required with KARTA_BRIDGE_METRICS_LISTEN_ADDR"))
+	}
+	return c, errors.Join(r.errs...)
 }

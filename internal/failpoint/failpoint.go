@@ -13,6 +13,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ExitCode is the status a failpoint exits with.
@@ -37,6 +38,16 @@ var Known = []string{
 	"fetch.after_download",
 	"fetch.before_marker",
 	"fetch.after_marker",
+	// Stage 5: the local intake.
+	"intake.after_hash",
+	"intake.after_authorize",
+	"intake.before_marker",
+	"intake.after_marker",
+	// Stage 5: the bridge.
+	"bridge.acquire_mid_download",
+	"bridge.sign_after_asset",
+	"bridge.sign_after_state",
+	"bridge.sign_after_manifest",
 }
 
 var enabled = parse(os.Getenv("KARTA_FAILPOINTS"))
@@ -78,4 +89,22 @@ func Hit(name string) {
 		fmt.Fprintf(os.Stderr, `{"level":"ERROR","msg":"failpoint hit, exiting","failpoint":%q,"exit_code":%d}`+"\n", name, ExitCode)
 		exit(ExitCode)
 	}
+}
+
+// ClockVariable fixes the clock the intake command names its handoffs by.
+const ClockVariable = "KARTA_FAILPOINT_CLOCK"
+
+// Clock returns the fixed time ClockVariable names (RFC 3339), or nil when it
+// is unset: tests make two command runs name the same second. Like the
+// failpoints it is a test facility: never set it in a deployment.
+func Clock() (func() time.Time, error) {
+	v := os.Getenv(ClockVariable)
+	if v == "" {
+		return nil, nil
+	}
+	at, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", ClockVariable, err)
+	}
+	return func() time.Time { return at }, nil
 }

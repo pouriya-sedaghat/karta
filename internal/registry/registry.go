@@ -232,14 +232,96 @@ CREATE TABLE registry.freshness (
 );
 GRANT SELECT ON registry.freshness TO karta_reader;
 `,
+	4: `
+-- Stage 5: the local intake. An authorization records the channel that
+-- created it: an operator (publish scope), the unattended intake watcher
+-- (intake_watch) or a named person's intake command (intake_submit), and,
+-- for the intake, the handoff name it is for. Operators keep one open
+-- authorization per region and digest; each intake credential has its
+-- own, so neither can supersede the other's.
+ALTER TABLE registry.authorizations
+    ADD COLUMN IF NOT EXISTS channel text NOT NULL DEFAULT 'operator',
+    ADD COLUMN IF NOT EXISTS intake_name text;
+ALTER TABLE registry.authorizations ADD CONSTRAINT authorizations_channel_check
+    CHECK (channel IN ('operator', 'intake_watch', 'intake_submit'));
+ALTER TABLE registry.authorizations ADD CONSTRAINT authorizations_intake_name_check
+    CHECK ((channel = 'operator') = (intake_name IS NULL));
+DROP INDEX IF EXISTS registry.authorizations_one_open;
+CREATE UNIQUE INDEX authorizations_one_open_operator ON registry.authorizations (region_id, sha256)
+    WHERE revoked_at IS NULL AND channel = 'operator';
+CREATE UNIQUE INDEX authorizations_one_open_intake ON registry.authorizations (region_id, sha256, created_by)
+    WHERE revoked_at IS NULL AND channel <> 'operator';
+
+-- The intake's handoff directory is a fourth submission source.
+ALTER TABLE registry.submissions DROP CONSTRAINT IF EXISTS submissions_source_check;
+ALTER TABLE registry.submissions ADD CONSTRAINT submissions_source_check CHECK (source IN ('inbox', 'cli', 'online', 'intake'));
+ALTER TABLE registry.audit DROP CONSTRAINT IF EXISTS audit_source_check;
+ALTER TABLE registry.audit ADD CONSTRAINT audit_source_check
+    CHECK (source IN ('operator_api', 'inbox', 'cli', 'system', 'online', 'intake'));
+
+-- Automatic activation of submissions admitted only by the unattended
+-- watcher: paused by a rollback or a restore, resumed by an operator.
+CREATE TABLE registry.intake_policy (
+    region_id text PRIMARY KEY,
+    watcher_auto_activate boolean NOT NULL DEFAULT true,
+    changed_at timestamptz,
+    changed_by text,
+    change_reason text
+);
+
+-- An operator's revoke is the stop button for a digest: the intake may not
+-- authorize it again until an operator authorizes it.
+CREATE TABLE registry.intake_blocks (
+    region_id text NOT NULL,
+    sha256 text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    blocked_at timestamptz NOT NULL DEFAULT now(),
+    blocked_by text NOT NULL,
+    reason text NOT NULL,
+    PRIMARY KEY (region_id, sha256)
+);
+`,
+	5: `
+-- Stage 5: an intake handoff name identifies one handoff for good. The
+-- intake's records find a handoff's submission by its name, so a name is
+-- never reused, by any credential, whether its authorization is open or
+-- closed. Rows that already share a name (written before this rule) cannot
+-- be attributed to one handoff: all of them are closed, and all but the
+-- first are renamed to a name no handoff can carry, so the publisher admits
+-- nothing under them and the intake ignores them.
+WITH shared AS (
+    SELECT id, intake_name, row_number() OVER (PARTITION BY intake_name ORDER BY id) AS n
+    FROM registry.authorizations
+    WHERE intake_name IN (SELECT intake_name FROM registry.authorizations WHERE intake_name IS NOT NULL
+                          GROUP BY intake_name HAVING count(*) > 1)
+), closed AS (
+    UPDATE registry.authorizations a
+    SET revoked_at = COALESCE(a.revoked_at, now()), revoked_by = COALESCE(a.revoked_by, 'registry migration 5'),
+        revoke_reason = COALESCE(a.revoke_reason, 'handoff name shared with another authorization'),
+        intake_name = CASE WHEN shared.n = 1 THEN a.intake_name ELSE a.intake_name || '~shared-' || a.id END
+    FROM shared WHERE a.id = shared.id
+    RETURNING a.id, shared.intake_name
+)
+INSERT INTO registry.audit (actor, source, action, target, outcome, reason, detail)
+SELECT 'registry migration 5', 'system', 'intake_name_deduplicate', intake_name, 'succeeded',
+    'authorizations sharing a handoff name were closed; all but the first were renamed',
+    jsonb_build_object('authorization_ids', jsonb_agg(id ORDER BY id))
+FROM closed GROUP BY intake_name;
+CREATE UNIQUE INDEX authorizations_intake_name_unique ON registry.authorizations (intake_name) WHERE intake_name IS NOT NULL;
+`,
 }
 
 // SchemaVersion is the registry schema this build writes.
-const SchemaVersion = 3
+const SchemaVersion = 5
 
 // Migrate brings the registry schema to SchemaVersion (idempotent; safe to
 // run concurrently from several processes).
 func Migrate(ctx context.Context, db TxBeginner) error {
+	return migrateTo(ctx, db, SchemaVersion)
+}
+
+// migrateTo applies the migrations up to version target (tests stop at an
+// older version to check an upgrade).
+func migrateTo(ctx context.Context, db TxBeginner, target int) error {
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return err
@@ -263,7 +345,7 @@ CREATE TABLE IF NOT EXISTS registry.schema_migrations (
 	if current > SchemaVersion {
 		return fmt.Errorf("registry schema version %d is newer than this build supports (%d)", current, SchemaVersion)
 	}
-	for v := current + 1; v <= SchemaVersion; v++ {
+	for v := current + 1; v <= target; v++ {
 		if _, err := tx.Exec(ctx, migrations[v]); err != nil {
 			return fmt.Errorf("registry migration %d: %w", v, err)
 		}
@@ -870,7 +952,15 @@ func ListSubmissions(ctx context.Context, q Querier, limit int) ([]Submission, e
 	return out, rows.Err()
 }
 
-// Authorization is an operator's approval of one exact snapshot digest.
+// Authorization channels: who created an authorization.
+const (
+	ChannelOperator     = "operator"
+	ChannelIntakeWatch  = "intake_watch"
+	ChannelIntakeSubmit = "intake_submit"
+)
+
+// Authorization is an approval of one exact snapshot digest, by an operator
+// or by a local intake credential.
 type Authorization struct {
 	ID           int64      `json:"id"`
 	RegionID     string     `json:"region_id"`
@@ -883,27 +973,45 @@ type Authorization struct {
 	RevokedAt    *time.Time `json:"revoked_at"`
 	RevokedBy    *string    `json:"revoked_by"`
 	RevokeReason *string    `json:"revoke_reason"`
+	// Channel is operator, intake_watch or intake_submit.
+	Channel string `json:"channel"`
+	// IntakeName is the handoff name an intake authorization is for.
+	IntakeName *string `json:"intake_name"`
 }
 
-const authColumns = `id, region_id, sha256, size_bytes, reason, created_by, created_at, expires_at, revoked_at, revoked_by, revoke_reason`
+// Describe names the authorization for import reports and audit records.
+func (a *Authorization) Describe() string {
+	if a.Channel == ChannelOperator || a.Channel == "" {
+		return fmt.Sprintf("operator authorization %d by %s", a.ID, a.CreatedBy)
+	}
+	return fmt.Sprintf("%s authorization %d by %s", a.Channel, a.ID, a.CreatedBy)
+}
+
+const authColumns = `id, region_id, sha256, size_bytes, reason, created_by, created_at, expires_at, revoked_at, revoked_by, revoke_reason,
+    channel, intake_name`
 
 func scanAuth(row pgx.Row) (*Authorization, error) {
 	var a Authorization
-	err := row.Scan(&a.ID, &a.RegionID, &a.SHA256, &a.SizeBytes, &a.Reason, &a.CreatedBy, &a.CreatedAt, &a.ExpiresAt, &a.RevokedAt, &a.RevokedBy, &a.RevokeReason)
+	err := row.Scan(&a.ID, &a.RegionID, &a.SHA256, &a.SizeBytes, &a.Reason, &a.CreatedBy, &a.CreatedAt, &a.ExpiresAt, &a.RevokedAt,
+		&a.RevokedBy, &a.RevokeReason, &a.Channel, &a.IntakeName)
 	return &a, err
 }
 
-// Authorize records an authorization for (region, digest). An open,
-// unexpired authorization for the same digest is returned unchanged
-// (created = false); an expired one is closed first.
+// Authorize records an operator authorization for (region, digest). An
+// open, unexpired operator authorization for the same digest is returned
+// unchanged (created = false); an expired one, or one for another size, is
+// closed first. Authorizations of the local intake are never touched.
 func Authorize(ctx context.Context, db TxBeginner, a Authorization, requestID string) (*Authorization, bool, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := lockDigest(ctx, tx, a.RegionID, a.SHA256); err != nil {
+		return nil, false, err
+	}
 	existing, err := scanAuth(tx.QueryRow(ctx, `SELECT `+authColumns+` FROM registry.authorizations
-WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL FOR UPDATE`, a.RegionID, a.SHA256))
+WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL AND channel = 'operator' FOR UPDATE`, a.RegionID, a.SHA256))
 	switch {
 	case err == nil && (existing.ExpiresAt == nil || existing.ExpiresAt.After(time.Now())) &&
 		sameSize(existing.SizeBytes, a.SizeBytes):
@@ -926,6 +1034,10 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+authColumns, a.RegionID, a.SHA256, a
 	if err != nil {
 		return nil, false, err
 	}
+	// An operator's authorization lifts an earlier revoke's intake block.
+	if _, err := tx.Exec(ctx, `DELETE FROM registry.intake_blocks WHERE region_id = $1 AND sha256 = $2`, a.RegionID, a.SHA256); err != nil {
+		return nil, false, err
+	}
 	detail := map[string]any{"region_id": a.RegionID, "authorization_id": created.ID}
 	if a.SizeBytes != nil {
 		detail["size_bytes"] = *a.SizeBytes
@@ -944,41 +1056,133 @@ func sameSize(a, b *int64) bool {
 	return (a == nil && b == nil) || (a != nil && b != nil && *a == *b)
 }
 
-// Revoke closes the open authorization for (region, digest).
+// Revoke closes every open authorization for (region, digest): the
+// operator's and those of local intake credentials. It is the operator's
+// stop button for a digest: the intake cannot authorize it again until an
+// operator authorizes it (registry.intake_blocks).
 func Revoke(ctx context.Context, db TxBeginner, region, digest, actor, reason, requestID string) (bool, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	tag, err := tx.Exec(ctx, `UPDATE registry.authorizations SET revoked_at = now(), revoked_by = $3, revoke_reason = $4
-WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL`, region, digest, actor, reason)
+	// Serialized with intake authorizations of the digest: one that already
+	// checked for a block commits its row before this UPDATE runs (and is
+	// closed by it), any other one waits and then sees the block.
+	if err := lockDigest(ctx, tx, region, digest); err != nil {
+		return false, err
+	}
+	rows, err := tx.Query(ctx, `UPDATE registry.authorizations SET revoked_at = now(), revoked_by = $3, revoke_reason = $4
+WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL RETURNING id, channel`, region, digest, actor, reason)
 	if err != nil {
 		return false, err
 	}
+	var ids []int64
+	channels := map[string]int{}
+	for rows.Next() {
+		var id int64
+		var ch string
+		if err := rows.Scan(&id, &ch); err != nil {
+			rows.Close()
+			return false, err
+		}
+		ids = append(ids, id)
+		channels[ch]++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO registry.intake_blocks (region_id, sha256, blocked_by, reason) VALUES ($1, $2, $3, $4)
+ON CONFLICT (region_id, sha256) DO UPDATE SET blocked_at = now(), blocked_by = EXCLUDED.blocked_by, reason = EXCLUDED.reason`,
+		region, digest, truncate(actor, 64), truncate(reason, 2000)); err != nil {
+		return false, err
+	}
 	outcome := OutcomeSucceeded
-	if tag.RowsAffected() == 0 {
+	if len(ids) == 0 {
 		outcome = OutcomeNoop
 	}
 	if err := Audit(ctx, tx, AuditEntry{Actor: actor, Source: "operator_api", Action: "revoke_digest", Target: digest,
-		Outcome: outcome, Reason: reason, RequestID: requestID, Detail: map[string]any{"region_id": region}}); err != nil {
+		Outcome: outcome, Reason: reason, RequestID: requestID, Detail: map[string]any{"region_id": region, "authorization_ids": ids,
+			"channels": channels}}); err != nil {
 		return false, err
 	}
-	return tag.RowsAffected() > 0, tx.Commit(ctx)
+	return len(ids) > 0, tx.Commit(ctx)
 }
 
-// Authorized reports whether an open, unexpired authorization covers the
-// digest (and size, when the authorization records one). A registry without
-// the table (version < 2) authorizes nothing.
-func Authorized(ctx context.Context, q Querier, region, digest string, size int64) (*Authorization, error) {
+// authPrecedence orders covering authorizations: an operator's first, then
+// a named person's intake command, then the unattended watcher. Only a
+// snapshot admitted by nothing but a watcher authorization is subject to
+// the watcher's activation pause.
+const authPrecedence = `CASE channel WHEN 'operator' THEN 0 WHEN 'intake_submit' THEN 1 ELSE 2 END, id DESC`
+
+// digestLockKey serializes, per region and digest, every change that decides
+// whether the digest is authorized: an operator's authorize and revoke and an
+// intake authorization (transaction-scoped advisory lock, the region and
+// digest hashed into the second key; a collision only serializes more).
+const digestLockKey int32 = 0x6b617264 // "kard"
+
+func lockDigest(ctx context.Context, tx pgx.Tx, region, digest string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2))`, digestLockKey, region+"/"+digest)
+	return err
+}
+
+// AuthScope selects the authorizations that may admit a submission. An
+// operator's authorization admits its digest through every feed; an intake
+// authorization admits only the intake handoff it was created for, by its
+// name and its channel, never the same bytes dropped into the inbox, given to
+// `karta import` or delivered online, and never a handoff of the other
+// intake channel.
+type AuthScope struct {
+	// IntakeName is the handoff name of a submission from the intake feed,
+	// "" for every other feed (operator authorizations only).
+	IntakeName string
+	// IntakeChannel is the channel the handoff's name says wrote it
+	// (ChannelIntakeWatch or ChannelIntakeSubmit); an intake authorization
+	// of another channel does not admit it.
+	IntakeChannel string
+	// Lock takes a share lock on the row found, inside an activation
+	// transaction: a revoke that commits first is seen, one that waits
+	// commits after the switch.
+	Lock bool
+}
+
+// scopeClause restricts a query to the rows of an AuthScope whose
+// IntakeName is parameter n and IntakeChannel parameter n+1.
+func scopeClause(n int) string {
+	return fmt.Sprintf(`(channel = 'operator' OR ($%d <> '' AND channel = $%d AND channel <> 'operator' AND intake_name = $%d))`, n, n+1, n)
+}
+
+// Authorized returns an open, unexpired authorization in scope that covers
+// the digest (and size, when the authorization records one), preferring an
+// operator's, or nil. A registry without the table (version < 2)
+// authorizes nothing.
+func Authorized(ctx context.Context, q Querier, region, digest string, size int64, scope AuthScope) (*Authorization, error) {
+	lock := ""
+	if scope.Lock {
+		lock = " FOR SHARE"
+	}
 	a, err := scanAuth(q.QueryRow(ctx, `SELECT `+authColumns+` FROM registry.authorizations
 WHERE region_id = $1 AND sha256 = $2 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())
-  AND (size_bytes IS NULL OR size_bytes = $3)`, region, digest, size))
+  AND (size_bytes IS NULL OR size_bytes = $3) AND `+scopeClause(4)+` ORDER BY `+authPrecedence+` LIMIT 1`+lock, region, digest, size,
+		scope.IntakeName, scope.IntakeChannel))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && (pgErr.Code == "42P01" || pgErr.Code == "3F000") {
+		return nil, nil
+	}
+	return a, err
+}
+
+// LatestAuthorization returns the newest authorization in scope ever
+// recorded for (region, digest), open or not, or nil: it explains why a
+// digest is not authorized (revoked, expired) when Authorized finds nothing.
+func LatestAuthorization(ctx context.Context, q Querier, region, digest string, scope AuthScope) (*Authorization, error) {
+	a, err := scanAuth(q.QueryRow(ctx, `SELECT `+authColumns+` FROM registry.authorizations
+WHERE region_id = $1 AND sha256 = $2 AND `+scopeClause(3)+` ORDER BY id DESC LIMIT 1`, region, digest, scope.IntakeName, scope.IntakeChannel))
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	return a, err

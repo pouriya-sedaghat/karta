@@ -107,25 +107,7 @@ func printPublic(pub ed25519.PublicKey) error {
 	return nil
 }
 
-func loadKey(path string) (ed25519.PrivateKey, error) {
-	b, err := os.ReadFile(path) // #nosec G304 -- operator-named key file
-	if err != nil {
-		return nil, err
-	}
-	blk, _ := pem.Decode(b)
-	if blk == nil || blk.Type != "PRIVATE KEY" {
-		return nil, fmt.Errorf("%s is not a PKCS#8 PEM private key", path)
-	}
-	k, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
-	if err != nil {
-		return nil, err
-	}
-	ek, ok := k.(ed25519.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("%s is not an Ed25519 key", path)
-	}
-	return ek, nil
-}
+func loadKey(path string) (ed25519.PrivateKey, error) { return online.LoadSigningKey(path) }
 
 func pubkey(args []string) error {
 	fs := flag.NewFlagSet("pubkey", flag.ExitOnError)

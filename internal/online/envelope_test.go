@@ -305,3 +305,37 @@ func TestParseSource(t *testing.T) {
 		}
 	}
 }
+
+// VerifySignedBy: a signer's check of its own earlier publication. The
+// signature and region bindings are those of Verify; the validity window is
+// not checked (a publication found after a restore may have expired).
+func TestVerifySignedBy(t *testing.T) {
+	a, other := testKey("a"), testKey("other")
+	keys := map[string]ed25519.PublicKey{"a": a.Public().(ed25519.PublicKey)}
+	expired := testManifest()
+	expired.IssuedAt, expired.ExpiresAt = testNow.Add(-30*24*time.Hour), testNow.Add(-20*24*time.Hour)
+	expired.Snapshot.DataTimestamp = testNow.Add(-31 * 24 * time.Hour)
+	m, id, err := VerifySignedBy(signed(t, expired, Signer{"a", a}), keys, testRegion)
+	if err != nil || id != "a" || m.Serial != expired.Serial {
+		t.Fatalf("an expired own publication: %+v %q %v", m, id, err)
+	}
+	elsewhere := testManifest()
+	elsewhere.RegionID = "elsewhere"
+	box := testManifest()
+	box.BBox = BBox{0, 0, 1, 1}
+	for name, c := range map[string]struct {
+		raw  []byte
+		code string
+	}{
+		"an untrusted key":           {signed(t, testManifest(), Signer{"other", other}), CodeSignatureUntrusted},
+		"a forged claim of key a":    {signed(t, testManifest(), Signer{"a", other}), CodeSignatureInvalid},
+		"a valid and a forged claim": {signed(t, testManifest(), Signer{"a", a}, Signer{"a", other}), CodeSignatureInvalid},
+		"another region":             {signed(t, elsewhere, Signer{"a", a}), CodeRegionMismatch},
+		"another box":                {signed(t, box, Signer{"a", a}), CodeRegionMismatch},
+		"not an envelope":            {[]byte(`{"payload": 1}`), CodeManifestInvalid},
+	} {
+		if _, _, err := VerifySignedBy(c.raw, keys, testRegion); CodeOf(err) != c.code {
+			t.Errorf("%s: %v, want %s", name, err, c.code)
+		}
+	}
+}

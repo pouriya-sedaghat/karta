@@ -1,0 +1,11 @@
+# Scrape job for a co-located controlled source bridge (compose.bridge.yaml
+# mounts this directory at /etc/karta-extra). bridge-serve answers on its
+# metrics listener (KARTA_BRIDGE_METRICS_LISTEN_ADDR=:9465) to the
+# monitoring credential only, over the `bridge` network (no NAT).
+scrape_configs:
+  - job_name: karta-bridge
+    metrics_path: /metrics
+    authorization:
+      credentials_file: /run/secrets/operator_monitor_token
+    static_configs:
+      - targets: ["bridge-serve:9465"]

@@ -168,3 +168,7 @@ func unwrapMsg(err error) string {
 	}
 	return truncate(err.Error(), 300)
 }
+
+// Classify turns a transport error into a coded *Error without the URL (for
+// the bridge's acquisition client, which shares this client and policy).
+func Classify(ctx context.Context, err error) error { return classify(ctx, err) }

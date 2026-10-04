@@ -124,7 +124,7 @@ func InspectContext(ctx context.Context, path string, maxSize int64) (Info, erro
 	switch format {
 	case FormatPBF:
 		counter := &countingReader{r: io.TeeReader(ctxReader{ctx, f}, h)}
-		err = scanPBF(bufio.NewReaderSize(counter, 1<<20), &info)
+		err = scanPBF(bufio.NewReaderSize(counter, 1<<20), &info, false)
 		if err == nil && counter.n != st.Size() {
 			err = fmt.Errorf("read %d bytes but the file is %d bytes; it changed while being read", counter.n, st.Size())
 		}
@@ -176,9 +176,37 @@ func Digest(path string) (string, error) {
 // that would overflow a signed Unix time).
 const maxTimestamp = 253402300799
 
-// scanPBF reads every blob of a PBF file. The first must be OSMHeader, all
-// others OSMData; the file must end exactly after the last blob.
-func scanPBF(r io.Reader, info *Info) error {
+// Header reads only the OSMHeader block of a PBF file (its box, replication
+// timestamp and required features), without hashing or scanning the rest.
+// It is the local intake's cheap advisory check before it authorizes a
+// digest; the publisher still scans the whole staged file.
+func Header(path string) (Info, error) {
+	if f, err := DetectFormat(path); err != nil || f != FormatPBF {
+		return Info{}, errors.New("not a .osm.pbf file")
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) // #nosec G304 -- the caller's own copy
+	if err != nil {
+		return Info{}, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return Info{}, err
+	}
+	if !st.Mode().IsRegular() {
+		return Info{}, fmt.Errorf("%s is not a regular file", path)
+	}
+	info := Info{Path: path, Format: FormatPBF, Size: st.Size()}
+	if err := scanPBF(bufio.NewReaderSize(f, 1<<16), &info, true); err != nil {
+		return Info{}, fmt.Errorf("%s: %w", path, err)
+	}
+	return info, nil
+}
+
+// scanPBF reads every blob of a PBF file (only the first with headerOnly).
+// The first must be OSMHeader, all others OSMData; the file must end
+// exactly after the last blob.
+func scanPBF(r io.Reader, info *Info, headerOnly bool) error {
 	var hdrBuf, blobBuf []byte
 	var offset int64
 	for n := 0; ; n++ {
@@ -245,6 +273,9 @@ func scanPBF(r io.Reader, info *Info) error {
 		}
 		if err != nil {
 			return fmt.Errorf("PBF %s block at byte %d: %w", typ, offset, err)
+		}
+		if headerOnly {
+			return nil
 		}
 		info.Blocks++
 		offset += 4 + int64(hl) + int64(dataSize) // #nosec G115 -- bounded sizes

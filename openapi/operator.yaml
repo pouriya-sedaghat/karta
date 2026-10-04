@@ -50,6 +50,30 @@ info:
     key was removed during the build, the submission is `rejected` with the
     verification code (reason "at activation ...") and its validated
     release stays `ready`.
+
+    **Local intake (Stage 5, opt-in).** With `KARTA_INTAKE_DIR` set, the
+    publisher also processes the local intake's handoff directory (scanned
+    first, then the inbox, then online deliveries). Intake credentials hold
+    exactly one scope, `intake_watch` (the unattended watcher) or
+    `intake_submit` (a named person's command), and reach only
+    `/v1/operator/intake/authorizations`: they create bounded authorizations
+    for one exact digest (required size, the publisher's region, at most
+    `KARTA_INTAKE_AUTHORIZATION_MAX_AGE`, at most `KARTA_INTAKE_MAX_OPEN` open
+    per credential), read their own, and close their own. Every other route
+    answers them `403`. Every automatic manual, command-line and intake
+    activation re-checks, at the switch, that the digest is still pinned or
+    covered by an open, unexpired authorization; otherwise the submission is
+    `rejected` (`authorization_revoked`, `authorization_expired` or
+    `unauthorized_digest`, reason "at activation ...") and its release stays
+    `ready`; a fresh authorization re-evaluates it and activates the ready
+    release without a rebuild. A rollback also pauses automatic activation of
+    deliveries admitted only by `intake_watch` authorizations
+    (`intake_activation_paused`; `intake/resume` lifts it). See
+    docs/adr/0006-stage5-hybrid-intake.md.
+
+    **Credentials** are read again when the publisher's credentials file
+    changes; while it cannot be read or does not parse, every request is
+    refused with `503 credentials_unavailable`.
   license:
     name: Apache-2.0 (API description)
 servers:
@@ -334,6 +358,177 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/intake/authorizations:
+    post:
+      summary: Authorize one exact digest for the local intake (intake credentials only)
+      operationId: operatorIntakeAuthorize
+      description: |
+        Scope `intake_watch` or `intake_submit`, and nothing else. Creates an
+        authorization for one exact snapshot digest and size, for the handoff
+        name the intake will use, valid for `ttl_seconds` (at most the
+        publisher's cap). The channel is the credential's scope. The same
+        credential repeating the same digest, size and name gets its open
+        authorization back (`200`, `created: false`); a different size or name
+        closes only that credential's own row first. Authorizations of
+        operators and of other intake credentials are never touched. `name`
+        must be a handoff name of the caller's own channel, the publisher's
+        region and the requested digest
+        (`<region>-<w|c><UTC time>-<first 12 hex digits of sha256>`, `w` for
+        `intake_watch`, `c` for `intake_submit`). An intake authorization
+        admits only the intake handoff of that name written by that channel:
+        never a handoff of the other channel, nor the same bytes through the
+        inbox, `karta import` or an online source. `409 intake_disabled`
+        without `KARTA_INTAKE_DIR`; `409 intake_limit_reached` beyond
+        `KARTA_INTAKE_MAX_OPEN`; `409 intake_refused` (`reason_code`
+        `region_mismatch`, `too_large`, `validity_beyond_cap`,
+        `handoff_name_mismatch`) outside the publisher's bounds,
+        (`handoff_name_taken`) for a name that an earlier authorization of
+        any credential (open or closed) or an intake submission already
+        carries, since a handoff name is never reused (the request changes
+        nothing; ask again under another name), or (`digest_revoked`) for a
+        digest an operator revoked, until an operator authorizes it again.
+        Serialized with operator authorize and revoke of the same digest.
+        Audited as `intake_authorize`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sha256, size_bytes, region_id, ttl_seconds, name, reason]
+              properties:
+                sha256: { $ref: "#/components/schemas/SHA256" }
+                size_bytes: { type: integer, format: int64, minimum: 1 }
+                region_id: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$", description: Must be the publisher's region. }
+                ttl_seconds: { type: integer, format: int64, minimum: 60, description: "Validity from now; at most `limits.max_ttl_seconds`." }
+                name: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", description: The handoff name. }
+                reason: { $ref: "#/components/schemas/Reason" }
+      responses:
+        "201":
+          description: Authorization created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthorizationResult" }
+        "200":
+          description: The credential's equal open authorization.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthorizationResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+    get:
+      summary: The caller's own intake authorizations and their outcomes
+      operationId: operatorIntakeList
+      description: |
+        Scope `intake_watch` or `intake_submit`. The caller's open
+        authorizations and those closed in the last week (at most 50), each
+        with the newest intake submission carrying its handoff name and
+        recorded after the authorization was created, and the limits the
+        publisher enforces. Nothing else is visible.
+      responses:
+        "200":
+          description: The caller's records.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IntakeList" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/intake/authorizations/{id}/close:
+    post:
+      summary: Close one of the caller's own intake authorizations
+      operationId: operatorIntakeClose
+      description: |
+        Scope `intake_watch` or `intake_submit`. Another principal's id is
+        `404 not_found`. Closing a closed authorization is a no-op
+        (`closed: false`). Audited as `intake_close`.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64, minimum: 1 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReasonBody" }
+      responses:
+        "200":
+          description: Whether the authorization was open.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [closed]
+                properties:
+                  closed: { type: boolean }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/intake/pause:
+    post:
+      summary: Pause automatic activation of watcher deliveries
+      operationId: operatorIntakePause
+      description: |
+        Scope `publish`. Deliveries admitted only by `intake_watch`
+        authorizations are still built and validated, but kept `ready`
+        (`intake_activation_paused`). A rollback pauses automatically.
+        Deliveries by the authenticated command (`intake_submit`), operator
+        authorizations and pins are not paused. Audited as `intake_pause`.
+        `409 intake_disabled` without the intake.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReasonBody" }
+      responses:
+        "200":
+          description: The policy after the request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IntakePolicyResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/intake/resume:
+    post:
+      summary: Resume automatic activation of watcher deliveries
+      operationId: operatorIntakeResume
+      description: |
+        Scope `publish`. Applies to the next activation; a release kept
+        `ready` while paused is activated explicitly. Audited as
+        `intake_resume`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReasonBody" }
+      responses:
+        "200":
+          description: The policy after the request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IntakePolicyResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
   /v1/operator/online/pause:
     post:
       summary: Pause automatic activation of online snapshots
@@ -464,11 +659,14 @@ components:
               enum: [unauthenticated, forbidden, invalid_request, request_body_too_large, unsupported_media_type, method_not_allowed,
                      not_found, unknown_release, release_not_eligible, release_incompatible, active_release_changed, busy,
                      no_rollback_target, policy_refused, timeout, service_unavailable, internal_error, online_disabled,
-                     nothing_to_retry]
+                     nothing_to_retry, intake_disabled, intake_limit_reached, intake_refused, credentials_unavailable]
             message: { type: string }
             reason_code:
               type: string
-              description: For `policy_refused`, the rule that refused (older_than_active, not_newer, region_changed, excessive_data_loss, counts_unavailable, region_config).
+              description: |
+                For `policy_refused`, the rule that refused (older_than_active, not_newer, region_changed, excessive_data_loss,
+                counts_unavailable, region_config); for `intake_refused`, region_mismatch, too_large, validity_beyond_cap,
+                digest_revoked, handoff_name_mismatch or handoff_name_taken.
             request_id: { type: string }
     SwitchBody:
       type: object
@@ -535,7 +733,7 @@ components:
                  reason, release_id, attempts, created_at, updated_at, finished_at, manifest_serial, manifest_sha256]
       properties:
         id: { type: integer, format: int64 }
-        source: { type: string, enum: [inbox, cli, online] }
+        source: { type: string, enum: [inbox, cli, online, intake] }
         name: { type: string }
         fingerprint: { type: string }
         region_id: { type: string }
@@ -549,6 +747,7 @@ components:
           nullable: true
           description: |
             Why the submission ended as it did, for example `unauthorized_digest`,
+            `authorization_expired`, `authorization_revoked`, `intake_activation_paused`,
             `insufficient_storage`, `policy_refused` or `publication_timeout` (the
             whole publication exceeded `KARTA_PUBLISH_TIMEOUT` and was stopped; it
             is final and not retried automatically: submit it again after raising
@@ -563,7 +762,8 @@ components:
         manifest_sha256: { type: string, nullable: true, description: SHA-256 of the signed manifest envelope of an online delivery. }
     Authorization:
       type: object
-      required: [id, region_id, sha256, size_bytes, reason, created_by, created_at, expires_at, revoked_at, revoked_by, revoke_reason]
+      required: [id, region_id, sha256, size_bytes, reason, created_by, created_at, expires_at, revoked_at, revoked_by, revoke_reason,
+                 channel, intake_name]
       properties:
         id: { type: integer, format: int64 }
         region_id: { type: string }
@@ -576,6 +776,8 @@ components:
         revoked_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
         revoked_by: { type: string, nullable: true }
         revoke_reason: { type: string, nullable: true }
+        channel: { type: string, enum: [operator, intake_watch, intake_submit], description: Who created it. }
+        intake_name: { type: string, nullable: true, description: The handoff name of an intake authorization. }
     AuthorizationResult:
       type: object
       required: [authorization, created]
@@ -589,7 +791,7 @@ components:
         id: { type: integer, format: int64 }
         at: { $ref: "#/components/schemas/Timestamp" }
         actor: { type: string, description: "Credential name, `inbox`, `cli`, `system` or `anonymous`." }
-        source: { type: string, enum: [operator_api, inbox, cli, system, online] }
+        source: { type: string, enum: [operator_api, inbox, cli, system, online, intake] }
         action: { type: string }
         target: { type: string }
         outcome: { type: string, enum: [succeeded, rejected, failed, denied, noop] }
@@ -622,7 +824,7 @@ components:
               why: { type: string }
     Status:
       type: object
-      required: [region, policy, active, releases, submissions, authorizations, inbox, job, storage, online, freshness]
+      required: [region, policy, active, releases, submissions, authorizations, inbox, job, storage, online, intake, freshness]
       properties:
         region:
           type: object
@@ -689,6 +891,7 @@ components:
             staging_free_bytes: { type: integer, format: int64, nullable: true }
             min_free_bytes: { type: integer, format: int64 }
         online: { $ref: "#/components/schemas/OnlineStatus" }
+        intake: { $ref: "#/components/schemas/IntakeStatus" }
         freshness:
           type: object
           required: [update_mode, active_data_timestamp, active_data_age_seconds, stale_after_seconds, stale]
@@ -845,3 +1048,143 @@ components:
             started_at: { $ref: "#/components/schemas/Timestamp" }
             attempts: { type: integer }
             abandoned_until: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+    IntakePolicy:
+      type: object
+      required: [region_id, watcher_auto_activate, changed_at, changed_by, change_reason]
+      properties:
+        region_id: { type: string }
+        watcher_auto_activate: { type: boolean, description: False while automatic activation of watcher deliveries is paused. }
+        changed_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        changed_by: { type: string, nullable: true }
+        change_reason: { type: string, nullable: true }
+    IntakePolicyResult:
+      type: object
+      required: [changed, policy]
+      properties:
+        changed: { type: boolean }
+        policy: { $ref: "#/components/schemas/IntakePolicy" }
+    IntakeLimits:
+      type: object
+      required: [region_id, max_ttl_seconds, max_open, max_snapshot_bytes]
+      properties:
+        region_id: { type: string }
+        max_ttl_seconds: { type: number }
+        max_open: { type: integer }
+        max_snapshot_bytes: { type: integer, format: int64 }
+    IntakeList:
+      type: object
+      required: [limits, records]
+      properties:
+        limits: { $ref: "#/components/schemas/IntakeLimits" }
+        records:
+          type: array
+          items:
+            type: object
+            required: [authorization, submission]
+            properties:
+              authorization: { $ref: "#/components/schemas/Authorization" }
+              submission: { allOf: [{ $ref: "#/components/schemas/Submission" }], nullable: true }
+    IntakeStatus:
+      type: object
+      required: [enabled, auto_activate, policy, limits, open_authorizations, watcher, last_scan]
+      properties:
+        enabled: { type: boolean }
+        auto_activate: { type: boolean, description: "Whether a watcher delivery is activated now: KARTA_PUBLISH_AUTO_ACTIVATE and not paused." }
+        policy: { allOf: [{ $ref: "#/components/schemas/IntakePolicy" }], nullable: true }
+        limits: { allOf: [{ $ref: "#/components/schemas/IntakeLimits" }], nullable: true }
+        open_authorizations: { type: object, additionalProperties: { type: integer, format: int64 }, description: "Open, unexpired intake authorizations by channel." }
+        watcher:
+          type: object
+          required: [state, state_age_seconds]
+          description: The watcher's own report, read from its state file in the handoff directory.
+          properties:
+            state: { allOf: [{ $ref: "#/components/schemas/IntakeState" }], nullable: true }
+            state_age_seconds: { type: number, nullable: true }
+            error: { type: string }
+        last_scan:
+          type: object
+          required: [at, pending]
+          properties:
+            at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+            error: { type: string }
+            pending:
+              type: array
+              items:
+                type: object
+                required: [name, waiting]
+                properties:
+                  name: { type: string }
+                  waiting: { type: string, enum: [waiting_for_ready_marker, waiting_for_snapshot, settling] }
+                  problem: { type: string }
+    IntakeHandoff:
+      type: object
+      required: [name, from, sha256, size_bytes, authorization_id, channel, handed_off_at, submission_state]
+      properties:
+        name: { type: string }
+        from: { type: string, description: The landing file it came from. }
+        sha256: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        authorization_id: { type: integer, format: int64 }
+        channel: { type: string }
+        handed_off_at: { $ref: "#/components/schemas/Timestamp" }
+        landing_fingerprint: { type: string }
+        submission_state: { type: string }
+        reason_code: { type: string }
+        release_id: { type: string }
+        finished_at: { $ref: "#/components/schemas/Timestamp" }
+    IntakeState:
+      type: object
+      required: [version, updated_at, landing, last_scan_at, stopped_at, preflight, entries, handoffs, last_outcome, last_error, consumed]
+      properties:
+        version: { type: integer }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        landing: { type: string }
+        last_scan_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
+        stopped_at:
+          allOf: [{ $ref: "#/components/schemas/Timestamp" }]
+          nullable: true
+          description: Set when the watcher stopped cleanly (a deliberate stop or shutdown); cleared by its next scan.
+        preflight:
+          type: object
+          required: [ok, checked_at, fs_type, problems]
+          properties:
+            ok: { type: boolean }
+            checked_at: { $ref: "#/components/schemas/Timestamp" }
+            fs_type: { type: string }
+            problems:
+              type: array
+              nullable: true
+              items:
+                type: object
+                required: [code, path, detail]
+                properties:
+                  code: { type: string }
+                  path: { type: string }
+                  detail: { type: string }
+        entries:
+          type: array
+          nullable: true
+          items:
+            type: object
+            required: [name, state, size_bytes]
+            properties:
+              name: { type: string }
+              state: { type: string, enum: [waiting_for_completion_marker, settling, queue_full, refused, delivered] }
+              code: { type: string }
+              detail: { type: string }
+              size_bytes: { type: integer, format: int64 }
+        handoffs: { type: array, nullable: true, items: { $ref: "#/components/schemas/IntakeHandoff" } }
+        last_outcome: { allOf: [{ $ref: "#/components/schemas/IntakeHandoff" }], nullable: true }
+        last_error: { $ref: "#/components/schemas/Problem" }
+        consumed:
+          type: array
+          nullable: true
+          items:
+            type: object
+            required: [fingerprint, name, outcome, at]
+            properties:
+              fingerprint: { type: string }
+              name: { type: string }
+              outcome: { type: string, enum: [delivered, refused] }
+              code: { type: string }
+              at: { $ref: "#/components/schemas/Timestamp" }

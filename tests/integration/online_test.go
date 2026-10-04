@@ -83,14 +83,15 @@ type sourceRule struct {
 }
 
 type sourceRequest struct {
-	Method  string `json:"method"`
-	Host    string `json:"host"`
-	Path    string `json:"path"`
-	Query   string `json:"query"`
-	Range   string `json:"range"`
-	IfRange string `json:"if_range"`
-	Auth    string `json:"authorization"`
-	Status  int    `json:"status"`
+	Method    string `json:"method"`
+	Host      string `json:"host"`
+	Path      string `json:"path"`
+	Query     string `json:"query"`
+	Range     string `json:"range"`
+	IfRange   string `json:"if_range"`
+	Auth      string `json:"authorization"`
+	UserAgent string `json:"user_agent"`
+	Status    int    `json:"status"`
 }
 
 // --- the test source -----------------------------------------------------------

@@ -2,6 +2,7 @@ package operator
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,11 +19,30 @@ import (
 type CredentialFile struct {
 	path string
 	log  *slog.Logger
+	// strict refuses every credential while the file cannot be read or does
+	// not parse (the operator API), instead of keeping the previous ones.
+	strict bool
 
-	mu    sync.Mutex
-	key   fileKey
-	creds []Credential
+	mu     sync.Mutex
+	key    fileKey
+	creds  []Credential
+	broken error
 }
+
+// CredentialSource yields the credentials in force for each request.
+type CredentialSource interface {
+	Credentials() ([]Credential, error)
+}
+
+// StaticCredentials never change (tests and one-off tools).
+type StaticCredentials []Credential
+
+// Credentials returns the credentials.
+func (s StaticCredentials) Credentials() ([]Credential, error) { return s, nil }
+
+// ErrCredentialsUnavailable means the credentials file cannot be used: every
+// request is refused until it is fixed.
+var ErrCredentialsUnavailable = errors.New("the operator credentials file cannot be read or does not parse")
 
 type fileKey struct {
 	size  int64
@@ -53,6 +73,53 @@ func OpenCredentialFile(path string, log *slog.Logger) (*CredentialFile, error) 
 		return nil, err
 	}
 	return &CredentialFile{path: path, log: log, key: k, creds: creds}, nil
+}
+
+// OpenStrictCredentialFile loads a credentials file that is read again when
+// it changes and fails closed: while the file is missing, unreadable or does
+// not parse, Credentials returns ErrCredentialsUnavailable, so a broken edit
+// cannot keep a removed credential working (the operator API, Stage 5).
+func OpenStrictCredentialFile(path string, log *slog.Logger) (*CredentialFile, error) {
+	f, err := OpenCredentialFile(path, log)
+	if err != nil {
+		return nil, err
+	}
+	f.strict = true
+	return f, nil
+}
+
+// Credentials returns the credentials in force (see Current); a strict file
+// that cannot be used returns ErrCredentialsUnavailable.
+func (f *CredentialFile) Credentials() ([]Credential, error) {
+	if !f.strict {
+		return f.Current(), nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, err := statKey(f.path)
+	if err != nil {
+		if f.broken == nil {
+			f.log.Error("operator credentials file cannot be read; refusing every request until it is restored", "file", f.path, "err", err)
+		}
+		f.broken, f.key = err, fileKey{}
+		return nil, fmt.Errorf("%w: %v", ErrCredentialsUnavailable, err)
+	}
+	if k == f.key {
+		if f.broken != nil {
+			return nil, fmt.Errorf("%w: %v", ErrCredentialsUnavailable, f.broken)
+		}
+		return f.creds, nil
+	}
+	creds, err := LoadCredentials(f.path)
+	f.key = k
+	if err != nil {
+		f.broken, f.creds = err, nil
+		f.log.Error("operator credentials file changed but does not parse; refusing every request until it is fixed", "file", f.path, "err", err)
+		return nil, fmt.Errorf("%w: %v", ErrCredentialsUnavailable, err)
+	}
+	f.creds, f.broken = creds, nil
+	f.log.Info("operator credentials reloaded", "file", f.path, "credentials", len(creds))
+	return creds, nil
 }
 
 // Current returns the credentials, reading the file again if it changed.

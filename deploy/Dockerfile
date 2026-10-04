@@ -2,8 +2,10 @@
 #
 # Karta images. Every base image is pinned by manifest-list digest.
 #   target api       distroless, non-root: `karta serve` plus the demo assets
-#                    (also `karta operator`, the operator API client, and
-#                    `karta fetcher`, the opt-in online source poller)
+#                    (also `karta operator`, the operator API client,
+#                    `karta fetcher`, the opt-in online source poller,
+#                    `karta intake`, the opt-in local intake, and
+#                    `karta bridge`, the opt-in controlled source bridge)
 #   target importer  Ubuntu 24.04 + osm2pgsql 1.11.0, non-root: `karta import`
 #                    and `karta publisher` (entrypoint overridden in compose);
 #                    also karta-load, the capacity measuring tool
@@ -40,7 +42,8 @@ COPY openapi/ openapi/
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/karta ./cmd/karta \
  && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/karta-load ./cmd/karta-load \
- && mkdir -p /out/online
+ && mkdir -p /out/online /out/intake /out/bridge/spool /out/bridge/publish /out/bridge/state \
+ && chmod 0700 /out/bridge/state
 # License notices of everything compiled into the binaries (the Go standard
 # library and every linked module) and of the embedded Vazirmatn fonts,
 # shipped in both images under /usr/share/licenses/karta (docs/licenses.md).
@@ -61,8 +64,12 @@ FROM ${RUNTIME_IMAGE} AS api
 COPY --from=build /out/karta /usr/local/bin/karta
 COPY --from=web /src/web/dist /opt/karta/web
 COPY --from=build /out/licenses /usr/share/licenses/karta
-# The fetcher's outbox (a named volume takes this owner when first mounted).
+# The fetcher's outbox, the intake handoff directory and the bridge's spool,
+# publish and signer-state directories (a named volume takes the owner and
+# mode of the image directory it is first mounted on).
 COPY --from=build --chown=65532:65532 /out/online /var/lib/karta/online
+COPY --from=build --chown=65532:65532 /out/intake /data/intake
+COPY --from=build --chown=65532:65532 /out/bridge /var/lib/karta/bridge
 ENV KARTA_WEB_DIR=/opt/karta/web
 USER 65532:65532
 EXPOSE 8080
@@ -77,7 +84,8 @@ RUN apt-get update \
  && useradd --system --uid 10001 --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin karta \
  && install -d -o 10001 -g 10001 -m 0700 /var/lib/karta/staging \
  && install -d -o root -g root -m 0755 /data/inbox \
- && install -d -o 65532 -g 65532 -m 0755 /data/online
+ && install -d -o 65532 -g 65532 -m 0755 /data/online \
+ && install -d -o 65532 -g 65532 -m 0755 /data/intake
 COPY --from=build /out/karta /out/karta-load /usr/local/bin/
 COPY --from=build /out/licenses /usr/share/licenses/karta
 USER 10001:10001

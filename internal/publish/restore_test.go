@@ -4,12 +4,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pouriya-sedaghat/karta/internal/registry"
 )
 
 // summary builds a registry summary: active release, releases (id=state),
 // audit high-water mark and the verified serial of region "r".
 func summary(active string, releases map[string]string, audit, serial int64) RegistrySummary {
-	return RegistrySummary{TakenAt: time.Now(), SchemaVersion: 3, ActiveRelease: active, Releases: releases,
+	return RegistrySummary{TakenAt: time.Now(), SchemaVersion: registry.SchemaVersion, ActiveRelease: active, Releases: releases,
 		AuditMaxID: audit, AuditCount: audit, SourceSerials: map[string]int64{"r": serial}, OnlinePaused: map[string]bool{}}
 }
 

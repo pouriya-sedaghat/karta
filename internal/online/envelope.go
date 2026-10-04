@@ -217,62 +217,113 @@ var minDataTimestamp = time.Date(2004, 8, 9, 0, 0, 0, 0, time.UTC)
 // snapshot reference. Serial ordering is checked by the caller against its
 // persisted state.
 func Verify(raw []byte, o VerifyOptions) (*Verified, error) {
-	if len(raw) > MaxEnvelopeBytes {
-		return nil, errorf(CodeManifestTooLarge, "the manifest envelope is larger than %d bytes", MaxEnvelopeBytes)
-	}
-	var env Envelope
-	if err := strictDecode(raw, &env); err != nil {
-		return nil, errorf(CodeManifestInvalid, "envelope: %v", err)
-	}
-	if env.PayloadType != PayloadType {
-		return nil, errorf(CodeManifestInvalid, "payloadType %q is not %q", truncate(env.PayloadType, 80), PayloadType)
-	}
-	payload, err := base64.StdEncoding.Strict().DecodeString(env.Payload)
-	if err != nil {
-		return nil, errorf(CodeManifestInvalid, "payload is not standard base64")
-	}
-	if len(payload) > MaxPayloadBytes {
-		return nil, errorf(CodeManifestTooLarge, "the manifest payload is larger than %d bytes", MaxPayloadBytes)
-	}
-	if n := len(env.Signatures); n == 0 || n > MaxSignatures {
-		return nil, errorf(CodeManifestInvalid, "the envelope must carry 1 to %d signatures", MaxSignatures)
-	}
-	msg := PAE(env.PayloadType, payload)
-	var signedBy *key
-	for i, sig := range env.Signatures {
-		var k *key
+	m, id, pub, err := signedManifest(raw, func(keyID string) []byte {
 		for j := range o.Source.keys {
-			if o.Source.keys[j].id == sig.KeyID {
-				k = &o.Source.keys[j]
+			k := &o.Source.keys[j]
+			if k.id == keyID {
+				if k.notAfter != nil && o.Now.After(*k.notAfter) {
+					return nil // the key's validity ended
+				}
+				return k.pub
 			}
 		}
-		if k == nil {
-			continue // not a trusted key (for example a key being introduced)
-		}
-		if k.notAfter != nil && o.Now.After(*k.notAfter) {
-			continue // the key's validity ended
-		}
-		s, err := base64.StdEncoding.Strict().DecodeString(sig.Sig)
-		if err != nil || len(s) != ed25519.SignatureSize || !ed25519.Verify(k.pub, msg, s) {
-			return nil, errorf(CodeSignatureInvalid, "signature %d claims trusted key %q but does not verify", i, sig.KeyID)
-		}
-		if signedBy == nil {
-			signedBy = k
-		}
-	}
-	if signedBy == nil {
-		return nil, errorf(CodeSignatureUntrusted, "no signature by a trusted, currently valid key")
-	}
-	var m Manifest
-	if err := strictDecode(payload, &m); err != nil {
-		return nil, errorf(CodeManifestInvalid, "manifest: %v", err)
+		return nil // not a trusted key (for example a key being introduced)
+	})
+	if err != nil {
+		return nil, err
 	}
 	if err := checkManifest(m, o); err != nil {
 		return nil, err
 	}
 	sum := sha256.Sum256(raw)
-	return &Verified{Manifest: m, KeyID: signedBy.id, KeyFingerprint: Fingerprint(signedBy.pub),
+	return &Verified{Manifest: m, KeyID: id, KeyFingerprint: Fingerprint(pub),
 		EnvelopeSHA256: hex.EncodeToString(sum[:]), Raw: raw}, nil
+}
+
+// VerifySignedBy checks an envelope the way Verify does (strict structure
+// and limits, a valid signature by one of keys, no invalid signature
+// claiming one of them) and that its manifest is bound to the region (id and
+// box) with a sane snapshot reference. It does not check the validity
+// window or a source's limits: it is for a signer deciding whether a
+// publication it finds (which may have expired since) is one of its own.
+// It returns the manifest and the id of the first key that signed it.
+func VerifySignedBy(raw []byte, keys map[string]ed25519.PublicKey, cfg region.Config) (*Manifest, string, error) {
+	m, id, _, err := signedManifest(raw, func(keyID string) []byte {
+		if k, ok := keys[keyID]; ok {
+			return k
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	bad := func(format string, args ...any) error { return errorf(CodeManifestInvalid, format, args...) }
+	switch {
+	case m.Format != ManifestFormat:
+		return nil, "", bad("format %q is not %q", truncate(m.Format, 80), ManifestFormat)
+	case m.RegionID != cfg.ID:
+		return nil, "", errorf(CodeRegionMismatch, "manifest is for region %q, the signer serves %q", truncate(m.RegionID, 80), cfg.ID)
+	case !region.SameBBox([4]float64(m.BBox), cfg.BBox):
+		return nil, "", errorf(CodeRegionMismatch, "manifest box %v differs from region %q box %v", m.BBox, cfg.ID, cfg.BBox)
+	case m.Serial < 1:
+		return nil, "", bad("serial must be a positive integer")
+	case m.IssuedAt.IsZero() || !m.ExpiresAt.After(m.IssuedAt):
+		return nil, "", bad("issued_at and expires_at are required, expires_at after issued_at")
+	case !sha256Pattern.MatchString(m.Snapshot.SHA256) || m.Snapshot.SizeBytes < 1:
+		return nil, "", bad("the snapshot reference needs a SHA-256 and a positive size")
+	}
+	return &m, id, nil
+}
+
+// signedManifest checks an envelope's structure and limits and its
+// signatures: trusted returns a key's public key, or nil when the key id is
+// not trusted (now). At least one signature must verify with a trusted key,
+// and none may claim a trusted key without verifying. It returns the
+// strictly decoded manifest and the first trusted key that signed it.
+func signedManifest(raw []byte, trusted func(keyID string) []byte) (Manifest, string, []byte, error) {
+	var m Manifest
+	if len(raw) > MaxEnvelopeBytes {
+		return m, "", nil, errorf(CodeManifestTooLarge, "the manifest envelope is larger than %d bytes", MaxEnvelopeBytes)
+	}
+	var env Envelope
+	if err := strictDecode(raw, &env); err != nil {
+		return m, "", nil, errorf(CodeManifestInvalid, "envelope: %v", err)
+	}
+	if env.PayloadType != PayloadType {
+		return m, "", nil, errorf(CodeManifestInvalid, "payloadType %q is not %q", truncate(env.PayloadType, 80), PayloadType)
+	}
+	payload, err := base64.StdEncoding.Strict().DecodeString(env.Payload)
+	if err != nil {
+		return m, "", nil, errorf(CodeManifestInvalid, "payload is not standard base64")
+	}
+	if len(payload) > MaxPayloadBytes {
+		return m, "", nil, errorf(CodeManifestTooLarge, "the manifest payload is larger than %d bytes", MaxPayloadBytes)
+	}
+	if n := len(env.Signatures); n == 0 || n > MaxSignatures {
+		return m, "", nil, errorf(CodeManifestInvalid, "the envelope must carry 1 to %d signatures", MaxSignatures)
+	}
+	msg := PAE(env.PayloadType, payload)
+	signedBy, signedPub := "", []byte(nil)
+	for i, sig := range env.Signatures {
+		pub := trusted(sig.KeyID)
+		if pub == nil {
+			continue
+		}
+		s, err := base64.StdEncoding.Strict().DecodeString(sig.Sig)
+		if err != nil || len(s) != ed25519.SignatureSize || len(pub) != ed25519.PublicKeySize || !ed25519.Verify(pub, msg, s) {
+			return m, "", nil, errorf(CodeSignatureInvalid, "signature %d claims trusted key %q but does not verify", i, sig.KeyID)
+		}
+		if signedPub == nil {
+			signedBy, signedPub = sig.KeyID, pub
+		}
+	}
+	if signedPub == nil {
+		return m, "", nil, errorf(CodeSignatureUntrusted, "no signature by a trusted, currently valid key")
+	}
+	if err := strictDecode(payload, &m); err != nil {
+		return m, "", nil, errorf(CodeManifestInvalid, "manifest: %v", err)
+	}
+	return m, signedBy, signedPub, nil
 }
 
 func checkManifest(m Manifest, o VerifyOptions) error {

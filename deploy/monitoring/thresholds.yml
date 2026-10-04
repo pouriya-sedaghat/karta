@@ -35,6 +35,23 @@ groups:
       # The fetcher is this late for its own next scheduled check: stopped or stuck.
       - record: karta:guard_fetcher_overdue_seconds
         expr: vector(900)
+      # The intake watcher's state is this old (it writes it after every
+      # scan, every KARTA_INTAKE_POLL_INTERVAL, 10 s, plus the time to copy
+      # and hash one delivery): crashed or hung.
+      - record: karta:guard_intake_watcher_overdue_seconds
+        expr: vector(900)
+      # The bridge downloader is this late for its next distributor check:
+      # longer than a whole download may take (download_timeout, 2h).
+      - record: karta:guard_bridge_acquire_overdue_seconds
+        expr: vector(10800)
+      # The bridge signer runs every few seconds; a full scan of an Iran PBF
+      # takes minutes. Older than this: stopped, failing closed or stuck.
+      - record: karta:guard_bridge_signer_stalled_seconds
+        expr: vector(1800)
+      # The published bridge manifest expires within this time: renewal
+      # (due at half its validity, 3.5 days) has failed for days.
+      - record: karta:guard_bridge_manifest_expiry_seconds
+        expr: vector(86400)
 
   - name: karta-objectives
     rules: []

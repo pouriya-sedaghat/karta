@@ -1,4 +1,4 @@
-# Karta runbook (Stage 4)
+# Karta runbook (Stage 5)
 
 Karta serves one **active release** of one region: vector tiles, a MapLibre
 style with local glyphs, named-place/POI search and a demo page, all from the
@@ -10,6 +10,12 @@ grace period and are kept for rollback; old ones are cleaned up. Optionally
 (off by default), a **fetcher** polls a configured HTTPS source for signed
 snapshot manifests and delivers newer verified snapshots to the publisher,
 which publishes them through the same path ("Online updates" below).
+Stage 5 adds two more opt-in intake paths in front of the same publication
+path: a **local intake** for outages (an authenticated command and a
+protected-folder watcher, "Local intake") and a **controlled source bridge**
+that turns Geofabrik's Iran extract into signed online updates
+("Controlled source bridge"). Both are engineering features tested with
+fixtures and local controlled services only.
 
 Stage 4 adds the operational layer: a deadline for every publication,
 metrics on a separate API listener, Prometheus alert rules with documented
@@ -35,6 +41,9 @@ from the network by any service.
 | `publisher` | importer image, UID 10001, `docker-init` as PID 1 | inbox watcher, builds, activation, cleanup, **operator API** | `backend` + `operator` (no NAT), 127.0.0.1:8081 |
 | `fetcher` | api image, UID 65532 | **opt-in** (`make up-online`): polls the online source, verifies signed manifests, downloads, delivers to the `online` volume; no database access | `egress` only, no port |
 | `operator-cli` | api image, UID 65532 | one-off operator API client (`make op`), holds the raw operator token | `operator` |
+| `intake-watch` | api image, UID 65532 | **opt-in** (`make up-intake`): watches the protected landing area, hands complete deliveries to the publisher with its own `intake_watch` credential | `operator` (no NAT), no port |
+| `intake-cli` | api image, UID 65532 | one-off authenticated intake command (`make intake-submit`), a person's `intake_submit` credential | `operator` |
+| `bridge-acquire`, `bridge-sign`, `bridge-serve` | api image, UID 65532 | **opt-in** (`compose.bridge.yaml`, `make up-bridge`): the controlled source bridge | `bridge-egress` / none / `bridge` (no NAT), 127.0.0.1:8443 and :9465 |
 | `importer` | importer image, UID 10001, `docker-init` | one-off command-line publication (`make import-*`), `restore-check`, `registry-summary`, `region-draft`, `karta-load` | `backend` |
 | `postgres-exporter` | pinned upstream image | **opt-in** (`make up-monitoring`): PostgreSQL statistics as role `karta_monitor` | `backend` + `monitoring` (no NAT), 127.0.0.1:9187 |
 | `prometheus` | pinned upstream image | **opt-in** (`make up-monitoring`): scrapes the three targets, evaluates the Karta alert rules | `backend` + `monitoring` (no NAT), 127.0.0.1:9090 |
@@ -385,6 +394,321 @@ would let an older but still valid manifest through.
 All Stage 2 reason codes (forward rule, validation, storage) apply to online
 submissions as well.
 
+## Local intake (opt-in, Stage 5)
+
+The local intake publishes a complete snapshot during an internet outage
+without a signing key, a fetcher or a per-file approval *after* a deliberate
+delivery: it establishes that the copy is complete from an **independent
+digest**, copies the bytes into its own handoff directory, and creates an
+authorization for **exactly that digest and size** through a narrow
+credential. The publisher then stages, verifies, builds and activates it
+like any manual submission and re-checks the authorization inside the
+switch transaction ([ADR 0006](adr/0006-stage5-hybrid-intake.md)). Two
+front ends share one implementation:
+
+* the **command**, `karta intake submit` (`make intake-submit`): a named
+  person with their own `intake_submit` credential submits one file and
+  follows it to its outcome. Always available once the intake is enabled,
+  also when the watcher is off or its preflight fails;
+* the **watcher**, `karta intake watch` (`make up-intake`): watches a
+  protected landing area for deliveries that carry a producer completion
+  marker. Opt-in per host, only after its preflight passes. **While it
+  runs, write access to the landing area is publication authority** for any
+  snapshot that passes the common checks: keep that write access to the
+  landing account and the people holding its keys.
+
+The direct manual path (inbox with a pin or an operator authorization, or
+`karta import`) stays available as an independent fallback.
+
+### Enable the intake and the command
+
+1. `.env`: `KARTA_INTAKE_DIR=/data/intake`, then `make up` (the publisher is
+   recreated with the `intake` volume read-only). `make op-status` shows
+   `intake.enabled: true` and the limits (`max_ttl_seconds`, `max_open`).
+2. Give each person their own credential (scope `intake_submit` only):
+
+   ```bash
+   scripts/operator-credential.sh add alice intake_submit    # creates secrets/alice.token; give it to alice only
+   scripts/operator-credential.sh list
+   ```
+
+   The running publisher picks it up at its next request; no restart.
+3. Submit with an **independent expectation** from the source copy: its
+   SHA-256 (and size) as recorded where the file came from, or the
+   producer's completion marker:
+
+   ```bash
+   make intake-submit FILE=/media/usb/iran-2026-10-01.osm.pbf TOKEN=secrets/alice.token \
+     SHA256=<64 hex of the source copy> SIZE=<bytes> REASON="outage delivery, digest from the download log"
+   make intake-submit FILE=... TOKEN=... EXPECT=/media/usb/iran-2026-10-01.osm.pbf.complete
+   make intake-submit FILE=... TOKEN=... ATTEST="copied directly from the verified source disk"   # last resort: the person's attestation, recorded
+   ```
+
+   The file (and its `.provenance.json` sidecar beside it, if any) must be
+   world-readable: the command runs as UID 65532. It copies and hashes the
+   file from wherever it is (a USB disk, a hypervisor share), refuses a
+   mismatch **before** creating any authorization, hands it off and waits
+   for the outcome (`NO_WAIT=1` returns after the handoff). Exit status: 0
+   published (or already active), 2 usage or no expectation, 3 the input was
+   refused (mismatch, region, size), 4 a publication outcome other than
+   published (the JSON names the state and reason code), 130 interrupted
+   (the publication continues), 1 other failures.
+
+### Enable the watcher
+
+1. **Landing area.** On the Karta host (or VM), a local POSIX filesystem
+   (ext4, xfs, btrfs, zfs, f2fs, tmpfs). Not a hypervisor or SMB/NFS share,
+   FUSE (virtiofs, vmhgfs), 9p/WSL drvfs, NTFS or FAT: the preflight refuses
+   those, because another system decides who writes them.
+
+   ```bash
+   sudo useradd --system --create-home --shell /usr/sbin/nologin karta-landing   # SFTP only: restrict it in sshd_config
+   sudo install -d -o karta-landing -g karta-landing -m 0755 /srv/karta/landing
+   # per-person SSH keys in ~karta-landing/.ssh/authorized_keys; umask 022 for the account (files must be readable by UID 65532)
+   make intake-check LANDING=/srv/karta/landing LANDING_UID=$(id -u karta-landing)
+   ```
+
+   `make intake-check` runs the preflight with the host root mounted
+   read-only, so the host parents are checked too (owners, no write for
+   others, no symlinks). It must print `"ok": true`. A group of writers is
+   allowed only as `KARTA_INTAKE_WRITER_GID` (mode 0775).
+2. `.env`: `KARTA_INTAKE_DIR=/data/intake`,
+   `KARTA_INTAKE_LANDING_HOST_DIR=/srv/karta/landing`,
+   `KARTA_INTAKE_LANDING_UID=<uid>` (and `KARTA_INTAKE_WRITER_GID`).
+3. `make up-intake`: runs the check again, registers the watcher's own
+   credential (`local-intake`, scope `intake_watch`, token in
+   `secrets/intake_watch_token`, mounted only into the watcher) and starts
+   it.
+4. `make op-status`: `intake.watcher.state.preflight.ok` is true and
+   `last_scan_at` advances every `KARTA_INTAKE_POLL_INTERVAL`.
+
+The preflight runs before every scan; when it fails the watcher hands off
+nothing and reports why (`KartaIntakePreflightFailing`). Use the command
+meanwhile.
+
+### Deliver to the landing area
+
+A delivery is `NAME.osm.pbf`, an optional `NAME.osm.pbf.provenance.json`,
+and the **completion marker** `NAME.osm.pbf.complete`, written **last**:
+
+```json
+{"format": "karta-delivery/1", "file": "NAME.osm.pbf", "sha256": "<64 hex>", "size_bytes": 229580914}
+```
+
+The digest and size come from the **source copy, before the transfer**.
+Upload under a temporary name (a leading dot, `.part` or `.filepart`, which
+the watcher ignores) and rename. A `.sha256` or `.md5` file is never a
+completion signal: a checksum computed from a cut copy matches the cut copy.
+
+From Linux, macOS or WSL (`scripts/deliver.sh`: hashes the source, uploads
+with sftp or copies locally, renames, writes the marker last):
+
+```bash
+make deliver SNAPSHOT=iran-2026-10-01.osm.pbf DEST=sftp://karta-landing@karta-host/srv/karta/landing
+```
+
+From Windows 10/11 or Server 2019+ (PowerShell and the built-in OpenSSH
+client, as the landing account with your own key):
+
+```powershell
+$f = "C:\data\iran-2026-10-01.osm.pbf"; $name = "iran-2026-10-01"
+$sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLower()   # from the source copy, before the transfer
+$len = (Get-Item -LiteralPath $f).Length
+$marker = Join-Path $env:TEMP "$name.osm.pbf.complete"
+[IO.File]::WriteAllText($marker, "{`"format`": `"karta-delivery/1`", `"file`": `"$name.osm.pbf`", `"sha256`": `"$sha`", `"size_bytes`": $len}")
+$batch = Join-Path $env:TEMP "deliver-$name.sftp"
+@"
+cd /srv/karta/landing
+put "$f" ".$name.osm.pbf.part"
+rename ".$name.osm.pbf.part" "$name.osm.pbf"
+put "$marker" ".$name.osm.pbf.complete.part"
+rename ".$name.osm.pbf.complete.part" "$name.osm.pbf.complete"
+"@ | Set-Content -Encoding ascii -LiteralPath $batch
+sftp -b $batch karta-landing@karta-host      # -b: any failed command stops the batch, so no marker after a failed upload
+```
+
+The marker tolerates a byte-order mark, CRLF and upper-case hex. A
+hypervisor shared folder (VirtualBox, VMware, Hyper-V) or an SMB share is
+only an untrusted transfer space: from there, use the command with an
+expectation.
+
+Every delivered file must be owned by the landing account and writable by
+it alone (mode 0644: umask 022 for the landing account); files writable by
+their group or others are refused (`unsafe_mode`), since anyone who can
+write them could change them in place. The watcher copies a complete
+delivery into the handoff volume and leaves the landing files alone; it remembers what it consumed and never processes
+the same files twice. Remove published deliveries from the landing area
+(`make op-status` shows each entry's state). A raw Geofabrik file has no
+provenance sidecar: keep `require_provenance` off in the Iran region file, or
+deliver a reviewed sidecar with it. The watcher's audit names the channel,
+its credential, the landing owner, name, size, time and digest: who
+delivered is in the landing account's SSH logs, outside Karta. Where every
+delivery needs a named person, use the command only.
+
+### Status, pause, resume and turning it off
+
+```bash
+make op-status                                       # intake: enabled, auto_activate, open authorizations, watcher state
+make op CMD='intake-pause --reason "checking a delivery"'
+make op CMD='intake-resume --reason "checked"'
+```
+
+A **rollback** (and a restore) pauses automatic activation of deliveries
+admitted only by the watcher, so automation never undoes it; they are
+still built and kept `ready` (`intake_activation_paused`). A command
+delivery by a named person is not paused: that is how a deliberate delivery
+resumes publication. `intake-resume` (scope `publish`) resumes the watcher.
+
+* **Stop the watcher**: `make intake-off` (stops it and removes its
+  credential; its open authorizations expire by themselves, or close them
+  with `make op CMD='revoke --sha256 ... --reason "..."'`).
+* **Stop one digest**: `make op CMD='revoke --sha256 ... --reason "..."'`
+  closes every open authorization of it, the intake's included, and the
+  intake cannot authorize it again (`digest_revoked`) until an operator
+  authorizes it (`make op CMD='authorize ...'`).
+* **Remove a person's credential**: `scripts/operator-credential.sh remove alice`
+  (refused from the next request on, no restart).
+* **Turn the intake off**: remove `KARTA_INTAKE_DIR` from `.env` and
+  `make up`: the publisher refuses intake authorizations
+  (`intake_disabled`).
+
+None of these affects online updates or direct manual publication.
+
+### Failure codes
+
+| Where | Code | Meaning, action |
+| --- | --- | --- |
+| landing entry | `waiting_for_completion_marker`, `settling`, `queue_full` | waiting: no marker yet; files changed within `KARTA_INTAKE_SETTLE`; `KARTA_INTAKE_MAX_OPEN` handoffs in flight |
+| landing entry | `size_mismatch`, `digest_mismatch`, `changed_during_copy`, `completion_stale` | the copy is not the source's (cut, changed, or replaced after the marker): deliver again under a new name |
+| landing entry | `invalid_completion`, `invalid_name` | the marker is not `karta-delivery/1` for this file, or the name is not allowed |
+| landing entry | `symlink`, `not_regular_file`, `hard_link`, `wrong_owner`, `unsafe_mode`, `too_large`, `empty_file` | unsafe or foreign files (also files writable by their group or others: upload with umask 022) are never opened: remove them |
+| landing entry | `digest_revoked` | an operator revoked this digest: only an operator's `authorize` releases it again |
+| landing entry | `region_mismatch`, `malformed_snapshot`, `timestamp_missing` | the advisory header check failed before any authorization |
+| preflight | `landing_missing`, `not_a_directory`, `symlink`, `wrong_owner`, `writable_by_others`, `writable_by_group`, `unsupported_filesystem`, `parent_*` | fix the landing area (above) |
+| API | `intake_disabled`, `intake_limit_reached`, `intake_refused` (`region_mismatch`, `too_large`, `validity_beyond_cap`, `handoff_name_mismatch`, `handoff_name_taken`, `digest_revoked`), `credentials_unavailable` | the intake is off; too many open authorizations for the credential; the request is outside the publisher's bounds, names a handoff of another channel, region or digest (a command credential can never authorize a watcher handoff), names a handoff an earlier authorization or submission already used (names are never reused; the intake itself just tries the next name), or the digest was revoked by an operator; the credentials file does not parse |
+| submission | `authorization_revoked`, `authorization_expired`, `unauthorized_digest` | the authorization was revoked, expired (also while queued) or never covered the digest, checked again at the switch: the built release stays `ready`, the pointer is unchanged; a fresh authorization (or a new delivery) re-evaluates it and activates the ready release without a rebuild |
+| submission | `intake_activation_paused` | watcher activation is paused: `intake-resume`, or activate the ready release explicitly |
+
+## Controlled source bridge (opt-in, Stage 5)
+
+The bridge turns Geofabrik's Iran extract into signed online updates that
+Karta's existing fetcher accepts ([ADR 0006](adr/0006-stage5-hybrid-intake.md)).
+Three processes of the api image (`compose.bridge.yaml`):
+
+* `bridge-acquire` checks the distributor's hints (HEAD validators and the
+  `.md5`) every `poll_interval` and downloads only when they change, or at
+  least every `reverify_interval`; resumes only with a strong ETag
+  (`If-Range`); discards a file replaced during the download
+  (`source_changed`) or not matching the `.md5`; honours `429`/`503`
+  `Retry-After`. The only process with a route out; no key.
+* `bridge-sign` has no network and the only copy of the key. It verifies
+  every download with Karta's importer checks, signs only newer data, and
+  allocates serials from its durable state (the exact envelope is saved
+  before it is published). Different bytes with equal or older data are
+  **held** and reported, not signed. It renews the current manifest at
+  `renew_before` without the distributor.
+* `bridge-serve` serves the manifest and the content-addressed assets over
+  HTTPS, read-only, with Range and strong ETags.
+
+A bridge signature means the bytes passed the bridge's policy; it is not
+Geofabrik's signature (Geofabrik publishes none) and not proof that the OSM
+data are correct.
+
+### Co-located setup
+
+Prerequisites (owner inputs): the Iran region file (`config/regions/iran.json`
+from the fixed, recorded PBF; docs/operations.md, "The Iran region"), the
+signing key from its custodian, and Geofabrik's current download terms.
+
+1. `cp config/bridge/geofabrik-iran.example.json config/bridge/geofabrik-iran.json`;
+   put a real contact into `user_agent`; review. Starting `bridge-acquire`
+   downloads the full Iran extract.
+2. `cp config/bridge/signer.example.json config/bridge/signer.json`; set the
+   key id. The custodian places the key at `secrets/bridge/signing-key.pem`
+   (or sets `KARTA_BRIDGE_SIGNING_KEY_FILE`), readable by UID 65532 inside
+   the private `secrets` directory.
+3. `make bridge-tls`: the bridge's own CA and `bridge-serve`'s certificate
+   (`secrets/bridge/`), and the CA copy `config/sources/bridge-ca.pem`.
+4. Write the fetcher's source file `config/sources/bridge.json`
+   (`config/sources/README.md`, "A co-located bridge") with the bridge's
+   public key (`go run ./cmd/karta-sign pubkey --key secrets/bridge/signing-key.pem`).
+5. `.env`: `KARTA_PUBLISH_REGION=iran`,
+   `KARTA_BRIDGE_SOURCE_FILE=/config/bridge/geofabrik-iran.json`,
+   `KARTA_ONLINE_SOURCE_FILE=/config/sources/bridge.json`,
+   `KARTA_DATA_STALE_AFTER=72h` (proposed; owner decision) and, for
+   monitoring, `KARTA_BRIDGE_METRICS_LISTEN_ADDR=:9465`.
+6. `make up-bridge`, then `make bridge-status` (acquire and sign reports)
+   and `make op-status` (`online.verified.serial`, freshness).
+
+Co-located, the fetcher leaves `egress` and reaches only `bridge-serve` on
+the no-NAT `bridge` network (`KARTA_BRIDGE_SUBNET`, in its
+`allowed_networks`); `bridge-sign` has no network. Use `$(BRIDGE_COMPOSE)`
+(`docker compose -f compose.yaml -f compose.bridge.yaml`) for every command
+that touches the fetcher while the bridge is in use, or `make up-online`
+recreates the fetcher with `egress`.
+
+**Separate bridge host.** The same file alone
+(`docker compose -f compose.bridge.yaml --profile bridge up -d`) with
+`KARTA_BRIDGE_BIND` set to the interface the Karta host reaches,
+`BRIDGE_TLS_NAMES="bridge.example.org"` for `make bridge-tls`, and the
+Karta host's fetcher keeping its own `egress` with `manifest_url`
+`https://bridge.example.org:8443/manifest.json`. The Make targets take
+`BRIDGE_COMPOSE="docker compose -f compose.bridge.yaml"` there.
+
+### The bridge signer refuses to start
+
+The signer fails closed (exit status 4, `KartaBridgeSignerStalled`) when its
+state is missing although a manifest is published, or its high-water serial
+is below the published manifest's (`state_behind_published`, for example
+after restoring an older backup of `bridge-state`), or the clock is earlier
+than the last `issued_at` (`clock_behind`). It also refuses, at start and
+while running, a published manifest it cannot prove it made: one that does
+not verify with its own keys and region (`published_manifest_untrusted`),
+or one with the serial of its persisted envelope but other bytes
+(`published_envelope_conflict`). Only `bridge-sign` writes the publish
+volume, so either means something else wrote it: find out what, then put the
+signer's own manifest back from a backup of the publish volume, or remove
+`manifest.json` (the signer then publishes its persisted envelope or the
+next one). For a state problem:
+
+1. read the serial Karta accepted: `make op-status`, `online.verified.serial`
+   (and the published manifest's serial in `make bridge-status`);
+2. raise the high-water serial to at least both, with a reason:
+
+   ```bash
+   make bridge-raise-high-water SERIAL=<at least that serial> REASON="state restored from the 2026-10-01 backup; Karta verified 41"
+   ```
+
+The raise is recorded in the signer state and never lowers the serial; the
+next manifest uses the following serial. At start the signer reconciles
+with the published manifest: an envelope the restored state had not yet
+published is published only if it is newer, and a newer published manifest
+becomes the signer's current one (only after it verifies with the signer's
+keys and region), so renewal continues from what Karta can see and nothing
+already published is signed again. For the clock,
+fix the time; nothing is signed meanwhile and the current manifest stays
+valid until it expires.
+
+### Failure codes (`make bridge-status`: acquire `last_error.code`, sign `last_error.code` and `held.code`)
+
+| Code | Meaning, action |
+| --- | --- |
+| `rate_limited` | `429`/`503`: backing off, `Retry-After` honoured |
+| `source_changed` | `iran-latest` was replaced during the download, or the `.md5` changed: retried at the next check |
+| `distributor_checksum_mismatch` | the bytes do not match the distributor's `.md5`: nothing spooled (`KartaBridgeSourceRefused`) |
+| `source_config` | the source file is invalid |
+| `http_status`, `tls_error`, `destination_refused`, `redirect_refused`, `too_large`, `timeout`, `stalled`, `network_error`, `insufficient_storage` | as for the fetcher ("Failure codes" above) |
+| `not_newer` (held) | different bytes whose data are not newer than the last signed snapshot: inspect; nothing to undo |
+| `malformed_snapshot`, `region_mismatch`, `timestamp_missing` (held) | the download failed Karta's checks; a `region_mismatch` after a Geofabrik boundary change needs a reviewed region-file update |
+| `state_behind_published`, `clock_behind`, `published_manifest_untrusted`, `published_envelope_conflict` | fail closed: "The bridge signer refuses to start" |
+| `asset_missing` | the asset of the current manifest is gone: not renewed; restore the publish volume or let the next download re-sign |
+| `serial_exhausted` | the serial reached 999,999,999,999: a new bridge identity and key are needed |
+
+**Turn it off**: `make bridge-off` stops the bridge and the fetcher reading
+it; the active release stays and ages. Local intake and direct manual
+publication are unaffected. Online updates from another source: set
+`KARTA_ONLINE_SOURCE_FILE` and `make up-online`.
+
 ## Operator API
 
 The operator API is served by the publisher on `127.0.0.1:8081`
@@ -427,13 +751,22 @@ reads and the file the API's metrics listener reads:
 | `secrets/operator_monitor_token` | monitoring | `status` |
 | `secrets/operator_tokens` | publisher | `NAME SCOPES SHA256(token)` per line: hashes only |
 | `secrets/metrics_tokens` | API metrics listener | the monitoring credential's hash only; rewritten in place, re-read when it changes |
+| `secrets/operator_tokens.extra` | host (merged into `operator_tokens`) | narrow extra credentials (hashes) |
+| `secrets/intake_watch_token`, `secrets/NAME.token` | the intake watcher; one person | `intake_watch`; `intake_submit` |
 
-To add a credential (for example a second operator with only `rollback`),
-generate a token (`od -An -N32 -tx1 /dev/urandom | tr -d ' \n'`), append
-`name rollback,status <sha256 of the token>` to `secrets/operator_tokens`
-(`scripts/gen-secrets.sh` rewrites that file, so keep extra lines in your
-secret store and re-append them) and restart the publisher. Rotate the two
-generated tokens with `make rotate-operator-tokens`. In production keep the
+Narrow extra credentials (an intake person, the intake watcher, a second
+monitoring credential) are added and removed with
+`scripts/operator-credential.sh add NAME intake_submit|intake_watch|status`
+and `remove NAME`: they live in `secrets/operator_tokens.extra`, and
+`scripts/gen-secrets.sh` merges them into `secrets/operator_tokens`, which
+it rewrites in place. The publisher re-reads that file when it changes: a
+new credential works and a removed one is refused from the next request on,
+**without a restart**. A file that does not parse refuses every request
+(503 `credentials_unavailable`) until it is fixed. For other scopes, add a
+line `NAME SCOPES SHA256` to `operator_tokens.extra` yourself (an
+`intake_*` scope must be a credential's only scope) and run
+`scripts/gen-secrets.sh`. Rotate the two generated tokens with
+`make rotate-operator-tokens`. In production keep the
 raw tokens on the operators' side only and give the publisher the hash file
 through the orchestrator's secret store. Tokens are never logged; failed
 authentication is logged and audited (at most 30 audit rows per minute).
@@ -699,7 +1032,8 @@ authorized after the backup (docs/operations.md, "Backup and restore").
 
 ```bash
 make rotate-db-password ROLE=api        # or importer, monitor, superuser: no restart, data kept
-make rotate-operator-tokens             # both operator tokens; recreates the publisher
+make rotate-operator-tokens             # both operator tokens; no restart (the publisher reloads its credentials)
+scripts/operator-credential.sh remove NAME   # an intake or other extra credential, refused at once
 make monitoring-role                    # (re)create karta_monitor after a restore without it
 ```
 

@@ -1,0 +1,8 @@
+{
+  "bridge_id": "karta-bridge-iran",
+  "keys": [
+    { "id": "bridge-iran-KEYID", "file": "/run/secrets/bridge_signing_key" }
+  ],
+  "manifest_validity": "168h",
+  "renew_before": "84h"
+}

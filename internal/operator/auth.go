@@ -26,9 +26,31 @@ const (
 	ScopePublish  = "publish"  // authorize or revoke digests, activate a ready release
 	ScopeRollback = "rollback" // roll back to a retained release
 	ScopeCleanup  = "cleanup"  // remove releases beyond retention
+	// ScopeIntakeWatch is the unattended local intake watcher: it may only
+	// create, read and close its own bounded digest authorizations
+	// (/v1/operator/intake/*); a rollback pauses what they admit.
+	ScopeIntakeWatch = "intake_watch"
+	// ScopeIntakeSubmit is a named person's intake command: the same narrow
+	// capability, for deliberate deliveries.
+	ScopeIntakeSubmit = "intake_submit"
 )
 
-var knownScopes = map[string]bool{ScopeStatus: true, ScopePublish: true, ScopeRollback: true, ScopeCleanup: true}
+var knownScopes = map[string]bool{ScopeStatus: true, ScopePublish: true, ScopeRollback: true, ScopeCleanup: true,
+	ScopeIntakeWatch: true, ScopeIntakeSubmit: true}
+
+// intakeScopes must each be a credential's only scope, so an intake
+// credential is narrow by construction.
+var intakeScopes = map[string]bool{ScopeIntakeWatch: true, ScopeIntakeSubmit: true}
+
+// IntakeChannel returns the intake scope of a credential ("" if it has none).
+func (c Credential) IntakeChannel() string {
+	for s := range c.Scopes {
+		if intakeScopes[s] {
+			return s
+		}
+	}
+	return ""
+}
 
 // Credential is one named operator credential. Only the SHA-256 of the
 // token is held; tokens are 256-bit random values, so an unsalted hash is
@@ -105,6 +127,9 @@ func ParseCredentials(b []byte) ([]Credential, error) {
 				return nil, fmt.Errorf("line %d: unknown scope %q", n, s)
 			}
 			c.Scopes[s] = true
+		}
+		if ch := c.IntakeChannel(); ch != "" && len(c.Scopes) > 1 {
+			return nil, fmt.Errorf("line %d: scope %s must be the credential's only scope", n, ch)
 		}
 		if !hashPattern.MatchString(f[2]) {
 			return nil, fmt.Errorf("line %d: the token hash must be 64 lowercase hex digits", n)

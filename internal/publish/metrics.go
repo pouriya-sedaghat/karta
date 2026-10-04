@@ -119,6 +119,39 @@ func (s *Service) Metrics(ctx context.Context) ([]byte, error) {
 			}
 		}
 	}
+	in := st.Intake
+	m.Gauge("karta_intake_enabled", "1 if the local intake (KARTA_INTAKE_DIR) is enabled on this publisher.", nil, promtext.Bool(in.Enabled))
+	if in.Enabled {
+		m.Gauge("karta_intake_watcher_auto_activation", "1 if deliveries admitted only by the intake watcher are activated automatically (not paused).",
+			nil, promtext.Bool(in.AutoActivate))
+		chans := make([]string, 0, len(in.OpenAuthorizations))
+		for c := range in.OpenAuthorizations {
+			chans = append(chans, c)
+		}
+		sort.Strings(chans)
+		m.Header("karta_intake_open_authorizations", "Open, unexpired intake authorizations by channel (intake_watch, intake_submit).", "gauge")
+		for _, c := range chans {
+			m.Sample("karta_intake_open_authorizations", map[string]string{"channel": c}, float64(in.OpenAuthorizations[c]))
+		}
+		m.Opt("karta_intake_watcher_state_age_seconds", "Seconds since the intake watcher last wrote its state; growing means it is not running.",
+			nil, in.Watcher.StateAgeSeconds)
+		if ws := in.Watcher.State; ws != nil {
+			m.Gauge("karta_intake_watcher_stopped", "1 if the intake watcher stopped cleanly (deliberately) and has not scanned since.",
+				nil, promtext.Bool(ws.StoppedAt != nil))
+			m.Gauge("karta_intake_preflight_ok", "1 if the watcher's last landing preflight passed (watcher report).", nil, promtext.Bool(ws.Preflight.OK))
+			m.Opt("karta_intake_last_scan_timestamp_seconds", "Last landing scan of the watcher (watcher report).", nil, ts(ws.LastScanAt))
+			waiting, refused := 0, 0
+			for _, e := range ws.Entries {
+				if e.State == "refused" {
+					refused++
+				} else if e.State != "delivered" {
+					waiting++
+				}
+			}
+			m.Gauge("karta_intake_landing_waiting", "Landing deliveries waiting for completion, settling or a free slot (watcher report).", nil, float64(waiting))
+			m.Gauge("karta_intake_landing_refused", "Landing deliveries the watcher refused (watcher report).", nil, float64(refused))
+		}
+	}
 	keys := make([][2]string, 0, len(subs))
 	for k := range subs {
 		keys = append(keys, k)

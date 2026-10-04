@@ -38,6 +38,11 @@ type Service interface {
 	OnlinePause(ctx context.Context, p publish.Principal, reason string) (publish.OnlinePolicyResult, error)
 	OnlineResume(ctx context.Context, p publish.Principal, reason string) (publish.OnlinePolicyResult, error)
 	OnlineRetry(ctx context.Context, p publish.Principal, reason string) (publish.OnlineRetryResult, error)
+	IntakeAuthorize(ctx context.Context, p publish.Principal, channel string, r publish.IntakeAuthorizeRequest) (*registry.Authorization, bool, error)
+	IntakeClose(ctx context.Context, p publish.Principal, id int64, reason string) (bool, error)
+	IntakeList(ctx context.Context, p publish.Principal) (publish.IntakeList, error)
+	IntakePause(ctx context.Context, p publish.Principal, reason string) (publish.IntakePolicyResult, error)
+	IntakeResume(ctx context.Context, p publish.Principal, reason string) (publish.IntakePolicyResult, error)
 	Metrics(ctx context.Context) ([]byte, error)
 	AuditDenied(ctx context.Context, p publish.Principal, action, reason string)
 	Ping(ctx context.Context) error
@@ -75,11 +80,19 @@ const (
 	CodeInternal           = "internal_error"
 	CodeOnlineDisabled     = "online_disabled"
 	CodeNothingToRetry     = "nothing_to_retry"
+	// Stage 5.
+	CodeIntakeDisabled         = "intake_disabled"
+	CodeIntakeLimit            = "intake_limit_reached"
+	CodeIntakeRefused          = "intake_refused"
+	CodeCredentialsUnavailable = "credentials_unavailable"
 )
+
+// MaxIntakeTTL bounds ttl_seconds before the publisher's own cap applies.
+const MaxIntakeTTL = 366 * 24 * time.Hour
 
 // Server is the operator HTTP API.
 type Server struct {
-	creds   []Credential
+	creds   CredentialSource
 	svc     Service
 	log     *slog.Logger
 	timeout time.Duration
@@ -89,8 +102,9 @@ type Server struct {
 	deniedCount  int
 }
 
-// New builds the operator handler. timeout bounds every request.
-func New(creds []Credential, svc Service, log *slog.Logger, timeout time.Duration) http.Handler {
+// New builds the operator handler. creds is consulted for every request
+// (a reloading file in the publisher); timeout bounds every request.
+func New(creds CredentialSource, svc Service, log *slog.Logger, timeout time.Duration) http.Handler {
 	s := &Server{creds: creds, svc: svc, log: log, timeout: timeout}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, r *http.Request) {
@@ -111,6 +125,14 @@ func New(creds []Credential, svc Service, log *slog.Logger, timeout time.Duratio
 	mux.Handle("POST /v1/operator/online/pause", s.auth(ScopePublish, "online_pause", s.onlinePolicy(false)))
 	mux.Handle("POST /v1/operator/online/resume", s.auth(ScopePublish, "online_resume", s.onlinePolicy(true)))
 	mux.Handle("POST /v1/operator/online/retry", s.auth(ScopePublish, "online_retry", s.onlineRetry))
+	// The local intake (Stage 5): only intake credentials, only their own
+	// bounded authorizations; pausing and resuming the watcher is an
+	// operator action.
+	mux.Handle("POST /v1/operator/intake/authorizations", s.authIntake("intake_authorize", s.intakeAuthorize))
+	mux.Handle("GET /v1/operator/intake/authorizations", s.authIntake("intake_list", s.intakeList))
+	mux.Handle("POST /v1/operator/intake/authorizations/{id}/close", s.authIntake("intake_close", s.intakeClose))
+	mux.Handle("POST /v1/operator/intake/pause", s.auth(ScopePublish, "intake_pause", s.intakePolicy(false)))
+	mux.Handle("POST /v1/operator/intake/resume", s.auth(ScopePublish, "intake_resume", s.intakePolicy(true)))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, CodeNotFound, "no such operator resource")
 	})
@@ -206,19 +228,37 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 
 type handler func(w http.ResponseWriter, r *http.Request, c *Credential)
 
+// authenticate resolves the request's credential; it answers the request
+// itself (401, or 503 while the credentials file is unusable) and returns
+// nil when there is none.
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, action string) *Credential {
+	creds, err := s.creds.Credentials()
+	if err != nil {
+		w.Header().Set("Retry-After", "10")
+		writeError(w, r, http.StatusServiceUnavailable, CodeCredentialsUnavailable,
+			"the operator credentials file cannot be read or does not parse; every request is refused until it is fixed")
+		return nil
+	}
+	c, err := Authenticate(creds, r.Header.Get("Authorization"))
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="karta-operator"`)
+		s.denied(r, "anonymous", action, err.Error())
+		writeError(w, r, http.StatusUnauthorized, CodeUnauthenticated, "a valid operator bearer token is required")
+		return nil
+	}
+	if rec, ok := w.(*recorder); ok {
+		rec.actor = c.Name
+	}
+	return c
+}
+
 // auth authenticates the request and checks the scope; refusals are logged
 // and audited (rate-limited).
 func (s *Server) auth(scope, action string, next handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := Authenticate(s.creds, r.Header.Get("Authorization"))
-		if err != nil {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="karta-operator"`)
-			s.denied(r, "anonymous", action, err.Error())
-			writeError(w, r, http.StatusUnauthorized, CodeUnauthenticated, "a valid operator bearer token is required")
+		c := s.authenticate(w, r, action)
+		if c == nil {
 			return
-		}
-		if rec, ok := w.(*recorder); ok {
-			rec.actor = c.Name
 		}
 		if !c.Scopes[scope] {
 			s.denied(r, c.Name, action, "credential lacks the "+scope+" scope")
@@ -226,6 +266,24 @@ func (s *Server) auth(scope, action string, next handler) http.Handler {
 			return
 		}
 		next(w, r, c)
+	})
+}
+
+// authIntake admits only intake credentials (intake_watch or
+// intake_submit); the channel of what they create is their scope.
+func (s *Server) authIntake(action string, next func(w http.ResponseWriter, r *http.Request, c *Credential, channel string)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c := s.authenticate(w, r, action)
+		if c == nil {
+			return
+		}
+		ch := c.IntakeChannel()
+		if ch == "" {
+			s.denied(r, c.Name, action, "credential lacks an intake scope")
+			writeError(w, r, http.StatusForbidden, CodeForbidden, "this endpoint is for intake credentials (scope intake_watch or intake_submit)")
+			return
+		}
+		next(w, r, c, ch)
 	})
 }
 
@@ -281,6 +339,7 @@ func writeErrorReason(w http.ResponseWriter, r *http.Request, status int, code, 
 // serviceError maps service errors to responses; unexpected errors are
 // logged with details and answered generically.
 func (s *Server) serviceError(w http.ResponseWriter, r *http.Request, err error) {
+	var refusal *publish.IntakeRefusal
 	switch {
 	case errors.Is(err, registry.ErrNotFound):
 		writeError(w, r, http.StatusNotFound, CodeUnknownRelease, err.Error())
@@ -299,8 +358,16 @@ func (s *Server) serviceError(w http.ResponseWriter, r *http.Request, err error)
 		writeError(w, r, http.StatusConflict, CodeOnlineDisabled, err.Error())
 	case errors.Is(err, publish.ErrNothingToRetry):
 		writeError(w, r, http.StatusConflict, CodeNothingToRetry, err.Error())
+	case errors.Is(err, publish.ErrIntakeDisabled):
+		writeError(w, r, http.StatusConflict, CodeIntakeDisabled, err.Error())
+	case errors.Is(err, publish.ErrIntakeLimit):
+		writeError(w, r, http.StatusConflict, CodeIntakeLimit, err.Error())
+	case errors.Is(err, publish.ErrIntakeNotOwned):
+		writeError(w, r, http.StatusNotFound, CodeNotFound, err.Error())
 	case errors.Is(err, publish.ErrPolicy):
 		writeErrorReason(w, r, http.StatusConflict, CodePolicyRefused, publish.PolicyCode(err), err.Error())
+	case errors.As(err, &refusal):
+		writeErrorReason(w, r, http.StatusConflict, CodeIntakeRefused, refusal.Code, refusal.Msg)
 	case errors.Is(err, context.DeadlineExceeded):
 		w.Header().Set("Retry-After", "5")
 		writeError(w, r, http.StatusServiceUnavailable, CodeTimeout, "the operation did not finish within the request timeout")
@@ -628,4 +695,117 @@ func (s *Server) onlineRetry(w http.ResponseWriter, r *http.Request, c *Credenti
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"queued": res})
+}
+
+type intakeAuthorizeBody struct {
+	SHA256     string `json:"sha256"`
+	SizeBytes  int64  `json:"size_bytes"`
+	RegionID   string `json:"region_id"`
+	TTLSeconds int64  `json:"ttl_seconds"`
+	Name       string `json:"name"`
+	Reason     string `json:"reason"`
+}
+
+var (
+	regionIDPattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+	intakeNamePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	authorizationIDPat = regexp.MustCompile(`^[1-9][0-9]{0,18}$`)
+)
+
+func (s *Server) intakeAuthorize(w http.ResponseWriter, r *http.Request, c *Credential, channel string) {
+	var b intakeAuthorizeBody
+	if !decode(w, r, &b) {
+		return
+	}
+	reason, ok := validReason(w, r, b.Reason)
+	if !ok {
+		return
+	}
+	switch {
+	case !digestPattern.MatchString(b.SHA256):
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "sha256 must be 64 lowercase hex digits")
+	case b.SizeBytes < 1 || b.SizeBytes > 1<<50:
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "size_bytes is required: the exact size of the snapshot")
+	case !regionIDPattern.MatchString(b.RegionID):
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "region_id is required: the region the delivery is for")
+	case b.TTLSeconds < 60 || time.Duration(b.TTLSeconds)*time.Second > MaxIntakeTTL:
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "ttl_seconds is required: the validity, at least 60 s and at most the publisher's cap")
+	case !intakeNamePattern.MatchString(b.Name):
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "name must be the handoff name, matching "+intakeNamePattern.String())
+	default:
+		a, created, err := s.svc.IntakeAuthorize(r.Context(), principal(r, c), channel, publish.IntakeAuthorizeRequest{SHA256: b.SHA256,
+			SizeBytes: b.SizeBytes, RegionID: b.RegionID, TTL: time.Duration(b.TTLSeconds) * time.Second, Name: b.Name, Reason: reason})
+		if err != nil {
+			s.serviceError(w, r, err)
+			return
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeJSON(w, status, map[string]any{"authorization": a, "created": created})
+	}
+}
+
+func (s *Server) intakeList(w http.ResponseWriter, r *http.Request, c *Credential, _ string) {
+	if r.URL.RawQuery != "" {
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "this endpoint takes no query parameters")
+		return
+	}
+	l, err := s.svc.IntakeList(r.Context(), principal(r, c))
+	if err != nil {
+		s.serviceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, l)
+}
+
+func (s *Server) intakeClose(w http.ResponseWriter, r *http.Request, c *Credential, _ string) {
+	raw := r.PathValue("id")
+	if !authorizationIDPat.MatchString(raw) {
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "the authorization id must be a positive integer")
+		return
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "the authorization id must be a positive integer")
+		return
+	}
+	var b reasonBody
+	if !decode(w, r, &b) {
+		return
+	}
+	reason, ok := validReason(w, r, b.Reason)
+	if !ok {
+		return
+	}
+	closed, err := s.svc.IntakeClose(r.Context(), principal(r, c), id, reason)
+	if err != nil {
+		s.serviceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"closed": closed})
+}
+
+func (s *Server) intakePolicy(resume bool) handler {
+	return func(w http.ResponseWriter, r *http.Request, c *Credential) {
+		var b reasonBody
+		if !decode(w, r, &b) {
+			return
+		}
+		reason, ok := validReason(w, r, b.Reason)
+		if !ok {
+			return
+		}
+		f := s.svc.IntakePause
+		if resume {
+			f = s.svc.IntakeResume
+		}
+		res, err := f(r.Context(), principal(r, c), reason)
+		if err != nil {
+			s.serviceError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	}
 }

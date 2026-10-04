@@ -26,15 +26,19 @@
 #      --replace and a backup without one, the outbox is emptied so that no
 #      stale fetcher state or delivery survives
 #   8. karta restore-check --finalize: the registry and every retained release
-#      are verified against the backup; automatic online activation is paused
-#      and the restored active pointer is audited
+#      are verified against the backup; automatic online activation and
+#      automatic activation of intake-watcher deliveries are paused, and the
+#      restored active pointer is audited
 #   9. the API and the publisher start; the script waits until the API is
 #      ready and reports the restore time
 #
-# The fetcher and the monitoring profile stay stopped: start the fetcher
-# (make up-online) once the source is confirmed, and resume online
-# activation after checking the producer's current serial
-# (docs/operations.md, "Backup and restore").
+# The fetcher, the intake watcher and the monitoring profile stay stopped:
+# start the fetcher (make up-online) once the source is confirmed, and resume
+# online activation after checking the producer's current serial; start the
+# watcher (make up-intake) and resume it (intake-resume) after checking its
+# landing area (docs/operations.md, "Backup and restore"). The intake
+# handoff volume is neither backed up nor restored: it holds only
+# deliveries in flight.
 #
 #   scripts/restore.sh BACKUP_DIR [--replace]
 # The restore-check report is kept in KARTA_RESTORE_REPORTS (default
@@ -121,7 +125,7 @@ refuse_in_use "nothing was changed"
 # API, publisher and fetcher kept running), then look again: a fetcher may
 # have written its outbox until it stopped.
 echo "restore: stopping the stack"
-$COMPOSE --profile online --profile monitoring --profile tools down > /dev/null 2>&1 || fail "stopping the stack failed"
+$COMPOSE --profile online --profile intake --profile monitoring --profile tools down > /dev/null 2>&1 || fail "stopping the stack failed"
 inspect
 refuse_in_use "the stack was stopped, but no data was changed"
 if [ "$dbv" != empty ]; then
@@ -207,5 +211,6 @@ until $COMPOSE exec -T api /usr/local/bin/karta healthcheck > /dev/null 2>&1; do
   sleep 1
 done
 active=$(sed -n 's/^    "active_release_id": "\(.*\)",$/\1/p' "$report" | head -1)
-echo "restore complete in $(( $(date +%s) - started )) s: active release ${active:-none}; automatic online activation is paused"
+echo "restore complete in $(( $(date +%s) - started )) s: active release ${active:-none}; automatic online and intake-watcher activation is paused"
 echo "the fetcher and the monitoring profile are stopped: make up-monitoring if used; start the fetcher (make up-online) only for a confirmed source, then resume (docs/operations.md)"
+echo "the intake watcher, if used, is stopped: make up-intake after checking its landing area, then intake-resume (docs/runbook.md)"

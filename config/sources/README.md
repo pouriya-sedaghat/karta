@@ -48,3 +48,34 @@ Unknown fields are rejected.
 
 Producers sign manifests with `cmd/karta-sign` (or any DSSE/Ed25519
 implementation following `docs/adr/0004-stage3-online-updates.md`).
+
+## A co-located bridge (Stage 5)
+
+With the controlled source bridge on the same host (`compose.bridge.yaml`,
+`docs/runbook.md`, "Controlled source bridge"), the fetcher reaches only
+`bridge-serve` on the no-NAT `bridge` network. Its source file trusts the
+bridge's own CA (`make bridge-tls` writes `bridge-ca.pem` here,
+git-ignored), allows exactly the `bridge` subnet, and pins the bridge's
+public key (`go run ./cmd/karta-sign pubkey --key KEY.pem`, run by the key's
+custodian):
+
+```json
+{
+  "region_id": "iran",
+  "manifest_url": "https://bridge-serve:8443/manifest.json",
+  "allowed_networks": ["10.233.0.0/24"],
+  "ca_file": "/config/sources/bridge-ca.pem",
+  "trusted_keys": [
+    { "id": "bridge-iran-KEYID", "ed25519_public_key": "<base64 of the bridge's 32-byte public key>" }
+  ],
+  "poll_interval": "15m",
+  "max_manifest_validity": "192h"
+}
+```
+
+`max_manifest_validity` must be at least the bridge's `manifest_validity`
+(7 days in `config/bridge/signer.example.json`, plus margin). The bridge's
+assets are on the manifest's own host, so no `allowed_hosts` are needed. A
+bridge on a separate host is an ordinary HTTPS source: its DNS name, its
+CA (or a public certificate) and no `allowed_networks` unless it is on a
+private network.

@@ -105,6 +105,13 @@ type Config struct {
 	// StaleAfter is the data age after which the active release is stale
 	// (0 = no threshold configured).
 	StaleAfter time.Duration
+	// IntakeDir is the local intake's handoff directory, read-only ("" =
+	// the intake is off; intake credentials are then refused).
+	IntakeDir string
+	// IntakeMaxAge caps the validity of an intake authorization.
+	IntakeMaxAge time.Duration
+	// IntakeMaxOpen bounds the open intake authorizations per credential.
+	IntakeMaxOpen int
 }
 
 // Principal is who asks for an action.
@@ -123,10 +130,12 @@ type Service struct {
 
 	settler       *inbox.Settler
 	onlineSettler *inbox.Settler
+	intakeSettler *inbox.Settler
 	mu            sync.Mutex
 	job           *JobStatus
 	scan          ScanStatus
 	onlineScan    ScanStatus
+	intakeScan    ScanStatus
 	now           func() time.Time
 	// readCounts reads a release database's stored counts (a test seam).
 	readCounts reportCountsReader
@@ -176,7 +185,8 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 		pool.Close()
 		return nil, fmt.Errorf("migrate registry: %w", err)
 	}
-	s := &Service{cfg: cfg, log: log, reg: pool, settler: inbox.NewSettler(), onlineSettler: inbox.NewSettler(), now: time.Now, started: time.Now()}
+	s := &Service{cfg: cfg, log: log, reg: pool, settler: inbox.NewSettler(), onlineSettler: inbox.NewSettler(), intakeSettler: inbox.NewSettler(),
+		now: time.Now, started: time.Now()}
 	s.readCounts = s.readReportCounts
 	return s, nil
 }
@@ -191,6 +201,11 @@ func (s *Service) Announce(ctx context.Context) error {
 	}
 	if err := registry.SetFreshness(ctx, s.reg, f); err != nil {
 		return err
+	}
+	if s.intakeEnabled() {
+		if err := registry.EnsureIntakePolicy(ctx, s.reg, s.regionID()); err != nil {
+			return err
+		}
 	}
 	if s.onlineEnabled() {
 		return registry.EnsureOnlinePolicy(ctx, s.reg, s.regionID())
@@ -246,31 +261,52 @@ type request struct {
 	reason            string
 }
 
-// feed is a watched directory of submissions: the manual inbox or the
-// online fetcher's outbox.
+// feed is a watched directory of submissions: the local intake's handoff
+// directory, the manual inbox or the online fetcher's outbox.
 type feed struct {
 	source  string
 	dir     string
 	settler *inbox.Settler
 	online  bool
+	// scan receives the feed's last scan status (under s.mu).
+	scan *ScanStatus
 }
 
 func (s *Service) inboxFeed() feed {
-	return feed{source: SourceInbox, dir: s.cfg.InboxDir, settler: s.settler}
+	return feed{source: SourceInbox, dir: s.cfg.InboxDir, settler: s.settler, scan: &s.scan}
 }
 
 func (s *Service) onlineFeed() feed {
-	return feed{source: SourceOnline, dir: s.cfg.OnlineDir, settler: s.onlineSettler, online: true}
+	return feed{source: SourceOnline, dir: s.cfg.OnlineDir, settler: s.onlineSettler, online: true, scan: &s.onlineScan}
 }
 
-// authorizer looks up operator authorizations for digests not pinned in
-// the region configuration.
-func (s *Service) authorizer(ctx context.Context, regionID, digest string, size int64) (string, error) {
-	a, err := registry.Authorized(ctx, s.reg, regionID, digest, size)
-	if err != nil || a == nil {
-		return "", err
+// authScope is what may admit a submission of a feed: an operator's
+// authorization for every feed, and for the intake feed also the intake
+// authorization created for exactly that handoff name by the channel the
+// name says wrote it (a watcher handoff only by intake_watch, a command
+// handoff only by intake_submit). A name the intake does not produce gets
+// operator authorizations only.
+func authScope(source, name string) registry.AuthScope {
+	if source != SourceIntake {
+		return registry.AuthScope{}
 	}
-	return fmt.Sprintf("operator authorization %d by %s", a.ID, a.CreatedBy), nil
+	h, ok := registry.ParseHandoffName(name)
+	if !ok {
+		return registry.AuthScope{}
+	}
+	return registry.AuthScope{IntakeName: name, IntakeChannel: h.Channel}
+}
+
+// authorizer looks up authorizations in scope for digests not pinned in
+// the region configuration.
+func (s *Service) authorizer(scope registry.AuthScope) importer.Authorizer {
+	return func(ctx context.Context, regionID, digest string, size int64) (string, error) {
+		a, err := registry.Authorized(ctx, s.reg, regionID, digest, size, scope)
+		if err != nil || a == nil {
+			return "", err
+		}
+		return a.Describe(), nil
+	}
 }
 
 // publish runs verify, policy, capacity, build and switch for a staged
@@ -286,7 +322,8 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		return fail(registry.SubRejected, importer.CodeRegionConfig, fmt.Errorf("%w: region: %v", importer.ErrInput, err))
 	}
 	s.phase("verifying", "")
-	authorize := importer.Authorizer(s.authorizer)
+	scope := authScope(req.source, req.name)
+	authorize := s.authorizer(scope)
 	var signed *online.Verified
 	if req.source == SourceOnline {
 		sv, auth, err := s.verifyDelivery(ctx, req, cfg)
@@ -307,6 +344,13 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 			return fail(registry.SubInterrupted, CodeInterrupted, err)
 		}
 		if code := importer.InputCode(err); code != "" {
+			if code == importer.CodeUnauthorizedDigest {
+				// Say why: an authorization that expired while queued, or
+				// was revoked, is reported as such.
+				if c, msg, uerr := s.unauthorized(ctx, s.reg, cfg.ID, req.staged.SHA256, req.staged.Size, scope); uerr == nil && c != code {
+					return fail(registry.SubRejected, c, &importer.InputError{Code: c, Msg: msg})
+				}
+			}
 			return fail(registry.SubRejected, code, err)
 		}
 		return fail(registry.SubFailed, CodeBuildFailed, err)
@@ -418,9 +462,14 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		return out
 	}
 	s.phase("activating", built.ReleaseID)
+	// What admitted the snapshot is checked again inside the pointer
+	// transaction: the signed manifest of an online delivery, or the pin or
+	// authorization of a manual, command-line or intake one.
 	var gate func(context.Context, registry.Querier) error
 	if signed != nil {
 		gate = s.onlineGate(signed)
+	} else {
+		gate = s.manualGate(v.Info.SHA256, v.Info.Size, scope)
 	}
 	// The switch runs on its own short bound, not the job deadline: a
 	// release built and validated in time is switched to (see switchContext).
@@ -447,7 +496,7 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 			out.State, out.Code, out.Reason = registry.SubReady, CodeActiveChanged,
 				"validated, but the active release changed during the build ("+err.Error()+"); kept ready for an operator to activate"
 			return out
-		case importer.InputCode(err) != "":
+		case importer.InputCode(err) != "" && signed != nil:
 			// The signed manifest no longer authorizes the snapshot (it
 			// expired or its key was removed during the build): refused.
 			// The validated release stays ready, for an operator to review
@@ -456,6 +505,16 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 			out.Reason = fmt.Sprintf("%v; release %s was built and validated but not activated; it stays ready: an operator may review "+
 				"and activate it, retry it with the operator API once the manifest verifies again, or the source can publish a fresh "+
 				"signed manifest for the same snapshot", err, built.ReleaseID)
+			return out
+		case importer.InputCode(err) != "":
+			// The pin or authorization that admitted the snapshot is gone
+			// (revoked, expired or removed during the build): refused. A
+			// fresh authorization re-evaluates this submission, which then
+			// activates the ready release without building it again.
+			out.State, out.Code, out.Err = registry.SubRejected, importer.InputCode(err), err
+			out.Reason = fmt.Sprintf("%v; release %s was built and validated but not activated; it stays ready: authorize the digest "+
+				"again (the submission is then re-evaluated and the ready release activated without a rebuild), or an operator may "+
+				"activate it explicitly", err, built.ReleaseID)
 			return out
 		case PolicyCode(err) != "":
 			out.State, out.Code, out.Reason = registry.SubReady, PolicyCode(err), err.Error()
@@ -761,14 +820,22 @@ func (s *Service) RunInbox(ctx context.Context) {
 }
 
 // ScanOnce processes every complete, settled submission that has no final
-// outcome yet: first the manual inbox, then online deliveries, each in name
-// order (online deliveries are named by serial). Builds are one at a time,
-// so when a manual and an online snapshot are both waiting, the manual one
-// is built and switched to first; the forward rule then decides the second
-// (a newer data timestamp replaces it; the same digest is a duplicate; a
-// different snapshot with the same timestamp is refused as not newer).
+// outcome yet: first the local intake's handoff directory, then the manual
+// inbox, then online deliveries, each in name order (online deliveries are
+// named by serial). Builds are one at a time, so when a manual and an
+// online snapshot are both waiting, the manual one is built and switched to
+// first; the forward rule then decides the second (a newer data timestamp
+// replaces it; the same digest is a duplicate; a different snapshot with
+// the same timestamp is refused as not newer). The trusted intake goes
+// before the inbox, so its queue is bounded by its own authorization limit,
+// not by whatever the untrusted inbox holds (ADR 0006).
 func (s *Service) ScanOnce(ctx context.Context) {
-	s.scanFeed(ctx, s.inboxFeed())
+	if s.intakeEnabled() {
+		s.scanFeed(ctx, s.intakeFeed())
+	}
+	if ctx.Err() == nil {
+		s.scanFeed(ctx, s.inboxFeed())
+	}
 	if s.onlineEnabled() && ctx.Err() == nil {
 		s.scanFeed(ctx, s.onlineFeed())
 	}
@@ -780,11 +847,7 @@ func (s *Service) scanFeed(ctx context.Context, f feed) {
 	st := ScanStatus{At: &now, Pending: []PendingEntry{}}
 	setStatus := func() {
 		s.mu.Lock()
-		if f.online {
-			s.onlineScan = st
-		} else {
-			s.scan = st
-		}
+		*f.scan = st
 		s.mu.Unlock()
 	}
 	if err != nil {
@@ -831,12 +894,19 @@ func (s *Service) retryable(ctx context.Context) func(*registry.Submission) bool
 			if s.retryRequested(ctx, prior) {
 				return true
 			}
-			// An unauthorized digest is re-evaluated once an operator has
-			// authorized exactly that digest (and size).
-			if prior.ReasonCode == nil || *prior.ReasonCode != importer.CodeUnauthorizedDigest || prior.SHA256 == nil || prior.SizeBytes == nil {
+			// An unauthorized digest (never authorized, or its
+			// authorization expired or was revoked, at verification or at
+			// the switch) is re-evaluated once exactly that digest (and
+			// size) is authorized again.
+			if prior.ReasonCode == nil || prior.SHA256 == nil || prior.SizeBytes == nil {
 				return false
 			}
-			a, err := registry.Authorized(ctx, s.reg, prior.RegionID, *prior.SHA256, *prior.SizeBytes)
+			switch *prior.ReasonCode {
+			case importer.CodeUnauthorizedDigest, CodeAuthorizationExpired, CodeAuthorizationRevoked:
+			default:
+				return false
+			}
+			a, err := registry.Authorized(ctx, s.reg, prior.RegionID, *prior.SHA256, *prior.SizeBytes, authScope(prior.Source, prior.Name))
 			return err == nil && a != nil
 		}
 		return false
@@ -897,8 +967,11 @@ func (s *Service) processEntry(ctx context.Context, f feed, e inbox.Entry) {
 }
 
 func resubmitHint(f feed) string {
-	if f.online {
+	switch {
+	case f.online:
 		return "retry it with the operator API (online retry) or wait for the next delivery"
+	case f.source == SourceIntake:
+		return resubmitHintIntake
 	}
 	return "touch the ready marker to submit again"
 }
@@ -995,16 +1068,30 @@ ORDER BY deactivated_at DESC NULLS LAST, release_id LIMIT 1`).Scan(&id)
 		}
 		a.ReleaseID = id
 	}
-	// An explicit rollback is not undone by automation: with online updates
-	// enabled, it pauses automatic activation of online snapshots in the
-	// same transaction, until an operator resumes it.
+	// An explicit rollback is not undone by automation: it pauses, in the
+	// same transaction and until an operator resumes them, automatic
+	// activation of online snapshots (online updates enabled) and of
+	// deliveries admitted only by the unattended intake watcher (intake
+	// enabled). Deliberate deliveries (the authenticated intake command, an
+	// operator's authorization, a pin) are not paused.
 	var inTx func(context.Context, registry.Querier) error
-	if s.onlineEnabled() {
+	if online, local := s.onlineEnabled(), s.intakeEnabled(); online || local {
 		regionID := s.regionID()
+		detail := func() map[string]any { return map[string]any{"cause": "rollback", "rollback_to": a.ReleaseID} }
 		inTx = func(ctx context.Context, q registry.Querier) error {
-			_, err := registry.SetOnlineAutoActivate(ctx, q, regionID, false, p.Name, p.Source,
-				"paused automatically by a rollback: "+a.Reason, p.RequestID, map[string]any{"cause": "rollback", "rollback_to": a.ReleaseID})
-			return err
+			if online {
+				if _, err := registry.SetOnlineAutoActivate(ctx, q, regionID, false, p.Name, p.Source,
+					"paused automatically by a rollback: "+a.Reason, p.RequestID, detail()); err != nil {
+					return err
+				}
+			}
+			if local {
+				if _, err := registry.SetIntakeWatcherAutoActivate(ctx, q, regionID, false, p.Name, p.Source,
+					"paused automatically by a rollback: "+a.Reason, p.RequestID, detail()); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 	}
 	return s.switchTo(ctx, p, "rollback", a, func(active, target *registry.Release) error {
@@ -1382,6 +1469,7 @@ type Status struct {
 	Job            *JobStatus               `json:"job"`
 	Storage        Capacity                 `json:"storage"`
 	Online         OnlineStatus             `json:"online"`
+	Intake         IntakeStatus             `json:"intake"`
 	Freshness      FreshnessStatus          `json:"freshness"`
 	Failpoints     []string                 `json:"failpoints,omitempty"`
 }
@@ -1455,6 +1543,9 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 		return st, err
 	}
 	if st.Online, err = s.onlineStatus(ctx, st.Region.ID); err != nil {
+		return st, err
+	}
+	if st.Intake, err = s.intakeStatus(ctx, st.Region.ID); err != nil {
 		return st, err
 	}
 	st.Freshness = s.freshness(st.Active)

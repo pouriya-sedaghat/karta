@@ -1,0 +1,181 @@
+# Controlled source bridge (Stage 5, opt-in; docs/adr/0006-stage5-hybrid-intake.md,
+# docs/runbook.md "Controlled source bridge"). Three processes of the api image:
+#
+#   bridge-acquire  downloads the snapshot named in KARTA_BRIDGE_SOURCE_FILE
+#                   (config/bridge/) into the spool. The only bridge process
+#                   with a route out (`bridge-egress`); no key, no listener.
+#   bridge-sign     no network at all, the only holder of the signing key. It
+#                   re-reads and verifies every spooled snapshot with Karta's
+#                   own checks, signs only newer data, and writes the publish
+#                   volume and its own durable serial state.
+#   bridge-serve    read-only HTTPS of the publish volume on `bridge`; no key,
+#                   no route out. Optional metrics listener (scope status).
+#
+# Co-located with Karta (`make up-bridge`):
+#   docker compose -f compose.yaml -f compose.bridge.yaml --profile bridge --profile online up -d
+# The fetcher then leaves `egress` and joins only `bridge`: the bridge's
+# downloader is the only container with an internet route, and the fetcher
+# reaches nothing but bridge-serve (its source file names
+# https://bridge-serve:8443/manifest.json, the `bridge` subnet in
+# allowed_networks and the bridge's CA in ca_file; config/sources/README.md).
+#
+# On a separate bridge host, the same file alone:
+#   docker compose -f compose.bridge.yaml --profile bridge up -d
+# with KARTA_BRIDGE_BIND set to the interface Karta's fetcher reaches it on.
+#
+# Nothing here starts unless asked for: every service is in profile `bridge`,
+# the source file is empty by default (acquire refuses to start), and the
+# signing key and TLS files are deployment inputs (docs/operations.md).
+
+x-bridge-logging: &bridge-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  bridge-acquire:
+    image: karta-api:${KARTA_IMAGE_TAG:-local}
+    profiles: [bridge]
+    command: ["bridge", "acquire"]
+    environment:
+      # A reviewed source file in config/bridge (empty: acquire refuses to start).
+      KARTA_BRIDGE_SOURCE_FILE: ${KARTA_BRIDGE_SOURCE_FILE:-}
+      KARTA_BRIDGE_SPOOL_DIR: /var/lib/karta/bridge/spool
+      KARTA_MAX_INPUT_MB: ${KARTA_MAX_INPUT_MB:-4096}
+      KARTA_BRIDGE_RESERVE_MB: ${KARTA_BRIDGE_RESERVE_MB:-64}
+      KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+      KARTA_FAILPOINTS: ${KARTA_BRIDGE_FAILPOINTS:-}
+    volumes:
+      - bridge-spool:/var/lib/karta/bridge/spool
+      - ./config/bridge:/config/bridge:ro
+    networks: [bridge-egress]
+    # Liveness is the age of its state (karta_bridge_acquire_state_age_seconds).
+    healthcheck:
+      disable: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KARTA_BRIDGE_ACQUIRE_MEM_LIMIT:-256m}
+    cpus: ${KARTA_BRIDGE_ACQUIRE_CPUS:-0.5}
+    pids_limit: 64
+    restart: unless-stopped
+    logging: *bridge-logging
+
+  bridge-sign:
+    image: karta-api:${KARTA_IMAGE_TAG:-local}
+    profiles: [bridge]
+    command: ["bridge", "sign"]
+    environment:
+      KARTA_BRIDGE_SIGNER_FILE: ${KARTA_BRIDGE_SIGNER_FILE:-/config/bridge/signer.json}
+      KARTA_REGION_FILE: /config/regions/${KARTA_PUBLISH_REGION:-tehran-chitgar}.json
+      KARTA_BRIDGE_SPOOL_DIR: /var/lib/karta/bridge/spool
+      KARTA_BRIDGE_PUBLISH_DIR: /var/lib/karta/bridge/publish
+      KARTA_BRIDGE_STATE_DIR: /var/lib/karta/bridge/state
+      KARTA_MAX_INPUT_MB: ${KARTA_MAX_INPUT_MB:-4096}
+      KARTA_MAX_FUTURE_SKEW: ${KARTA_MAX_FUTURE_SKEW:-10m}
+      KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+      KARTA_FAILPOINTS: ${KARTA_BRIDGE_FAILPOINTS:-}
+    secrets: [bridge_signing_key]
+    volumes:
+      - bridge-spool:/var/lib/karta/bridge/spool:ro
+      - bridge-publish:/var/lib/karta/bridge/publish
+      - bridge-state:/var/lib/karta/bridge/state
+      - ./config/bridge:/config/bridge:ro
+      - ./config/regions:/config/regions:ro
+    # No network: it can neither exfiltrate the key nor be reached.
+    network_mode: none
+    healthcheck:
+      disable: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # It scans the complete PBF before it signs.
+    mem_limit: ${KARTA_BRIDGE_SIGN_MEM_LIMIT:-512m}
+    cpus: ${KARTA_BRIDGE_SIGN_CPUS:-1}
+    pids_limit: 64
+    restart: unless-stopped
+    logging: *bridge-logging
+
+  bridge-serve:
+    image: karta-api:${KARTA_IMAGE_TAG:-local}
+    profiles: [bridge]
+    command: ["bridge", "serve"]
+    environment:
+      KARTA_BRIDGE_PUBLISH_DIR: /var/lib/karta/bridge/publish
+      KARTA_BRIDGE_SPOOL_DIR: /var/lib/karta/bridge/spool
+      KARTA_BRIDGE_LISTEN_ADDR: ":8443"
+      KARTA_BRIDGE_TLS_CERT: /run/secrets/bridge_tls_cert
+      KARTA_BRIDGE_TLS_KEY: /run/secrets/bridge_tls_key
+      # The bridge's own metrics (empty: off), for the monitoring credential.
+      KARTA_BRIDGE_METRICS_LISTEN_ADDR: ${KARTA_BRIDGE_METRICS_LISTEN_ADDR:-}
+      KARTA_BRIDGE_METRICS_TOKENS_FILE: /run/secrets/bridge_metrics_tokens
+      KARTA_LOG_LEVEL: ${KARTA_LOG_LEVEL:-info}
+    secrets: [bridge_tls_cert, bridge_tls_key, bridge_metrics_tokens]
+    volumes:
+      - bridge-publish:/var/lib/karta/bridge/publish:ro
+      - bridge-spool:/var/lib/karta/bridge/spool:ro
+    ports:
+      - "${KARTA_BRIDGE_BIND:-127.0.0.1}:${KARTA_BRIDGE_PORT:-8443}:8443"
+      - "${KARTA_METRICS_BIND:-127.0.0.1}:${KARTA_BRIDGE_METRICS_PORT:-9465}:9465"
+    networks:
+      bridge:
+        aliases: [bridge-serve]
+    healthcheck:
+      disable: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KARTA_BRIDGE_SERVE_MEM_LIMIT:-128m}
+    cpus: ${KARTA_BRIDGE_SERVE_CPUS:-0.5}
+    pids_limit: 64
+    restart: unless-stopped
+    logging: *bridge-logging
+
+  # Co-located topology: the fetcher reaches only the bridge (no internet).
+  fetcher:
+    profiles: [online]
+    networks: !override [bridge]
+
+  # Co-located monitoring: Prometheus also scrapes bridge-serve's metrics
+  # listener (deploy/monitoring/bridge/scrape.yml; set
+  # KARTA_BRIDGE_METRICS_LISTEN_ADDR=:9465).
+  prometheus:
+    profiles: [monitoring]
+    volumes:
+      - ./deploy/monitoring/bridge:/etc/karta-extra:ro
+    networks: [bridge]
+
+networks:
+  bridge-egress: {}
+  # No NAT route out (as `operator`): it only carries bridge-serve's HTTPS to
+  # the fetcher and publishes its port. A fixed subnet, so the fetcher's
+  # source file can allow exactly it (allowed_networks).
+  bridge:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam:
+      config:
+        - subnet: ${KARTA_BRIDGE_SUBNET:-10.233.0.0/24}
+
+volumes:
+  # Acquire's downloads: written by acquire, read-only for sign and serve.
+  bridge-spool: {}
+  # Signed manifests and content-addressed assets: written by sign, read-only for serve.
+  bridge-publish: {}
+  # The signer's durable high-water serial and exact pending envelope.
+  # Back it up; never restore an older copy without raising the high-water
+  # serial (docs/runbook.md).
+  bridge-state: {}
+
+secrets:
+  # The bridge's Ed25519 signing key: generated and held by its custodian
+  # (an owner decision), never by this repository or a Karta deployment.
+  bridge_signing_key:
+    file: ${KARTA_BRIDGE_SIGNING_KEY_FILE:-./secrets/bridge/signing-key.pem}
+  bridge_tls_cert:
+    file: ${KARTA_BRIDGE_TLS_CERT_FILE:-./secrets/bridge/tls.pem}
+  bridge_tls_key:
+    file: ${KARTA_BRIDGE_TLS_KEY_FILE:-./secrets/bridge/tls-key.pem}
+  bridge_metrics_tokens:
+    file: ${KARTA_BRIDGE_METRICS_TOKENS_HOST_FILE:-./secrets/metrics_tokens}
