@@ -7,8 +7,8 @@ This is a measurement and recovery rehearsal of the merged Stage 5 code, not a n
 production acceptance test. The production host does not yet exist. The
 baseline is `main` at merge commit `ab7dca3` (PR #12); both jobs of its CI
 run 37183595394 passed on fixtures (rechecked 2026-10-04). Do not infer
-full-Iran capacity from those fixtures or from the PBF size (about 230 MB:
-229,580,914 bytes are claimed for the 2026-09-27 file).
+full-Iran capacity from those fixtures or from the roughly 230 MB
+`iran-261002.osm.pbf` file.
 
 **Tier C, never tier D.** Every result is evidence about this VM only
 (`docs/operations.md`, evidence tiers). It says nothing about production-host
@@ -159,7 +159,8 @@ If a Karta database exists on the VM:
   any build: all release and candidate databases plus
   max(40 × PBF + 32 MiB, 1.25 × the region's largest ready, active or
   retired release) must fit `KARTA_RELEASE_STORAGE_BUDGET_MB` (10240). For
-  229,580,914 bytes the estimate is about 8.6 GiB. So the first Iran build
+  the listed 229,655,710-byte `iran-261002` file, the estimate is about
+  8.6 GiB. So the first Iran build
   fits only while the cluster's other release databases stay under about
   1.4 GiB. **Every later Iran submission, a duplicate of a built release
   included, is refused `insufficient_storage` once the first Iran release
@@ -223,8 +224,8 @@ If a Karta database exists on the VM:
    database, scans the whole file, prints the box source and counts, pins
    `expected_sha256`, sets `require_provenance` only if a sidecar is present
    (keep it off for a raw Geofabrik file unless a reviewed sidecar is
-   supplied), and centres the default view in the box (with the claimed box,
-   about 53.7°E 31.9°N at zoom 4). Review the pin and box. Do not copy
+   supplied), and centres the default view in the box. Review the actual `261002`
+   pin, box and view; do not assume they match the older `260927` file. Do not copy
    Chitgar checks.
 4. **Budget, then the measured no-activate import.** Agree the budget, the
    abort thresholds (free space on the Docker data root and on the Windows
