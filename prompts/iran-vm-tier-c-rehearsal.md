@@ -2,8 +2,8 @@
 
 Status: **repository review complete; pending owner inputs and a read-only VM
 inventory**. Claude Code reviewed this brief on 2026-10-04 and Codex checked
-the revised claims against the merged code. No VM results are claimed. This is a measurement and recovery
-rehearsal of the merged Stage 5 code, not a new implementation stage or a
+the revised claims against the merged code. No VM results are claimed.
+This is a measurement and recovery rehearsal of the merged Stage 5 code, not a new implementation stage or a
 production acceptance test. The production host does not yet exist. The
 baseline is `main` at merge commit `ab7dca3` (PR #12); both jobs of its CI
 run 37183595394 passed on fixtures (rechecked 2026-10-04). Do not infer
@@ -17,44 +17,50 @@ and capacity runs `tier-c-vm-…`; the runbook's `tier-d-iran-…` examples are
 for the future production host.
 
 **What the review could not check.** The review ran in Claude Code's cloud
-container, not on the VM. It observed no VM filesystem, Docker setup, CPU,
-memory, storage, existing Karta data or PBF, and records none. The
-corrections below come from the repository at `ab7dca3`. Every VM fact under
-"Owner inputs" is still open and is collected read-only at the start of the
-VM session (procedure step 1).
+container, not on the owner's VM. The owner now reports an Ubuntu Server VM
+with the previous Karta deployment removed, and a downloaded
+`iran-261002.osm.pbf`; these are owner reports, not observations. The
+read-only VM inventory must verify whether any Karta images, volumes,
+database or checkout remain and where the PBF actually resides.
 
-The owner will open a separate Claude Code session on the VM. Reading this
-brief does not authorize connecting to the VM, downloading a PBF, generating
-a signing key, changing a running database, or deploying to a production
-host. Agree on the VM work and its data source in that session.
+The owner will start a new Claude Desktop SSH session into the Ubuntu guest.
+Claude runs on that guest in SSH mode and needs its model connection. For
+application-disconnected tests, isolate Karta's network while leaving the
+SSH/Claude control path available; a fully disconnected guest requires
+the agent to run on the Windows host and control the guest over SSH.
+No PBF download, key generation, migration or publication starts until
+the VM inventory and resource budget have been reviewed.
 
 ## Goals
 
-Measure one **fixed, exact Geofabrik Iran PBF** through Karta's common
-verification/build path. Exercise protected local intake first; if the host
-preflight and owner-approved writer boundary permit it, exercise the watcher
-separately. Confirm serving during a publication, and, only with two separately
-accepted releases, across a rollback. Measure disk, memory, CPU, WAL, time
-and request latency. Record
-both successes and refusals. Keep Stage 3/5 online source and bridge disabled
-unless a separate, clearly scoped test with a throwaway key and controlled
-source is approved; no production key or automatic Geofabrik polling here.
+First verify and manually publish a fixed, exact Geofabrik Iran PBF through
+Karta's common verification/build path. The named `intake_submit` command
+is the initial local delivery; the protected-folder watcher is a separate
+optional check after its host preflight and writer boundary are reviewed.
+Once the manual release passes Iran-specific acceptance and the VM has room
+for another complete release, test an opt-in online update through the
+controlled bridge from a **genuinely newer** Geofabrik Iran extract.
+The bridge's signing key for this VM is a throwaway test key, never a
+production key. Both paths must preserve serving and audit. Measure disk,
+memory, CPU, WAL, time and latency; only claim full-Iran rollback if two
+separately accepted releases exist. Neither path is production acceptance.
 
 ## Candidate snapshot
 
-The only Iran file identity recorded in the repository is the source of the
-Chitgar extract, from that extract's provenance sidecar (`docs/licenses.md`,
-`docs/development-data.md`): `iran-260927.osm.pbf`, 229,580,914 bytes,
-SHA-256 `fbb1b010efaa16b01ba24baaa40109f90cda4d32cf38bf4be1b5b67bac2e4529`,
-Geofabrik replication sequence 4920, timestamp 2026-09-27T20:23:36Z, header
-box `44.023033,24.039475,63.35413,39.790447`. These are **claims, never
-verified**: the file was not available. No Iran PBF is in Git or was seen by
-this review. If the owner still holds that exact file, it is the natural
-fixed snapshot: the Chitgar sidecar's digest claim predates the proposed VM transfer, but
-its origin remains unverified until the owner supplies the file and its
-independent record. A matching VM hash corroborates that recorded claim. Otherwise
-the owner names another dated file and records its SHA-256 and size before
-the transfer. A mismatch with the record stops the run.
+The owner reports downloading `iran-261002.osm.pbf` on 2026-10-03. At the
+time of this brief revision, Geofabrik's Iran listing names this dated PBF
+as 229,655,710 bytes, modified 2026-10-02 22:37 UTC. The local file, its
+SHA-256 and its header have **not** been observed. Record its SHA-256 and
+size from the original source copy, compare them with the VM copy, and
+record Geofabrik's MD5 as distributor metadata (not authentication).
+The dated filename does not prove that the local bytes are complete.
+
+The repository also records an older `iran-260927.osm.pbf` digest as an
+unverified claim from the Chitgar extract sidecar. That digest does not
+authorize or identify the owner's new `iran-261002.osm.pbf`. Derive the
+Iran region box and initial pin from the verified new file. The bridge
+will later inspect `iran-latest.osm.pbf` and publish its own immutable
+copy if the extract is newer and passes the same region and time rules.
 
 ## Owner inputs before anything on the VM changes
 
@@ -69,16 +75,16 @@ the transfer. A mismatch with the record stops the run.
    volume behind a dynamically expanding virtual disk (a check inside the VM
    cannot see the host); clock synchronization and whether the VM may be
    suspended or checkpointed.
-2. **Existing Karta:** whether a checkout, Compose project (default name
-   `karta`), images, volumes or database exist; their commit and registry
-   schema version; what must be preserved (a Chitgar release, audit history)
-   and whether that stack may be stopped. See "Existing database".
-3. **Snapshot:** the PBF's path on the VM or permission for one specified
-   download, plus origin URL, observation time, expected SHA-256 and size
-   recorded independently of the copy ("Candidate snapshot"). Record
-   Geofabrik's `.md5`, `Last-Modified`, header timestamp and box as
-   metadata, not as a signature. Never use the moving `iran-latest` URL as
-   the identity of a fixed snapshot.
+2. **Existing Karta:** the owner reports deleting prior deployments. Verify
+   read-only whether a checkout, Compose project (default name `karta`),
+   images, volumes or database remain; if any do, record their commit and
+   registry schema, what must be preserved, and consult "Existing database".
+3. **Snapshot:** locate the owner's `iran-261002.osm.pbf` on Windows or
+   the VM; obtain its original-copy SHA-256 and size before transfer and
+   verify the VM copy. Record the dated Geofabrik URL, observation time,
+   `.md5`, header timestamp and box as metadata, not as a signature.
+   A future `iran-latest` URL may identify the distributor for the bridge,
+   never the fixed identity of the manually delivered bytes.
 4. **Disk:** how much the rehearsal may use, the storage budget value
    ("Capacity"), the abort thresholds, where backups go (outside the
    filesystem being measured, ideally off the VM), and whether an isolated
@@ -89,9 +95,11 @@ the transfer. A mismatch with the record stops the run.
    `scripts/operator-credential.sh` makes them mode 0644 (readable by
    container UID 65532), so a custom token path under a traversable
    directory is unsafe.
-6. **Scope:** whether a second Iran release is in scope (step 5a; the only
-   same-region rollback target, at the cost of its disk), and the request
-   mix and limits for the load run.
+6. **Scope:** owner approval for a one-off live Geofabrik update test after
+   the manual baseline, a real contact in the bridge user agent, custody of
+   a disposable VM test key, polling and stop time, enough space for two
+   releases plus bridge spool/outbox/staging, and the load mix and limits.
+   The bridge and fetcher remain off until this phase.
 
 Do not put the PBF, tokens, keys, `.env`, backups, VM paths, UIDs, host names
 or unredacted logs in Git. At the `ab7dca3` baseline `.env` is not ignored;
@@ -296,14 +304,39 @@ If a Karta database exists on the VM:
    If there is only one accepted release, omit the full-Iran rollback
    experiment and rely on the fixture CI for that behavior. Check the
    active pointer, audit and release pinning; check watcher activation
-   pause only if a rollback was actually performed. Test serving after
-   network loss. Do not claim a performance objective until the owner
+   pause only if a rollback was actually performed. Test Karta's disconnected serving by isolating its network without ending
+   the Claude Desktop SSH session; a guest-wide internet cut needs a host-run
+   agent instead. Do not claim a performance objective until the owner
    chooses the workload and limits.
-8. **Backup and isolated restore.** Run `make backup` of the rehearsal
-   project to the agreed location. Restore it into a second isolated project
-   with other ports (runbook, "Backup and restore") and confirm
-   `restore-check` passes there. Check the clock (`timedatectl`) before and
-   after any VM suspend or resume, and do not suspend during a build.
+8. **Optional live online update, after manual acceptance.** Verify that
+   Geofabrik currently serves an extract whose **PBF header timestamp** is
+   newer than the active `iran-261002` release; the dated filename alone
+   is not the forward-rule evidence. Review the distributor's current
+   download terms and configure a real contact in `user_agent`.
+   First check capacity for another complete candidate and retained
+   release, bridge spool, fetcher outbox, staging and a backup; abort if
+   the agreed disk or memory reserve cannot be maintained. Use the
+   bridge's separate acquire/sign/serve roles with a disposable signing
+   key whose public key is pinned in Karta's reviewed source config.
+   Never commit the private key. The bridge alone contacts Geofabrik;
+   Karta's fetcher trusts only the bridge's signed manifest. With
+   `require_operator_authorization` left false in the source config,
+   that signature authorizes the newer digest; do not silently broaden
+   any other publication path. Confirm acquire checks, exact downloaded
+   digest/size, provenance record, manifest serial, signer verification,
+   fetcher and publisher checks, audit, serving during switch and active
+   release. A Geofabrik boundary/box change or a non-newer extract is a
+   recorded refusal/no-update, not a reason to weaken region or forward
+   policy. If no newer extract exists when tested, report that the online
+   update path could not be demonstrated live. Stop bridge/fetcher after
+   the bounded test unless the owner explicitly chooses to keep them on.
+   Only now consider rollback to the already accepted manual release,
+   with load and the normal activation-pause audit.
+9. **Backup and isolated restore.** Run `make backup` of the rehearsal
+   project to the agreed location. Restore it into a second isolated
+   project with other ports (runbook, "Backup and restore") and confirm
+   `restore-check` passes there. Check the clock (`timedatectl`) before
+   and after any VM suspend or resume, and do not suspend during a build.
 
 ## Evidence and exit criteria
 
@@ -311,8 +344,11 @@ Deliver a concise report with:
 
 * exact commit, image tags and digests, and project name;
 * the VM resource inventory, including the Windows host volume;
-* the fixed PBF's provenance, SHA-256, size, timestamp and box, and whether
-  they match the recorded claim;
+* the manual `iran-261002` provenance, SHA-256, size, timestamp and box,
+  and whether the local file matches the independently recorded bytes;
+* if the online phase ran, the newer Geofabrik snapshot's digest, size,
+  timestamp, bridge manifest serial/key id, source checks, publication
+  outcome and final bridge/fetcher state;
 * the budget, abort thresholds and any override, with their values;
 * before and after storage, and backup verification;
 * the region configuration diff and how the reviewed checks were executed;
