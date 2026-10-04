@@ -94,10 +94,11 @@ the transfer. A mismatch with the record stops the run.
    mix and limits for the load run.
 
 Do not put the PBF, tokens, keys, `.env`, backups, VM paths, UIDs, host names
-or unredacted logs in Git. `.env` is **not** git-ignored: never `git add -A`
-on the VM. The only file meant for a commit is the reviewed
-`config/regions/iran.json`, through a branch and PR. Record nonsecret evidence
-in a separate report.
+or unredacted logs in Git. At the `ab7dca3` baseline `.env` is not ignored;
+PR #13 proposes an ignore rule, but verify the actual checkout and never
+stage `.env` or secrets regardless. During VM execution the only intended
+repository change is the reviewed `config/regions/iran.json`, through a
+branch and PR. Record nonsecret evidence in a separate report.
 
 ## Existing database: pre-upgrade backup and schema v5
 
