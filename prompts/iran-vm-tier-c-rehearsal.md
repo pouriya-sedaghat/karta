@@ -1,7 +1,7 @@
 # Draft brief: full-Iran rehearsal on the owner's Windows-hosted VM (tier C)
 
-Status: **repository review complete; SSH inventory and cross-copy PBF hash
-supplied by the owner; pending resource and measured-run decisions**. Claude Code reviewed this brief on 2026-10-04 and Codex checked
+Status: **repository review complete; pending private tier C resource review
+and measured-run decisions**. Claude Code reviewed this brief on 2026-10-04 and Codex checked
 the revised claims against the merged code. No measured Karta results are claimed.
 This is a measurement and recovery rehearsal of the merged Stage 5 code, not a new implementation stage or a
 production acceptance test. The production host does not yet exist. The
@@ -16,49 +16,20 @@ capacity, limits, objectives, key custody or recovery (tier D). Label reports
 and capacity runs `tier-c-vm-…`; the runbook's `tier-d-iran-…` examples are
 for the future production host.
 
-**SSH inventory (2026-10-04).** The owner supplied a Claude Desktop SSH
-report from the Ubuntu VM. Codex has not directly accessed that VM. The
-following are observations attributed to Claude's report, not independent
-measurements by Codex: VMware, Ubuntu 26.04.1, 4 vCPUs, 7.20 GiB RAM,
-4 GiB swap, and about 81.5 GiB free on `/`. Docker Engine runs in the
-guest (29.8.1, Compose 5.5.1); `/var/lib/docker`, `/var/lib/containerd`,
-swap and the PBF share the ext4 root. The unprivileged inventory found no
-Karta checkout, project, container, image, volume or database; about 2.644
-GB of old build cache and eight build records remain. Root-owned Docker
-directories were not read directly, though Docker's object listings were
-queried. No cache cleanup is necessary for the inventory.
+**Private tier C evidence.** The owner and Claude Code will verify VM and
+Windows host capacity, the source-file digest, time stability, network
+access and backup location before the measured run. Keep exact host
+identifiers, addresses, paths, hashes, resource measurements and logs in
+a private report; do not add them to this public repository. A SHA-256 match
+between the original and transferred PBF verifies the copy, while the
+normal Karta verification still checks the full file. A source-side
+checksum is distributor metadata, not a signature.
 
-The reported VM copy of `iran-261002.osm.pbf` is 229,655,710 bytes,
-SHA-256
-`4cbf2a95cffee119615e6862fd2257817356c263c15729477e21a4f5b8aedc5d`.
-Its header reports 2026-10-02T20:21:34Z, sequence 4925 and box
-44.0230330,24.0394750 to 63.3541300,39.7904470. Only the header was
-read; full-file structural verification remains open. On 2026-10-04 the
-owner measured the original Windows file as 229,655,710 bytes with the same
-SHA-256 (case-insensitive match). This confirms byte agreement between the
-reported original and VM copy, not independent Geofabrik authenticity. The
-reported MD5 has not been compared with Geofabrik's sidecar. Never mount the user's home directory into a container: it contains
-unrelated private files, and its reported 0750 mode blocks the container
-UID. Stage verified bytes in a dedicated input directory for the run.
-
-Chrony was synchronized at inventory time, but the journal reportedly
-shows 13 forward time jumps and a gap consistent with guest suspension or
-host sleep. Establish the cause and prevent either during measured runs.
-The owner reports a Windows host with 17,050,075,136 bytes (15.88 GiB) RAM.
-Volume F: has 559,026,163,712 bytes (520.63 GiB) free out of
-580,770,590,720 bytes; confirm F: holds the VM's VMDK. The VM's virtual
-disk is configured as 200 GB; whether it is growable and whether snapshots
-already exist remain unverified. The owner can prevent Windows sleep and VM
-suspension during the measured run, but must apply and verify those settings.
-The guest root has about 81.5 GiB free and roughly half its volume group
-unallocated. Do not resize it before measuring.
-
-Claude runs on the guest in SSH mode and needs its model connection. For
-application-disconnected tests, isolate Karta's network while leaving the
-SSH/Claude control path available; a fully disconnected guest requires
-the agent to run on the Windows host and control the guest over SSH.
-No PBF download, key generation, migration or publication starts until
-the remaining owner inputs and resource budget have been reviewed.
+Claude Desktop SSH runs its agent on the guest. Application-disconnected
+tests must keep the Claude/SSH control path available; fully disconnecting
+the guest requires a host-run agent. No import, live download, signing key,
+migration or publication starts until private evidence and the resource
+budget have been reviewed.
 
 ## Goals
 
@@ -76,52 +47,38 @@ separately accepted releases exist. Neither path is production acceptance.
 
 ## Candidate snapshot
 
-The owner reports downloading `iran-261002.osm.pbf` on 2026-10-03. At the
-time of this brief revision, Geofabrik's Iran listing names this dated PBF
-as 229,655,710 bytes, modified 2026-10-02 22:37 UTC. The VM copy's
-size, SHA-256 and header have been reported above. The original Windows
-file has the same size and SHA-256. Record Geofabrik's MD5 if reachable as
-distributor metadata (not authentication); let Karta scan the complete PBF.
-The dated filename does not prove that the local bytes are complete.
-
-The repository also records an older `iran-260927.osm.pbf` digest as an
-unverified claim from the Chitgar extract sidecar. That digest does not
-authorize or identify the owner's new `iran-261002.osm.pbf`. Derive the
-Iran region box and initial pin from the verified new file. The bridge
-will later inspect `iran-latest.osm.pbf` and publish its own immutable
-copy if the extract is newer and passes the same region and time rules.
+The owner proposes a fixed dated Geofabrik Iran PBF for the initial manual
+delivery. Record its original and transferred SHA-256, exact byte size,
+header time and bounding box in the private tier C report. Check the
+transfer against an independently recorded digest; the filename alone
+does not prove completeness. Source-side MD5, if available, is metadata
+and not authentication. Derive the Iran region box and initial pin from
+the verified bytes. The bridge later inspects the distributor's latest
+extract and publishes its own immutable copy only if it is newer and
+passes the same region and time rules.
 
 ## Owner inputs before anything on the VM changes
 
-1. **Windows host and final VM settings:** confirm F: holds the VMDK;
-   identify VMware product/version, virtual-disk growth mode and any
-   existing snapshots. Host RAM and F: free space are recorded above;
-   available host RAM during the run must also be checked before increasing
-   guest RAM. Verify the new checkout and landing area's filesystem and
-   free space. Compose 5.5.1 meets the stated minimum but has not been
-   exercised with Karta here. Investigate the time jumps; apply the owner's
-   available sleep/suspend prevention before measured work, and check the
-   clock before and after. A VM snapshot is optional before changes and
-   is not a database backup; it is not required on this VM with no existing
-   Karta database. Avoid retaining a snapshot during measured database
-   work unless its space and performance cost are in the plan.
-2. **Existing Karta:** the SSH inventory found no Karta checkout, Compose
-   project, images, volumes or database, only build cache and records. If
-   any later check finds a database, record its commit and schema, identify
-   what to preserve and consult "Existing database" before connecting a
-   Stage 5 process. Cache cleanup is optional.
-3. **Snapshot:** the original Windows and VM copy size/SHA-256 now match.
-   Record the dated Geofabrik URL, observation time, `.md5` (if reachable),
-   header timestamp and box as metadata, not as a signature.
-   A future `iran-latest` URL may identify the distributor for the bridge,
-   never the fixed identity of the manually delivered bytes.
+1. **VM and host resources:** privately record hypervisor/version, CPU,
+   RAM and available memory, swap, virtual-disk growth mode, any snapshots,
+   and guest and host free space. Confirm which host filesystem contains
+   the VMDK. Keep the VM and host awake for measured runs, and check the
+   clock before and after. A VM snapshot is optional, not a database backup;
+   account for its storage and performance effects if used.
+2. **Existing Karta:** inventory any existing checkout, Compose project,
+   images, volumes or database before Stage 5 code can connect to it. If
+   one exists, follow "Existing database" below for preservation.
+3. **Snapshot bytes:** compare original and VM copy size and SHA-256.
+   Privately record dated source URL, observation time, checksum metadata,
+   header timestamp and box. Never put a host path or the input file in Git.
+   A future latest URL can identify the distributor for the bridge, not the
+   fixed identity of the manually delivered bytes.
 4. **Disk:** how much the rehearsal may use, the storage budget value
    ("Capacity"), the abort thresholds, where backups go (outside the
    measured filesystem, preferably off the VM), and whether an isolated
-   restore project fits (it needs room for the whole cluster again). No
-   second guest filesystem was reported. A second logical volume on the
-   same virtual disk can separate measurement but does not protect a
-   backup from failure of that disk or its Windows host volume.
+   restore project fits (it needs room for the whole cluster again). An additional logical volume on the same virtual disk can separate
+   measurement but does not protect a backup from failure of that disk
+   or its host volume.
 5. **Access:** the person holding the named `intake_submit` credential and,
    only if the watcher is in scope, the landing account and its writers.
    Token files stay under the private `secrets/` directory:
@@ -130,10 +87,9 @@ copy if the extract is newer and passes the same region and time rules.
    directory is unsafe.
 6. **Network and scope:** determine and document the route for image builds
    and the future bridge container to reach registries and Geofabrik. The
-   reported Docker proxy listens on host loopback, which a normal container
-   cannot use through its own loopback address. Earlier registry 403 errors
-   followed by successful builds do not establish that this is the only
-   working route. Obtain owner approval for a one-off live Geofabrik
+   host proxy, if configured, may listen on loopback and not be reachable
+   from a normal container. Test the actual route without assuming that
+   image pulls, build steps and containers share it. Obtain owner approval for a one-off live Geofabrik
    update test after the manual baseline; agree on a real contact in the
    bridge user agent, custody of a disposable VM test key, polling and stop
    time, enough space for two releases plus bridge spool/outbox/staging,
@@ -213,12 +169,9 @@ If a Karta database exists on the VM:
 * **Memory:** osm2pgsql runs non-slim (cache 800 MB, 2 processes) inside the
   publisher or importer (4 GiB limit each); db 2 GiB with 256 MB shared
   buffers; api 512 MiB. During a `karta import` with the stack up, the
-  memory limits add up to 10.5 GiB, while the reported VM has 7.20 GiB RAM
-  and 4 GiB swap on `/`. The Windows host has 15.88 GiB physical RAM;
-  a 10 GiB guest allocation, for example, leaves under 6 GiB for Windows
-  and other processes. Limits are ceilings, not predicted use. Determine
-  host available RAM before any guest increase; agree a swap/OOM abort
-  rule before the run. An OOM kill is a result to record, not to work
+  memory limits add up to 10.5 GiB. These limits are ceilings rather than
+  predicted use. Compare guest and host available memory privately before
+  any guest increase; set a swap/OOM abort rule before the run. An OOM kill is a result to record, not to work
   around silently.
 * **Settings that `.env` does not reach:** `KARTA_OSM2PGSQL_SLIM`,
   `KARTA_DB_VOLUME_PATH`, `KARTA_CANDIDATE_SIZE_FACTOR` and
@@ -230,16 +183,12 @@ If a Karta database exists on the VM:
 
 ## Procedure for Claude Code
 
-1. **Read-only inventory (SSH report received).** Review the observed VM
-   facts and obtain the missing Windows/source inputs before changes. The
-   prior session fetched only this brief over HTTPS and found no checkout.
-   If a follow-up inventory is needed, use read-only commands such as
-   `uname -a`, `free -h`, `df -hT`, `docker info`, `docker compose ls -a`,
-   `docker ps -a`, `docker volume ls`, `timedatectl` and chrony status.
-   Read the runbook, operations guide, ADR 0006, scripts, region config and
-   Compose files at the agreed commit via HTTPS if the checkout is absent.
-   Report any difference and resolve resource and network questions before
-   checking out or running Karta.
+1. **Read-only inventory.** Confirm the actual VM and host resources,
+   Docker objects, current Karta state, filesystem boundaries, clock and
+   network routes. Read the runbook, operations guide, ADR 0006, scripts,
+   region config and Compose at the reviewed commit. Compare observations
+   with this brief; record identifying results only in a private report.
+   Resolve capacity and source questions before changing Karta state.
 2. **Isolation.** Use a separate checkout at the reviewed commit, with its own
    `.env`, `secrets/`, `data/` and `config/regions`. `compose.yaml` pins
    `name: karta`, so a second checkout without a project name attaches to
@@ -258,8 +207,8 @@ If a Karta database exists on the VM:
    `KARTA_IMAGE_TAG=<tag>` in the rehearsal `.env` **and** the shell
    (`make intake-check`, `scripts/backup.sh` and `scripts/capacity-run.sh`
    read it from the environment only).
-3. **Snapshot and region draft.** The reported original and VM copy match
-   in size and SHA-256; re-check after staging, and stop on a mismatch.
+3. **Snapshot and region draft.** Compare the original and VM copy size
+   and SHA-256; re-check after staging, and stop on a mismatch.
    Stage the PBF alone in a dedicated directory accessible to container
    UID 65532; do
    not mount the home directory or any unrelated private files. Draft
@@ -358,11 +307,9 @@ If a Karta database exists on the VM:
    agent instead. Do not claim a performance objective until the owner
    chooses the workload and limits.
 8. **Optional live online update, after manual acceptance.** First establish
-   and review the image-build and bridge-container network routes; Docker's
-   reported proxy is bound to host loopback and containers do not inherit
-   it. Earlier `gcr.io` 403s followed by successful builds do not prove
-   that the proxy is the only usable route. Leave Claude's SSH/model route
-   available. Verify that
+   and review image-build and bridge-container network routes; a host proxy
+   is not automatically reachable from container loopback. Leave Claude's
+   SSH/model route available. Verify that
    Geofabrik currently serves an extract whose **PBF header timestamp** is
    newer than the active `iran-261002` release; the dated filename alone
    is not the forward-rule evidence. Review the distributor's current
@@ -394,10 +341,10 @@ If a Karta database exists on the VM:
 
 ## Evidence and exit criteria
 
-Deliver a concise report with:
+Deliver a concise private report with:
 
 * exact commit, image tags and digests, and project name;
-* the VM resource inventory, including the Windows host volume;
+* the privately recorded VM and Windows host resource inventory;
 * the manual `iran-261002` provenance, SHA-256, size, timestamp and box,
   and whether the local file matches the independently recorded bytes;
 * if the online phase ran, the newer Geofabrik snapshot's digest, size,
