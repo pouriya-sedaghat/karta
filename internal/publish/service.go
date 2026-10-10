@@ -1110,7 +1110,9 @@ func (s *Service) Activate(ctx context.Context, p Principal, a ActionRequest) (r
 	}, nil)
 }
 
-// Rollback makes a retained, validated, compatible release active again.
+// Rollback makes a retained, compatible release that was active before
+// (retired) active again. A ready release is refused: it is activated
+// (Activate), with every forward gate.
 func (s *Service) Rollback(ctx context.Context, p Principal, a ActionRequest) (registry.ActivateResult, error) {
 	if a.ReleaseID == "" {
 		var id string
@@ -1154,17 +1156,19 @@ ORDER BY deactivated_at DESC NULLS LAST, release_id LIMIT 1`).Scan(&id)
 		}
 	}
 	return s.switchTo(ctx, p, "rollback", a, func(active, target *registry.Release) error {
+		// A rollback is the way back to a release that was served before:
+		// only a replaced active release is retired. It is not held up by the
+		// forward rule, the row-count gate or a policy changed since. A ready
+		// release was never active: going to it is not going back, and only
+		// an operator activate, with every forward gate, may make it active.
+		if target.State != registry.StateRetired {
+			return fmt.Errorf("%w: release %s is %s and was never active; a rollback only returns to a release that was active before "+
+				"(retired): activate it instead (operator activate, with the forward rule, the validation policy and the row-count gate)",
+				registry.ErrNotEligible, target.ID, target.State)
+		}
 		if active != nil && active.RegionID != target.RegionID && !a.AllowRegionChange {
 			return policyErr(CodeRegionChanged, "release %s serves region %q, the active release %q; a region change must be explicit",
 				target.ID, target.RegionID, active.RegionID)
-		}
-		// Going back to a release that was served before is not held up by
-		// a policy changed since. A release never activated is not "going
-		// back": it must have passed the policy in force, as for activate
-		// (the region file read under the locks, as there).
-		if target.ActivatedAt == nil {
-			cfg, cfgErr := region.Load(s.cfg.RegionPath)
-			return policyGate(cfg, cfgErr, target)
 		}
 		return nil
 	}, inTx)
@@ -1517,8 +1521,9 @@ func (s *Service) Revoke(ctx context.Context, p Principal, digest, reason string
 // ReleaseStatus is a release as reported to operators.
 type ReleaseStatus struct {
 	registry.Release
-	// RollbackEligible: retained, validated and not active (compatibility
-	// is checked when a rollback is requested).
+	// RollbackEligible: retired (active before, so a rollback may return to
+	// it) and not active; compatibility is checked when a rollback is
+	// requested. A ready release is activated, not rolled back to.
 	RollbackEligible bool `json:"rollback_eligible"`
 	// PinnedServed: a retired release clients may still use.
 	PinnedServed bool `json:"pinned_served"`
@@ -1603,7 +1608,7 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	for _, r := range rels {
 		rs := ReleaseStatus{Release: r}
 		isActive := st.Active != nil && st.Active.ID == r.ID
-		rs.RollbackEligible = !isActive && (r.State == registry.StateReady || r.State == registry.StateRetired)
+		rs.RollbackEligible = !isActive && r.State == registry.StateRetired
 		rs.PinnedServed = r.State == registry.StateRetired && r.PinnedUntil != nil && now.Before(*r.PinnedUntil)
 		rs.PolicyCurrent = policyCurrent(r, st.Region.ValidationPolicySHA256)
 		st.Releases = append(st.Releases, rs)

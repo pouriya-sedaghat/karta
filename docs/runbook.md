@@ -174,8 +174,10 @@ not retried automatically and does not use up attempts.
   release with more data is refused (`excessive_data_loss`). If the active
   release's counts cannot be read, the publication or activation is refused
   (`counts_unavailable`), never let through. Rollback has its own policy and
-  no count gate. If a large drop is intended, raise `max_drop_fraction` in
-  the region file through a reviewed change.
+  no count gate, so it only returns to a release that was active before
+  (`retired`): a `ready` release is never made active by a rollback
+  (`409 release_not_eligible`; activate it). If a large drop is intended,
+  raise `max_drop_fraction` in the region file through a reviewed change.
 * **One at a time, in name order.** Builds are serialized; with several
   ready submissions the newest valid one ends up active regardless of order.
 * **Region changes are explicit**: `make import-tehran IMPORT_FLAGS=--allow-region-change`,
@@ -721,7 +723,7 @@ with the credential name.
 make op-status                                           # status (monitor or operator token)
 make op CMD='audit --limit 50'                           # newest audit records
 make op CMD='rollback --reason "B has broken labels"'    # to the most recently replaced release
-make op CMD='rollback --release rXXXX --reason "..."'    # to a specific retained release
+make op CMD='rollback --release rXXXX --reason "..."'    # to a specific retired release (one that was active before)
 make op CMD='revalidate --release rXXXX --reason "..."'  # evaluate a release against the region file's checks in force (no rebuild, never activates)
 make op CMD='activate --release rXXXX --reason "..."'    # a ready release (forward only, must have passed the checks in force, row counts re-checked)
 make op CMD='cleanup --dry-run --reason "check"'         # what cleanup would remove
@@ -775,10 +777,14 @@ authentication is logged and audited (at most 30 audit rows per minute).
 ## Rollback and pinned clients
 
 * **Rollback** changes only the active pointer, in one audited transaction,
-  to a retained (`ready` or `retired`), validated release that passes the
+  to a retained release that was active before (`retired`) and passes the
   same compatibility checks as serving (schema major, style, serving
-  database toolchain). Removed, failed or incompatible releases are refused
-  (`409`). Rollback is immediate; the API follows within 5 s.
+  database toolchain). It is the way back, so the forward rule, the
+  row-count gate and the validation policy do not hold it up. A release
+  that was never active (`ready`) is refused (`409 release_not_eligible`):
+  activate it instead, with every forward gate. Removed, failed or
+  incompatible releases are refused too (`409`). Rollback is immediate; the
+  API follows within 5 s.
 * **Pinned clients.** When a release is replaced (publication or rollback),
   clients that pinned its `release_id` keep getting it for
   `KARTA_RELEASE_PIN_GRACE` (24 h); requests already running always finish on
@@ -925,13 +931,13 @@ bound to the region identity they were evaluated for (`id`, `name`, `bbox`,
 `view`), as a SHA-256 shown in `make op-status` (`region.validation_policy_sha256`,
 and per release `validation_policy_sha256`, `validation_policy_current` and
 the latest evaluation in `validation`). Every forward activation (an
-automatic publication, `activate`, and a rollback to a release that was
-never active) requires the target to have passed the policy in force,
-inside the pointer transaction; otherwise it is refused with
+automatic publication and `activate`; a rollback cannot target a release
+that was never active) requires the target to have passed the policy in
+force, inside the pointer transaction; otherwise it is refused with
 `validation_required`. Editing only the region's name, box or view (the
 checks unchanged) also changes the policy: a release built for the old
-identity is then not current, cannot be activated (or rolled back to, if it
-was never active) and cannot be revalidated against the edited file
+identity is then not current, cannot be activated and cannot be
+revalidated against the edited file
 (`release_not_revalidatable`); it needs a new build, and restoring the
 identity makes its pass current again. `max_drop_fraction` is not part of
 the policy: the row-count gate is checked again at every forward switch
@@ -1020,7 +1026,8 @@ release that fails is never activated (`validation_failed`).
 
 A rollback to a release that was active before is not held up by a policy
 changed since: it is the way back. Going forward to it again is an
-activation and needs a pass of the policy in force. The region file is read
+activation and needs a pass of the policy in force. A rollback never makes
+a release that was never active (`ready`) active. The region file is read
 for each switch under the pointer lock: one that cannot be read or parsed
 refuses the switch (`region_config`).
 

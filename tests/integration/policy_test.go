@@ -5,6 +5,8 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,11 +53,12 @@ type cliImport struct {
 }
 
 type policyRelease struct {
-	ID            string  `json:"release_id"`
-	State         string  `json:"state"`
-	Passed        *string `json:"validation_policy_sha256"`
-	PolicyCurrent bool    `json:"validation_policy_current"`
-	Validation    *struct {
+	ID               string  `json:"release_id"`
+	State            string  `json:"state"`
+	Passed           *string `json:"validation_policy_sha256"`
+	PolicyCurrent    bool    `json:"validation_policy_current"`
+	RollbackEligible bool    `json:"rollback_eligible"`
+	Validation       *struct {
 		PolicySHA256 string   `json:"policy_sha256"`
 		Passed       bool     `json:"passed"`
 		Kind         string   `json:"kind"`
@@ -257,9 +260,10 @@ func TestReadyReleasePolicy(t *testing.T) {
 		if s := policyView(t); s.activeID() != "" || s.release(t, rel).State != "ready" {
 			t.Fatalf("after the refused activation: active %q, %+v", s.activeID(), s.release(t, rel))
 		}
-		// Not a back door either: a rollback to a release never served.
+		// Not a back door either: a rollback only returns to a release that
+		// was active before.
 		r = op(t, http.MethodPost, "/v1/operator/rollback", admin, map[string]any{"reason": "rollback to an unvalidated release", "release_id": rel})
-		if r.status != http.StatusConflict || r.reasonCode(t) != "validation_required" {
+		if code, _ := r.errorCode(t); r.status != http.StatusConflict || code != "release_not_eligible" {
 			t.Fatalf("rollback to a release never activated: %d %s", r.status, r.body)
 		}
 	})
@@ -626,7 +630,7 @@ func TestReadyReleasePolicy(t *testing.T) {
 				t.Fatalf("activation after the %s changed: %d %s", e.name, r.status, r.body)
 			}
 			r = op(t, http.MethodPost, "/v1/operator/rollback", admin, map[string]any{"reason": "the " + e.name + " changed", "release_id": rel})
-			if r.status != http.StatusConflict || r.reasonCode(t) != "validation_required" {
+			if code, _ := r.errorCode(t); r.status != http.StatusConflict || code != "release_not_eligible" {
 				t.Fatalf("rollback to the never-activated release after the %s changed: %d %s", e.name, r.status, r.body)
 			}
 			// Nor can it be revalidated against a file describing another
@@ -753,6 +757,105 @@ func TestReadyReleasePolicy(t *testing.T) {
 		writeRegion(t, strict)
 		r := op(t, http.MethodPost, "/v1/operator/releases/"+s.release()+"/activate", admin, map[string]any{"reason": "name restored"})
 		expectStatus(t, r, http.StatusOK)
+	})
+
+	t.Run("a rollback never activates a release that was never active, so it cannot bypass the row-count gate", func(t *testing.T) {
+		resetAll(t)
+		restartPublisher(t, usePolicyFile)
+		// A: fixture A with three more named points of interest (nodes come
+		// first, sorted by id), so that B, the newer snapshot B with as many
+		// features as fixture A, keeps fewer rows than A.
+		base := string(readRepo(t, "testdata/fixture/karta-fixture.osm"))
+		var extra strings.Builder
+		for i := 0; i < 3; i++ {
+			fmt.Fprintf(&extra, "  <node id=\"%d\" lat=\"0.0110000\" lon=\"%.7f\">\n    <tag k=\"amenity\" v=\"pharmacy\"/>\n"+
+				"    <tag k=\"name\" v=\"Extra Pharmacy %d\"/>\n  </node>\n", 590+i, 0.005+0.0005*float64(i), i)
+		}
+		cut := strings.Index(base, "  <way ")
+		bigger := []byte(base[:cut] + extra.String() + base[cut:])
+		if err := os.WriteFile(filepath.Join(regionDir, "bigger-a.osm"), bigger, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Join(regionDir, "bigger-a.osm"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(bigger)
+		pinA := func(d map[string]any) {
+			src := map[string]any{}
+			for k, v := range doc["source"].(map[string]any) {
+				src[k] = v
+			}
+			src["allowed_sha256"] = append(append([]any{}, src["allowed_sha256"].([]any)...), hex.EncodeToString(sum[:]))
+			d["source"] = src
+		}
+		// The same checks with a tight relative gate: not part of the policy.
+		tight := map[string]any{}
+		for k, v := range strict {
+			tight[k] = v
+		}
+		tight["max_drop_fraction"] = 0.05
+		if p := writeRegionAs(t, strict, pinA); p != pStrict {
+			t.Fatalf("pinning a digest changed the policy: %s, want %s", p, pStrict)
+		}
+		resA, code, stderr := importFixture(t, "/config/test-regions/bigger-a.osm", nil)
+		if code != 0 || resA.Outcome.State != "published" {
+			t.Fatalf("A: exit %d %+v\n%s", code, resA, stderr)
+		}
+		a := resA.ReleaseID
+		resB, code, stderr := importFixture(t, "/data/testdata/fixture/snapshots/karta-fixture-b.osm.pbf", nil, "--no-activate")
+		if code != 0 || resB.Outcome.State != "ready" || resB.ReleaseID == "" {
+			t.Fatalf("B: exit %d %+v\n%s", code, resB, stderr)
+		}
+		b := resB.ReleaseID
+		if p := writeRegionAs(t, tight, pinA); p != pStrict {
+			t.Fatalf("max_drop_fraction changed the policy: %s, want %s", p, pStrict)
+		}
+		s := policyView(t)
+		if s.activeID() != a || s.release(t, b).State != "ready" || !s.release(t, b).PolicyCurrent {
+			t.Fatalf("before the switches: active %q, B %+v", s.activeID(), s.release(t, b))
+		}
+		// B passed the policy in force but would lose too many rows
+		// relative to A: an activation refuses it ...
+		r := op(t, http.MethodPost, "/v1/operator/releases/"+b+"/activate", admin, map[string]any{"reason": "B loses rows"})
+		if r.status != http.StatusConflict || r.reasonCode(t) != "excessive_data_loss" {
+			t.Fatalf("activation of B: %d %s", r.status, r.body)
+		}
+		// ... and a rollback, which would not apply that gate, refuses a
+		// release that was never active.
+		r = op(t, http.MethodPost, "/v1/operator/rollback", admin, map[string]any{"reason": "B by rollback", "release_id": b})
+		if code, _ := r.errorCode(t); r.status != http.StatusConflict || code != "release_not_eligible" || !strings.Contains(string(r.body), "activate it instead") {
+			t.Fatalf("rollback to B, never active: %d %s", r.status, r.body)
+		}
+		if s := policyView(t); s.activeID() != a || s.release(t, b).State != "ready" || s.release(t, b).RollbackEligible {
+			t.Fatalf("after the refused rollback: active %q, B %+v", s.activeID(), s.release(t, b))
+		}
+
+		// The emergency way back stays open: with B served once (under the
+		// lenient gate), a rollback returns to the older A (which the
+		// forward rule refuses to activate), and then to B again although
+		// activating B is still refused for its row counts.
+		writeRegionAs(t, strict, pinA)
+		r = op(t, http.MethodPost, "/v1/operator/releases/"+b+"/activate", admin, map[string]any{"reason": "B under the lenient gate"})
+		expectStatus(t, r, http.StatusOK)
+		writeRegionAs(t, tight, pinA)
+		r = op(t, http.MethodPost, "/v1/operator/releases/"+a+"/activate", admin, map[string]any{"reason": "forward to the older A"})
+		if r.status != http.StatusConflict || r.reasonCode(t) != "older_than_active" {
+			t.Fatalf("activation of the older A: %d %s", r.status, r.body)
+		}
+		r = op(t, http.MethodPost, "/v1/operator/rollback", admin, map[string]any{"reason": "back to A", "release_id": a})
+		expectStatus(t, r, http.StatusOK)
+		r = op(t, http.MethodPost, "/v1/operator/releases/"+b+"/activate", admin, map[string]any{"reason": "forward to B again"})
+		if r.status != http.StatusConflict || r.reasonCode(t) != "excessive_data_loss" {
+			t.Fatalf("roll-forward to B: %d %s", r.status, r.body)
+		}
+		if !policyView(t).release(t, b).RollbackEligible {
+			t.Fatal("B, active before, is not reported rollback-eligible")
+		}
+		r = op(t, http.MethodPost, "/v1/operator/rollback", admin, map[string]any{"reason": "back to B", "release_id": b})
+		expectStatus(t, r, http.StatusOK)
+		if s := policyView(t); s.activeID() != b {
+			t.Fatalf("after the rollback to B: active %q", s.activeID())
+		}
 	})
 }
 

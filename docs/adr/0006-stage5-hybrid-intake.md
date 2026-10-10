@@ -338,13 +338,20 @@ not count.
   policy of the region file read for that switch, checked in
   `registry.Activate`'s `Allow`, which reads the region file there, under the
   pointer lock and with the target row locked: the automatic switch of a
-  publication (for this gate and the row-count gate), operator `activate`,
-  and a rollback to a release that was never active. Otherwise the switch is
-  refused with `validation_required` and nothing changes; a region file that
-  cannot be read or parsed refuses it (`region_config`). A rollback to a
-  release that was active before is not held up by a policy changed since:
-  it is the way back. A roll-forward to such a release is an activation and
-  is held to the policy in force.
+  publication (for this gate and the row-count gate) and operator
+  `activate` (with the forward rule and the row-count gate too). Otherwise
+  the switch is refused with `validation_required` and nothing changes; a
+  region file that cannot be read or parsed refuses it (`region_config`).
+* **Rollback only goes back.** A rollback applies none of the forward
+  gates (forward rule, row-count gate, validation policy): it is the way
+  back to a release that was served before. So it only accepts a `retired`
+  target, the state of a replaced active release, checked on the locked
+  row; a `ready` release, never active, is refused
+  (`409 release_not_eligible`) and must be activated, with every gate.
+  Before this, a rollback to a ready release applied no gate at all
+  (originally) or the policy alone, so it could make active a release the
+  row-count gate or the forward rule refused. A roll-forward to a release
+  that was active before is an activation and is held to every gate.
 * **Revalidation.** An existing release (ready, retired or active) is
   evaluated with the code a build uses: `min_counts` on the row counts
   recorded at its build (the database is immutable), and the tile layer
@@ -437,7 +444,8 @@ from a command-line process refused while one waits in the database, that
 one ending at the request deadline with nothing recorded and its statement
 stopped on the server, a process killed holding the lock, a resubmission
 without a rebuild under a 1 MiB storage budget, an edit of only the name, box
-or view refusing activation and a rollback to the never-activated release
+or view refusing activation, a rollback refusing a release never active
+(which an activation refuses for its row counts)
 and leaving the pass not current, activation after a pass, the rollback
 exemption and the roll-forward rule (also after a rename), and a policy or a
 region name changed during an automatic publication's build).

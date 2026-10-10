@@ -318,14 +318,14 @@ paths:
       description: |
         Scope `rollback`. Without `release_id`, the target is the most
         recently replaced retained (`retired`) release. The target must be
-        `ready` or `retired` (never `removing`, `removed` or `failed`) and
-        pass the serving compatibility checks. Only the active pointer
-        changes; release contents are immutable. A region change must be
-        explicit (`allow_region_change`). Rollback is the explicit way back
-        and has no row-count gate. A target that was never active must have
-        passed the content policy in force, as for `activate`
-        (`validation_required`); one that was active before is not held up by
-        a policy changed since.
+        `retired`, a release that was active before, and pass the serving
+        compatibility checks; a `ready` release, never active, is refused
+        (`409 release_not_eligible`) and is activated instead (`activate`,
+        with every forward gate), as are `removing`, `removed` and `failed`
+        ones. Only the active pointer changes; release contents are
+        immutable. A region change must be explicit (`allow_region_change`).
+        Rollback is the explicit way back: the forward rule, the row-count
+        gate and a validation policy changed since do not hold it up.
       requestBody:
         required: true
         content:
@@ -830,7 +830,7 @@ components:
         - type: object
           required: [rollback_eligible, pinned_served, validation_policy_current]
           properties:
-            rollback_eligible: { type: boolean, description: "Retained, validated and not active." }
+            rollback_eligible: { type: boolean, description: "Retired (active before) and not active: a rollback may return to it." }
             pinned_served: { type: boolean, description: Retired and still inside its pin grace. }
             validation_policy_current: { type: boolean, description: "Passed the content policy in force, which a forward activation requires." }
     Submission:
