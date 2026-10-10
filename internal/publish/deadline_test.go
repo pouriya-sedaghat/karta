@@ -156,7 +156,7 @@ func TestCapacityQueryCrossingTheDeadlineIsATimeout(t *testing.T) {
 	job, cancel := s.jobContext(parent)
 	defer cancel()
 	start := time.Now()
-	err := s.checkCapacity(job, 1<<20, "fixture")
+	err := s.checkCapacity(job, 1<<20, "fixture", "")
 	took := time.Since(start)
 	if err == nil || took < 250*time.Millisecond || took > 10*time.Second {
 		t.Fatalf("capacity query: %v after %s, want it blocked until the 300ms deadline", err, took)
@@ -180,7 +180,7 @@ func TestCapacityQueryStoppedByShutdownIsInterrupted(t *testing.T) {
 	job, cancel := s.jobContext(parent)
 	defer cancel()
 	time.AfterFunc(200*time.Millisecond, shutdown)
-	err := s.checkCapacity(job, 1<<20, "fixture")
+	err := s.checkCapacity(job, 1<<20, "fixture", "")
 	if err == nil {
 		t.Fatal("the capacity query was not stopped by the shutdown")
 	}

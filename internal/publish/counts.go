@@ -49,7 +49,7 @@ func releaseCounts(ctx context.Context, r *registry.Release, read reportCountsRe
 // readReportCounts reads the counts of the import report stored in a
 // release database.
 func (s *Service) readReportCounts(ctx context.Context, database string) ([]byte, error) {
-	conn, err := s.cfg.Build.DB.Connect(ctx, database)
+	conn, err := s.releaseParams().Connect(ctx, database)
 	if err != nil {
 		return nil, err
 	}

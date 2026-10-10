@@ -33,6 +33,7 @@ type Service interface {
 	Authorize(ctx context.Context, p publish.Principal, digest string, size *int64, expires *time.Time, reason string) (*registry.Authorization, bool, error)
 	Revoke(ctx context.Context, p publish.Principal, digest, reason string) (bool, error)
 	Activate(ctx context.Context, p publish.Principal, a publish.ActionRequest) (registry.ActivateResult, error)
+	Revalidate(ctx context.Context, p publish.Principal, releaseID, reason string) (publish.Revalidation, error)
 	Rollback(ctx context.Context, p publish.Principal, a publish.ActionRequest) (registry.ActivateResult, error)
 	Cleanup(ctx context.Context, p publish.Principal, reason string, dryRun bool) (publish.CleanupResult, error)
 	OnlinePause(ctx context.Context, p publish.Principal, reason string) (publish.OnlinePolicyResult, error)
@@ -80,6 +81,12 @@ const (
 	CodeInternal           = "internal_error"
 	CodeOnlineDisabled     = "online_disabled"
 	CodeNothingToRetry     = "nothing_to_retry"
+	// CodeNotRevalidatable: this build cannot evaluate the release (another
+	// schema or style revision, or its row counts are unreadable).
+	CodeNotRevalidatable = "release_not_revalidatable"
+	// CodeRevalidationInProgress: an evaluation of the release is already
+	// running (one at a time per release, across processes).
+	CodeRevalidationInProgress = "revalidation_in_progress"
 	// Stage 5.
 	CodeIntakeDisabled         = "intake_disabled"
 	CodeIntakeLimit            = "intake_limit_reached"
@@ -119,6 +126,7 @@ func New(creds CredentialSource, svc Service, log *slog.Logger, timeout time.Dur
 	mux.Handle("POST /v1/operator/authorizations", s.auth(ScopePublish, "authorize_digest", s.authorize))
 	mux.Handle("POST /v1/operator/authorizations/{sha256}/revoke", s.auth(ScopePublish, "revoke_digest", s.revoke))
 	mux.Handle("POST /v1/operator/releases/{release_id}/activate", s.auth(ScopePublish, "activate", s.activate))
+	mux.Handle("POST /v1/operator/releases/{release_id}/revalidate", s.auth(ScopePublish, "revalidate", s.revalidate))
 	mux.Handle("POST /v1/operator/rollback", s.auth(ScopeRollback, "rollback", s.rollback))
 	mux.Handle("POST /v1/operator/cleanup", s.auth(ScopeCleanup, "cleanup", s.cleanup))
 	mux.Handle("GET /v1/operator/metrics", s.auth(ScopeStatus, "metrics", s.metrics))
@@ -347,8 +355,13 @@ func (s *Server) serviceError(w http.ResponseWriter, r *http.Request, err error)
 		writeError(w, r, http.StatusConflict, CodeNotEligible, err.Error())
 	case errors.Is(err, publish.ErrIncompatible):
 		writeError(w, r, http.StatusConflict, CodeIncompatible, err.Error())
+	case errors.Is(err, publish.ErrRevalidation):
+		writeError(w, r, http.StatusConflict, CodeNotRevalidatable, err.Error())
 	case errors.Is(err, registry.ErrActiveChanged):
 		writeError(w, r, http.StatusConflict, CodeActiveChanged, err.Error())
+	case errors.Is(err, registry.ErrRevalidating):
+		w.Header().Set("Retry-After", "30")
+		writeError(w, r, http.StatusConflict, CodeRevalidationInProgress, err.Error())
 	case errors.Is(err, registry.ErrBusy):
 		w.Header().Set("Retry-After", "5")
 		writeError(w, r, http.StatusConflict, CodeBusy, err.Error())
@@ -590,6 +603,35 @@ func (s *Server) activate(w http.ResponseWriter, r *http.Request, c *Credential)
 	}
 	res, err := s.svc.Activate(r.Context(), principal(r, c), publish.ActionRequest{ReleaseID: id, ExpectedActive: b.ExpectedActive,
 		AllowRegionChange: b.AllowRegionChange, Reason: reason})
+	if err != nil {
+		s.serviceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"result": res})
+}
+
+type revalidateBody struct {
+	Reason string `json:"reason"`
+}
+
+// revalidate evaluates an existing release against the content policy in
+// force, without a rebuild; it never activates it. A completed evaluation is
+// 200 whether the release passed or not ("passed").
+func (s *Server) revalidate(w http.ResponseWriter, r *http.Request, c *Credential) {
+	id := r.PathValue("release_id")
+	if !releaseid.Valid(id) {
+		writeError(w, r, http.StatusBadRequest, CodeInvalidRequest, "release_id must match "+releaseid.Pattern.String())
+		return
+	}
+	var b revalidateBody
+	if !decode(w, r, &b) {
+		return
+	}
+	reason, ok := validReason(w, r, b.Reason)
+	if !ok {
+		return
+	}
+	res, err := s.svc.Revalidate(r.Context(), principal(r, c), id, reason)
 	if err != nil {
 		s.serviceError(w, r, err)
 		return

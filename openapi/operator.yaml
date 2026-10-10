@@ -233,8 +233,13 @@ paths:
         (checked in the pointer transaction), whatever it was validated
         against: otherwise `409 policy_refused` with reason code
         `excessive_data_loss`, or `counts_unavailable` if either release's
-        row counts cannot be read. The previous release stays servable to
-        pinned clients for the pin grace period.
+        row counts cannot be read. The target must also have passed the
+        content policy in force (the region file's `min_counts`, searches and
+        tiles; thresholds are not part of a release id, so a policy-only edit
+        keeps the release): otherwise `409 policy_refused` with reason code
+        `validation_required`, until `releases/{release_id}/revalidate`
+        passes. The previous release stays servable to pinned clients for the
+        pin grace period.
       parameters:
         - { name: release_id, in: path, required: true, schema: { $ref: "#/components/schemas/ReleaseID" } }
       requestBody:
@@ -256,6 +261,56 @@ paths:
         "413": { $ref: "#/components/responses/Error" }
         "415": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/releases/{release_id}/revalidate:
+    post:
+      summary: Evaluate an existing release against the content policy in force (no rebuild, never activates)
+      operationId: operatorRevalidate
+      description: |
+        Scope `publish`. Runs the region file's content checks against a
+        `ready`, `retired` or `active` release built by this build's schema
+        and style revisions: `min_counts` on the row counts recorded when the
+        immutable release was built, and the tile layer contract, configured
+        tiles and searches against its database, read only. The outcome is
+        recorded with the release (`validation`, and
+        `validation_policy_sha256` when it passed) and audited as
+        `release_revalidated`. A completed evaluation is `200` whether the
+        release passed (`passed`) or not; a release that fails stays as it
+        is and cannot be activated under this policy. Nothing is ever
+        activated. `409 release_not_eligible` for another state,
+        `release_incompatible` if this server cannot serve it,
+        `release_not_revalidatable` if this build cannot evaluate it (another
+        schema or style revision, unreadable row counts, or a release
+        database that records another region identity than the region
+        file's), `policy_refused` (`region_config`) for a release of another
+        region or an unreadable region file; `409 revalidation_in_progress`
+        (with `Retry-After`) at once, never queued, while another evaluation
+        of the release runs in any publisher or importer process; `503
+        timeout` if the evaluation outlasts
+        `KARTA_OPERATOR_REQUEST_TIMEOUT`, `503 service_unavailable`
+        if the request is cancelled or the release database connection is
+        lost: nothing is recorded with the release, and the attempt is
+        audited as a failed `revalidate` action.
+      parameters:
+        - { name: release_id, in: path, required: true, schema: { $ref: "#/components/schemas/ReleaseID" } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReasonBody" }
+      responses:
+        "200":
+          description: Evaluated and recorded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RevalidationResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
   /v1/operator/rollback:
     post:
       summary: Roll back to a retained, validated, compatible release
@@ -263,11 +318,14 @@ paths:
       description: |
         Scope `rollback`. Without `release_id`, the target is the most
         recently replaced retained (`retired`) release. The target must be
-        `ready` or `retired` (never `removing`, `removed` or `failed`) and
-        pass the serving compatibility checks. Only the active pointer
-        changes; release contents are immutable. A region change must be
-        explicit (`allow_region_change`). Rollback is the explicit way back
-        and has no row-count gate.
+        `retired`, a release that was active before, and pass the serving
+        compatibility checks; a `ready` release, never active, is refused
+        (`409 release_not_eligible`) and is activated instead (`activate`,
+        with every forward gate), as are `removing`, `removed` and `failed`
+        ones. Only the active pointer changes; release contents are
+        immutable. A region change must be explicit (`allow_region_change`).
+        Rollback is the explicit way back: the forward rule, the row-count
+        gate and a validation policy changed since do not hold it up.
       requestBody:
         required: true
         content:
@@ -659,13 +717,14 @@ components:
               enum: [unauthenticated, forbidden, invalid_request, request_body_too_large, unsupported_media_type, method_not_allowed,
                      not_found, unknown_release, release_not_eligible, release_incompatible, active_release_changed, busy,
                      no_rollback_target, policy_refused, timeout, service_unavailable, internal_error, online_disabled,
-                     nothing_to_retry, intake_disabled, intake_limit_reached, intake_refused, credentials_unavailable]
+                     nothing_to_retry, intake_disabled, intake_limit_reached, intake_refused, credentials_unavailable,
+                     release_not_revalidatable, revalidation_in_progress]
             message: { type: string }
             reason_code:
               type: string
               description: |
                 For `policy_refused`, the rule that refused (older_than_active, not_newer, region_changed, excessive_data_loss,
-                counts_unavailable, region_config); for `intake_refused`, region_mismatch, too_large, validity_beyond_cap,
+                counts_unavailable, region_config, validation_required); for `intake_refused`, region_mismatch, too_large, validity_beyond_cap,
                 digest_revoked, handoff_name_mismatch or handoff_name_taken.
             request_id: { type: string }
     SwitchBody:
@@ -680,6 +739,47 @@ components:
           description: Compare-and-swap guard; defaults to the release active when the request arrived.
         allow_region_change: { type: boolean, default: false }
         reason: { $ref: "#/components/schemas/Reason" }
+    RevalidationResult:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          required: [release_id, passed, policy_sha256, checks, searches, counts_from, duration_seconds]
+          properties:
+            release_id: { $ref: "#/components/schemas/ReleaseID" }
+            passed: { type: boolean, description: The release passed every check of the policy in force. }
+            policy_sha256: { $ref: "#/components/schemas/SHA256" }
+            checks:
+              type: array
+              items:
+                type: object
+                required: [name, passed, detail]
+                properties:
+                  name: { type: string }
+                  passed: { type: boolean }
+                  detail: { type: string }
+            searches: { type: array, nullable: true, items: { type: object } }
+            counts_from: { type: string, enum: [registry, import_report], description: Where the build-time row counts were read. }
+            duration_seconds:
+              type: number
+              description: How long the evaluation took, on this host, for this policy (the measurement the operator timeouts are set from).
+    Validation:
+      type: object
+      nullable: true
+      description: The latest evaluation of the release against a content policy.
+      required: [policy_sha256, policy, passed, kind, at, actor, source, checks]
+      properties:
+        policy_sha256: { $ref: "#/components/schemas/SHA256" }
+        policy: { type: object, description: "The canonical policy evaluated: revision, region identity (id, name, bbox, center, zoom), min_counts, search, tiles." }
+        passed: { type: boolean }
+        kind: { type: string, enum: [import, revalidation] }
+        at: { $ref: "#/components/schemas/Timestamp" }
+        actor: { type: string }
+        source: { type: string }
+        checks: { type: integer }
+        failed: { type: array, items: { type: string } }
+        duration_seconds: { type: number, description: "How long the evaluation took (validation stage of a build, or a revalidation)." }
     SwitchResult:
       type: object
       required: [result]
@@ -719,14 +819,20 @@ components:
         removed_at: { allOf: [{ $ref: "#/components/schemas/Timestamp" }], nullable: true }
         created_at: { $ref: "#/components/schemas/Timestamp" }
         updated_at: { $ref: "#/components/schemas/Timestamp" }
+        validation_policy_sha256:
+          type: string
+          nullable: true
+          description: The content policy the release last passed; null if none is recorded (built before registry schema 6, or its last evaluation of that policy failed).
+        validation: { $ref: "#/components/schemas/Validation" }
     ReleaseStatus:
       allOf:
         - $ref: "#/components/schemas/Release"
         - type: object
-          required: [rollback_eligible, pinned_served]
+          required: [rollback_eligible, pinned_served, validation_policy_current]
           properties:
-            rollback_eligible: { type: boolean, description: "Retained, validated and not active." }
+            rollback_eligible: { type: boolean, description: "Retired (active before) and not active: a rollback may return to it." }
             pinned_served: { type: boolean, description: Retired and still inside its pin grace. }
+            validation_policy_current: { type: boolean, description: "Passed the content policy in force, which a forward activation requires." }
     Submission:
       type: object
       required: [id, source, name, fingerprint, region_id, marker_sha256, sha256, size_bytes, data_timestamp, state, reason_code,
@@ -834,6 +940,7 @@ components:
             name: { type: string }
             pinned_digests: { type: array, items: { $ref: "#/components/schemas/SHA256" } }
             require_provenance: { type: boolean }
+            validation_policy_sha256: { $ref: "#/components/schemas/SHA256" }
             error: { type: string }
         policy:
           type: object

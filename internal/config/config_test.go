@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -155,5 +156,68 @@ func TestMetricsListener(t *testing.T) {
 	}
 	if _, err := LoadServe(env(with("KARTA_METRICS_LISTEN_ADDR", ":8080", "KARTA_METRICS_TOKENS_FILE", tokens))); err == nil {
 		t.Error("metrics on the public listener accepted")
+	}
+}
+
+// The measured-timeout gate: twice the measurement for the server, 30 s
+// more for the client, both within 10 min. The boundary is a measurement of
+// exactly 285 s; the runbook states the same numbers.
+func TestRevalidationTimeouts(t *testing.T) {
+	for _, c := range []struct {
+		d               time.Duration
+		request, client time.Duration
+		ok              bool
+	}{
+		{0, time.Second, 31 * time.Second, true},
+		{400 * time.Millisecond, time.Second, 31 * time.Second, true},
+		{12*time.Second + 300*time.Millisecond, 25 * time.Second, 55 * time.Second, true},
+		{285 * time.Second, 570 * time.Second, 600 * time.Second, true},
+		{285*time.Second + time.Nanosecond, 571 * time.Second, 601 * time.Second, false},
+		{285*time.Second + 500*time.Millisecond, 571 * time.Second, 601 * time.Second, false},
+		{9*time.Minute + 30*time.Second, 19 * time.Minute, 19*time.Minute + 30*time.Second, false},
+	} {
+		request, client, ok := RevalidationTimeouts(c.d)
+		if request != c.request || client != c.client || ok != c.ok {
+			t.Errorf("%v: %v %v %v, want %v %v %v", c.d, request, client, ok, c.request, c.client, c.ok)
+		}
+	}
+	// The largest measurement that fits, to the nanosecond.
+	lo, hi := time.Duration(0), MaxOperatorTimeout
+	for lo < hi {
+		mid := lo + (hi-lo+1)/2
+		if _, _, ok := RevalidationTimeouts(mid); ok {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	request, client, _ := RevalidationTimeouts(lo)
+	if lo != 285*time.Second {
+		t.Fatalf("the boundary is %v", lo)
+	}
+	b, err := os.ReadFile("../../docs/runbook.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := string(b)
+	start := strings.Index(doc, "#### Measured-timeout gate")
+	end := strings.Index(doc[start+1:], "\n4. **Measure again**")
+	if start < 0 || end < 0 {
+		t.Fatal("the runbook has no measured-timeout gate")
+	}
+	gate := strings.Join(strings.Fields(doc[start:start+1+end]), " ")
+	for _, want := range []string{
+		"at least twice the measurement (rounded up to a whole second)",
+		fmt.Sprintf("at least %d s longer than the request deadline", int(OperatorClientMargin.Seconds())),
+		fmt.Sprintf("neither may exceed the %d min maximum", int(MaxOperatorTimeout.Minutes())),
+		fmt.Sprintf("at most %d s (%d min %d s), which gives %d s and %d s", int(lo.Seconds()), int(lo.Minutes()), int(lo.Seconds())%60,
+			int(request.Seconds()), int(client.Seconds())),
+		"For a longer measurement, or if the measurement itself timed out",
+		"do not use the operator endpoint for that release and policy",
+		"resubmit the snapshot with `karta import --no-activate`",
+	} {
+		if !strings.Contains(gate, want) {
+			t.Errorf("the runbook's measured-timeout gate does not say %q", want)
+		}
 	}
 }

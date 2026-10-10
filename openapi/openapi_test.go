@@ -36,7 +36,7 @@ func TestOperatorSpecIsValid(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range []string{"/v1/operator/status", "/v1/operator/audit", "/v1/operator/authorizations",
-		"/v1/operator/authorizations/{sha256}/revoke", "/v1/operator/releases/{release_id}/activate",
+		"/v1/operator/authorizations/{sha256}/revoke", "/v1/operator/releases/{release_id}/activate", "/v1/operator/releases/{release_id}/revalidate",
 		"/v1/operator/rollback", "/v1/operator/cleanup", "/v1/operator/metrics", "/v1/operator/online/pause",
 		"/v1/operator/online/resume", "/v1/operator/online/retry", "/v1/operator/intake/authorizations",
 		"/v1/operator/intake/authorizations/{id}/close", "/v1/operator/intake/pause", "/v1/operator/intake/resume"} {

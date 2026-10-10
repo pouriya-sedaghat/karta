@@ -20,12 +20,15 @@
 //
 //  1. creates an isolated candidate database from the PostGIS template and
 //     derives the release id (it includes the database toolchain)
-//  2. returns the existing release if that id is already built
-//  3. imports with osm2pgsql (flex) and runs the post-import SQL
+//  2. returns the existing release if that id is already built (nothing is
+//     imported, so the caller's storage admission is not asked)
+//  3. asks the caller's storage admission (BuildOptions.Admit), then imports
+//     with osm2pgsql (flex) and runs the post-import SQL
 //  4. validates: row-count gates, the drop relative to the active release,
 //     the tile layer contract, the style, representative tiles and searches
 //  5. records metadata, makes the database read-only, renames it to
-//     karta_<release_id> and marks the release ready
+//     karta_<release_id> and marks the release ready with the content policy
+//     it was validated against (PolicyOf)
 //
 // Any failure drops the candidate database and records the reason; no
 // existing release is touched.
@@ -275,6 +278,12 @@ type BuildOptions struct {
 	// with; with an ActiveID, empty ActiveCounts fail validation.
 	ActiveCounts map[string]int64
 	ActiveID     string
+	// Admit, if set, decides whether a new import may start (storage
+	// admission). It runs once the release id is known and only when the
+	// release is not built yet, with the name of the candidate database
+	// already created (so it is not counted twice). Its error is returned as
+	// is, and nothing is recorded in the registry.
+	Admit func(ctx context.Context, candidate string) error
 }
 
 // Built is the result of Build.
@@ -306,6 +315,14 @@ type Report struct {
 	Timings          map[string]float64   `json:"timings_seconds"`
 	Resources        ResourceReport       `json:"resources"`
 	Searches         []SearchCheckOutcome `json:"searches"`
+	// ValidationPolicy is the content policy the checks evaluated.
+	ValidationPolicy *PolicyReport `json:"validation_policy,omitempty"`
+}
+
+// PolicyReport identifies a content policy in a report.
+type PolicyReport struct {
+	SHA256 string          `json:"sha256"`
+	Policy json.RawMessage `json:"policy"`
 }
 
 // SourceReport describes the verified input.
@@ -478,6 +495,13 @@ func Build(ctx context.Context, reg *pgx.Conn, v *Verified, opts BuildOptions, l
 			return &Built{ReleaseID: id, Existing: existing}, nil
 		}
 	}
+	if opts.Admit != nil {
+		if err := opts.Admit(ctx, candidate); err != nil {
+			_ = rel.Close(ctx)
+			discard()
+			return nil, err
+		}
+	}
 	failpoint.Hit("build.after_create")
 	// A karta_<id> database without a ready registry row is the leftover of
 	// an interrupted rename.
@@ -493,10 +517,11 @@ func Build(ctx context.Context, reg *pgx.Conn, v *Verified, opts BuildOptions, l
 		discard()
 		return nil, err
 	}
+	policy := PolicyOf(cfg)
 	report := &Report{
 		ReleaseID: id, Region: cfg.ID, Source: src, SchemaRevision: schemaRev, StyleRevision: styleRev,
 		Osm2pgsqlVersion: o2pVersion, ImporterVersion: opts.Version, Timings: timings,
-		Identity: identity, Toolchain: tools,
+		Identity: identity, Toolchain: tools, ValidationPolicy: &PolicyReport{SHA256: policy.SHA256, Policy: policy.Canonical},
 	}
 	fail := func(cause error) (*Built, error) {
 		cause = storageError(cause)
@@ -556,13 +581,7 @@ func Build(ctx context.Context, reg *pgx.Conn, v *Verified, opts BuildOptions, l
 	validate(ctx, rel, cfg, catalog, report)
 	report.Checks = append(report.Checks, RelativeChecks(cfg.Validation.MaxDropFraction, opts.ActiveID, opts.ActiveCounts, report.Counts)...)
 	lap("validate", t)
-	var failed []string
-	for _, c := range report.Checks {
-		if !c.Passed {
-			failed = append(failed, c.Name+": "+c.Detail)
-		}
-	}
-	if len(failed) > 0 {
+	if failed := report.Failed(); len(failed) > 0 {
 		return fail(fmt.Errorf("%w: %s", ErrValidation, strings.Join(failed, "; ")))
 	}
 
@@ -610,11 +629,14 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, n
 	}
 	candidate = dbName // a failure from here on drops the renamed database
 	failpoint.Hit("build.after_rename")
-	if err := registry.MarkReady(ctx, reg, id, schema.Major, report.Resources.DatabaseBytes, report.Counts); err != nil {
+	if err := registry.MarkReady(ctx, reg, id, schema.Major, report.Resources.DatabaseBytes, report.Counts, registry.Validation{
+		PolicySHA256: policy.SHA256, Policy: policy.Canonical, Passed: true, Kind: registry.ValidationImport, At: time.Now().UTC(),
+		Actor: opts.Actor, Source: opts.Source, Checks: len(report.Checks), DurationSeconds: timings["validate"]}); err != nil {
 		return fail(err)
 	}
 	if err := registry.Audit(ctx, reg, registry.AuditEntry{Actor: opts.Actor, Source: opts.Source, Action: "import_validated", Target: id,
-		Outcome: registry.OutcomeSucceeded, Detail: map[string]any{"database_bytes": report.Resources.DatabaseBytes, "seconds": timings["total"]}}); err != nil {
+		Outcome: registry.OutcomeSucceeded, Detail: map[string]any{"database_bytes": report.Resources.DatabaseBytes, "seconds": timings["total"],
+			"validation_policy_sha256": policy.SHA256}}); err != nil {
 		return fail(err)
 	}
 	log.Info("release ready", "release_id", id, "seconds", timings["total"])

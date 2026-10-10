@@ -543,6 +543,7 @@ func runOperator(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: karta operator status | audit [--limit N] [--before-id N] | authorize --sha256 HEX [--size N] [--expires RFC3339] --reason TEXT |\n"+
 			"  revoke --sha256 HEX --reason TEXT | activate --release ID --reason TEXT [--expected ID|none] |\n"+
+			"  revalidate --release ID --reason TEXT |\n"+
 			"  rollback [--release ID] --reason TEXT [--expected ID|none] | cleanup --reason TEXT [--dry-run] | metrics |\n"+
 			"  online-pause --reason TEXT | online-resume --reason TEXT | online-retry --reason TEXT |\n"+
 			"  intake-pause --reason TEXT | intake-resume --reason TEXT")
@@ -556,7 +557,7 @@ func runOperator(args []string) int {
 	sha := fs.String("sha256", "", "snapshot SHA-256")
 	size := fs.Int64("size", 0, "snapshot size in bytes (authorize)")
 	expires := fs.String("expires", "", "authorization end, RFC 3339 (authorize)")
-	rel := fs.String("release", "", "release id (activate, rollback)")
+	rel := fs.String("release", "", "release id (activate, revalidate, rollback)")
 	expected := fs.String("expected", "", "expected active release id, or none (activate, rollback)")
 	allowRegion := fs.Bool("allow-region-change", false, "allow a region change (activate, rollback)")
 	dryRun := fs.Bool("dry-run", false, "only report what cleanup would remove")
@@ -617,6 +618,8 @@ func runOperator(args []string) int {
 			b["expected_active_release_id"] = *expected
 		}
 		method, path, body = http.MethodPost, "/v1/operator/releases/"+*rel+"/activate", b
+	case "revalidate":
+		method, path, body = http.MethodPost, "/v1/operator/releases/"+*rel+"/revalidate", map[string]any{"reason": *reason}
 	case "rollback":
 		b := map[string]any{"reason": *reason, "allow_region_change": *allowRegion}
 		if *rel != "" {
@@ -651,7 +654,40 @@ func runOperator(args []string) int {
 		fmt.Fprintf(os.Stderr, "karta operator: %s %s: HTTP %d\n", method, filepath.Clean(path), resp.Status)
 		return exitFailure
 	}
+	if cmd == "revalidate" {
+		var r struct {
+			Result struct {
+				Passed          bool     `json:"passed"`
+				DurationSeconds *float64 `json:"duration_seconds"`
+			} `json:"result"`
+		}
+		err := json.Unmarshal(resp.Body, &r)
+		if err == nil && r.Result.DurationSeconds != nil {
+			fmt.Fprintln(os.Stderr, "karta operator:", timeoutAdvice(*r.Result.DurationSeconds))
+		}
+		// A completed evaluation the release failed: not activatable.
+		if err != nil || !r.Result.Passed {
+			fmt.Fprintln(os.Stderr, "karta operator: the release did not pass the validation policy in force; it cannot be activated under it")
+			return exitValidation
+		}
+	}
 	return exitOK
+}
+
+// timeoutAdvice states the operator timeouts an evaluation measured to take
+// seconds needs, or that it is too long for the operator endpoint
+// (runbook, "Measured-timeout gate").
+func timeoutAdvice(seconds float64) string {
+	d := time.Duration(seconds * float64(time.Second))
+	request, client, ok := config.RevalidationTimeouts(d)
+	if !ok {
+		return fmt.Sprintf("the evaluation took %.3f s: twice that, with the client %v longer, exceeds the %v limit; do not use the operator "+
+			"endpoint for this release and policy: resubmit the snapshot with `karta import --no-activate` (runbook, \"Measured-timeout gate\")",
+			seconds, config.OperatorClientMargin, config.MaxOperatorTimeout)
+	}
+	return fmt.Sprintf("the evaluation took %.3f s; to revalidate this release under this policy on this host through the operator endpoint, "+
+		"set KARTA_OPERATOR_REQUEST_TIMEOUT=%v (publisher) and KARTA_OPERATOR_CLIENT_TIMEOUT=%v (runbook, \"Measured-timeout gate\")",
+		seconds, request, client)
 }
 
 // healthcheck is the container health probe; the distroless image has no

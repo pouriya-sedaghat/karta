@@ -24,7 +24,9 @@ services:
     ports: !override
       - "127.0.0.1:${KARTA_TEST_OPERATOR_PORT:-18081}:8081"
     environment:
-      KARTA_REGION_FILE: /config/regions/fixture.json
+      # The validation-policy test points the publisher at a region file it
+      # edits (in KARTA_TEST_REGION_DIR, mounted below).
+      KARTA_REGION_FILE: ${KARTA_TEST_REGION_FILE:-/config/regions/fixture.json}
       KARTA_INBOX_POLL_INTERVAL: 1s
       KARTA_INBOX_SETTLE: 1s
       KARTA_PUBLISH_AUTO_ACTIVATE: ${KARTA_TEST_AUTO_ACTIVATE:-true}
@@ -42,6 +44,8 @@ services:
       KARTA_PUBLISH_TIMEOUT: ${KARTA_TEST_PUBLISH_TIMEOUT:-6h}
       # Fault injection (internal/failpoint): test-only.
       KARTA_FAILPOINTS: ${KARTA_TEST_FAILPOINTS:-}
+      # The validation-policy test shortens the operator request deadline.
+      KARTA_OPERATOR_REQUEST_TIMEOUT: ${KARTA_TEST_OPERATOR_REQUEST_TIMEOUT:-60s}
       # Online updates are off unless the Stage 3 suite turns them on.
       KARTA_ONLINE_SOURCE_FILE: ${KARTA_TEST_ONLINE_SOURCE_FILE:-}
       KARTA_DATA_STALE_AFTER: ${KARTA_TEST_STALE_AFTER:-}
@@ -60,6 +64,8 @@ services:
       - ${KARTA_ONLINE_HOST_DIR:?set by make test-integration}:/data/online:ro
       # The Stage 5 intake handoff directory, a host directory the tests control.
       - ${KARTA_INTAKE_HOST_DIR:?set by make test-integration}:/data/intake:ro
+      # Region files the validation-policy test writes.
+      - ${KARTA_TEST_REGION_DIR:?set by make test-integration}:/config/test-regions:ro
     tmpfs: !override
       - /tmp:size=1g,mode=1777
       - /var/lib/karta/staging:size=${KARTA_TEST_STAGING_SIZE:-64m},uid=10001,gid=10001,mode=0700

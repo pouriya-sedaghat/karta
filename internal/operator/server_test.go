@@ -63,6 +63,10 @@ func (f *fakeService) Activate(_ context.Context, p publish.Principal, a publish
 	f.record("activate " + a.ReleaseID + " expected=" + a.ExpectedActive)
 	return registry.ActivateResult{Active: a.ReleaseID, Changed: true}, f.err
 }
+func (f *fakeService) Revalidate(_ context.Context, p publish.Principal, id, reason string) (publish.Revalidation, error) {
+	f.record("revalidate " + id + " by " + p.Name + ": " + reason)
+	return publish.Revalidation{ReleaseID: id, Passed: true, PolicySHA256: strings.Repeat("ab", 32)}, f.err
+}
 func (f *fakeService) Rollback(_ context.Context, p publish.Principal, a publish.ActionRequest) (registry.ActivateResult, error) {
 	f.record("rollback " + a.ReleaseID)
 	return registry.ActivateResult{Active: a.ReleaseID, Changed: true}, f.err
@@ -307,6 +311,62 @@ func TestServiceErrorMapping(t *testing.T) {
 	}
 }
 
+// Revalidation evaluates an existing release against the policy in force
+// (scope publish); it is a separate action from activation, and a release
+// that has not passed the policy is refused activation with the reason.
+func TestRevalidateEndpoint(t *testing.T) {
+	h, svc, _ := setup(t)
+	path := "/v1/operator/releases/" + relID + "/revalidate"
+	for _, c := range []struct {
+		name, path, token, body string
+		status                  int
+		code                    string
+	}{
+		{"monitor", path, monitorToken, `{"reason":"x"}`, 403, CodeForbidden},
+		{"bad release id", "/v1/operator/releases/latest/revalidate", adminToken, `{"reason":"x"}`, 400, CodeInvalidRequest},
+		{"no reason", path, adminToken, `{}`, 400, CodeInvalidRequest},
+		{"unknown field", path, adminToken, `{"reason":"x","activate":true}`, 400, CodeInvalidRequest},
+	} {
+		rec := do(t, h, "POST", c.path, c.token, c.body, nil)
+		if rec.Code != c.status || code(t, rec) != c.code {
+			t.Errorf("%s: %d %s", c.name, rec.Code, rec.Body)
+		}
+	}
+	if len(svc.calls) != 0 {
+		t.Fatalf("invalid requests reached the service: %v", svc.calls)
+	}
+	rec := do(t, h, "POST", path, adminToken, `{"reason":"  checks set from the measured import  "}`, nil)
+	if rec.Code != 200 || len(svc.calls) != 1 || svc.calls[0] != "revalidate "+relID+" by operator: checks set from the measured import" ||
+		!strings.Contains(rec.Body.String(), `"passed":true`) {
+		t.Fatalf("%d %s %v", rec.Code, rec.Body, svc.calls)
+	}
+	for _, c := range []struct {
+		err  error
+		code string
+	}{
+		{publish.ErrRevalidation, CodeNotRevalidatable},
+		{publish.ErrIncompatible, CodeIncompatible},
+		{registry.ErrNotEligible, CodeNotEligible},
+	} {
+		svc.err = c.err
+		if rec := do(t, h, "POST", path, adminToken, `{"reason":"x"}`, nil); rec.Code != 409 || code(t, rec) != c.code {
+			t.Errorf("%v: %d %s", c.err, rec.Code, rec.Body)
+		}
+	}
+	// One evaluation of a release at a time: a second one is refused at
+	// once, with its own code and a retry hint, not queued.
+	svc.err = fmt.Errorf("%w (release %s)", registry.ErrRevalidating, relID)
+	if rec := do(t, h, "POST", path, adminToken, `{"reason":"x"}`, nil); rec.Code != 409 || code(t, rec) != CodeRevalidationInProgress ||
+		rec.Header().Get("Retry-After") != "30" {
+		t.Errorf("an evaluation already running: %d %s %v", rec.Code, rec.Body, rec.Header())
+	}
+	svc.err = &publish.PolicyError{Code: publish.CodeValidationRequired, Msg: "not validated under the policy in force"}
+	rec = do(t, h, "POST", "/v1/operator/releases/"+relID+"/activate", adminToken, `{"reason":"x"}`, nil)
+	if rec.Code != 409 || code(t, rec) != CodePolicyRefused || !strings.Contains(rec.Body.String(), `"reason_code":"validation_required"`) {
+		t.Errorf("activation of an unvalidated release: %d %s", rec.Code, rec.Body)
+	}
+}
+
 // Refusals are audited at most deniedAuditPerMinute times per minute.
 func TestDeniedAuditIsRateLimited(t *testing.T) {
 	h, svc, _ := setup(t)
@@ -400,6 +460,7 @@ func TestIntakeScopeIsolation(t *testing.T) {
 		{"POST", "/v1/operator/authorizations", `{"sha256":"` + digest + `","size_bytes":10,"reason":"x"}`},
 		{"POST", "/v1/operator/authorizations/" + digest + "/revoke", `{"reason":"x"}`},
 		{"POST", "/v1/operator/releases/" + relID + "/activate", `{"reason":"x"}`},
+		{"POST", "/v1/operator/releases/" + relID + "/revalidate", `{"reason":"x"}`},
 		{"POST", "/v1/operator/rollback", `{"reason":"x"}`},
 		{"POST", "/v1/operator/cleanup", `{"reason":"x"}`},
 		{"POST", "/v1/operator/online/pause", `{"reason":"x"}`},

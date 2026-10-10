@@ -28,6 +28,12 @@ PROMETHEUS_IMAGE := prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf0036
 
 # Tool versions for static and security checks (run with `go run`, no global installs).
 STATICCHECK := honnef.co/go/tools/cmd/staticcheck@v0.8.1
+# staticcheck v0.8.1, the latest release, reads compiler export data up to
+# version 4; Go 1.27.2 writes version 5 ("export data version 5 is greater
+# than maximum supported version 4"). Until a release reads it, staticcheck
+# analyses with the toolchain go.mod declares; everything else uses the
+# installed Go.
+STATICCHECK_GOTOOLCHAIN := go1.27.1
 GOVULNCHECK := golang.org/x/vuln/cmd/govulncheck@v1.8.0
 GOSEC       := github.com/securego/gosec/v2/cmd/gosec@v2.29.0
 
@@ -283,8 +289,8 @@ lint: ## gofmt, go vet, staticcheck, govulncheck, gosec, committed fixture check
 	go vet ./...
 	go vet -tags integration ./tests/integration/
 	go vet -tags browser ./tests/browser/
-	go run $(STATICCHECK) ./...
-	go run $(STATICCHECK) -tags integration,browser ./tests/...
+	GOTOOLCHAIN=$(STATICCHECK_GOTOOLCHAIN) go run $(STATICCHECK) ./...
+	GOTOOLCHAIN=$(STATICCHECK_GOTOOLCHAIN) go run $(STATICCHECK) -tags integration,browser ./tests/...
 	go run $(GOVULNCHECK) ./...
 	go run $(GOSEC) -quiet -exclude-generated ./...
 
@@ -311,10 +317,11 @@ testsource: ## Build the controlled HTTPS source image of the Stage 3 tests (tes
 test-integration: secrets data-dirs testsource ## Registry concurrency tests (PostgreSQL) and full-stack integration tests on an isolated compose project (committed fixtures, local controlled HTTPS source only)
 	@mkdir -p $(ARTIFACTS)
 	@tmp=$$(mktemp -d) && chmod 755 $$tmp && mkdir -m 755 $$tmp/inbox $$tmp/online $$tmp/sources $$tmp/docroot $$tmp/tls \
-	    $$tmp/intake $$tmp/landing $$tmp/bridge && \
+	    $$tmp/intake $$tmp/landing $$tmp/bridge $$tmp/regions && \
 	  export KARTA_INBOX_HOST_DIR=$$tmp/inbox KARTA_ONLINE_HOST_DIR=$$tmp/online KARTA_TEST_SOURCE_CONFIG_DIR=$$tmp/sources \
 	    KARTA_TEST_SOURCE_DOCROOT=$$tmp/docroot KARTA_TEST_SOURCE_TLS_DIR=$$tmp/tls KARTA_TEST_UID=$$(id -u) KARTA_TEST_GID=$$(id -g) \
-	    KARTA_INTAKE_HOST_DIR=$$tmp/intake KARTA_INTAKE_LANDING_HOST_DIR=$$tmp/landing KARTA_TEST_BRIDGE_DIR=$$tmp/bridge && \
+	    KARTA_INTAKE_HOST_DIR=$$tmp/intake KARTA_INTAKE_LANDING_HOST_DIR=$$tmp/landing KARTA_TEST_BRIDGE_DIR=$$tmp/bridge \
+	    KARTA_TEST_REGION_DIR=$$tmp/regions && \
 	  { $(TEST_COMPOSE) --profile online --profile intake down -v --remove-orphans >/dev/null 2>&1 || true; } && \
 	  $(TEST_COMPOSE) up -d --wait db && $(TEST_COMPOSE) up -d api publisher && \
 	  KARTA_TEST_PG_DSN="host=127.0.0.1 port=$${KARTA_TEST_DB_PORT:-55433} user=postgres dbname=postgres sslmode=disable password=$$(cat secrets/db_superuser_password)" \

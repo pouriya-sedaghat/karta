@@ -4,7 +4,7 @@ Status: proposed with the Stage 5 draft PR, 2026-10-03. Builds on
 [ADR 0001](../architecture.md) and ADRs [0003](0003-stage2-publication.md),
 [0004](0004-stage3-online-updates.md) and [0005](0005-stage4-operations.md);
 the brief is [prompts/iran-hybrid-intake.md](../../prompts/iran-hybrid-intake.md).
-It records stored-data migrations (registry schema versions 4 and 5), additive
+It records stored-data migrations (registry schema versions 4, 5 and 6), additive
 operator API changes, a tightening of manual activation, and two new trust
 boundaries, as ADR 0001 requires before each. The public API is unchanged.
 
@@ -304,6 +304,152 @@ accepted but logged as a warning (queued submissions could expire). An
 expired authorization is never renewed automatically: the operator delivers
 again (a new marker or another command run).
 
+### The content policy is bound to a release
+
+Acceptance checks are deliberately not part of a release id (ADR 0003), so a
+policy-only edit of the region file keeps the release. Before this decision,
+nothing evaluated the checks in force for a release already built: the
+existing-release shortcut of a resubmission (the build finds the release and
+imports nothing) skipped validation, and an operator activation ran none. The
+documented Iran procedure (a draft region with empty checks, an import with
+`--no-activate`, the checks set from the measured import, then activation)
+therefore activated a release that had passed only the empty draft checks. A
+dry run of proposed checks by another tool is not Karta's validation and does
+not count.
+
+* **Policy.** The content policy is the region file's `min_counts`, searches
+  and tiles plus a validation revision (`importer.ValidationRevision`,
+  changed whenever a check's meaning changes), bound to the region identity
+  the checks are evaluated for (id, name, box, view centre and zoom, the
+  region-file part of a release id, encoded losslessly), identified by a
+  SHA-256 over a canonical encoding (`importer.PolicyOf`; absent and empty
+  checks are one policy). A pass therefore stands for that exact identity
+  only: an edit of the name, box or view alone, with the checks unchanged,
+  makes every recorded pass not current, so a forward activation of a
+  release built for the old identity is refused, and such a release cannot
+  be revalidated against the file either (the identity check below): it is
+  a new build. Restoring the identity makes the pass current again.
+  `max_drop_fraction` is not part of the policy: it is relative to the
+  release active at a switch and is judged again at every forward switch.
+* **Binding.** A build records the policy it validated with the release
+  (`registry.releases.validation_policy_sha256`, and the evaluation in
+  `validation`) and in its import report (`validation_policy`).
+* **Gate.** Every forward activation requires the target to have passed the
+  policy of the region file read for that switch, checked in
+  `registry.Activate`'s `Allow`, which reads the region file there, under the
+  pointer lock and with the target row locked: the automatic switch of a
+  publication (for this gate and the row-count gate) and operator
+  `activate` (with the forward rule and the row-count gate too). Otherwise
+  the switch is refused with `validation_required` and nothing changes; a
+  region file that cannot be read or parsed refuses it (`region_config`).
+* **Rollback only goes back.** A rollback applies none of the forward
+  gates (forward rule, row-count gate, validation policy): it is the way
+  back to a release that was served before. So it only accepts a `retired`
+  target, the state of a replaced active release, checked on the locked
+  row; a `ready` release, never active, is refused
+  (`409 release_not_eligible`) and must be activated, with every gate.
+  Before this, a rollback to a ready release applied no gate at all
+  (originally) or the policy alone, so it could make active a release the
+  row-count gate or the forward rule refused. A roll-forward to a release
+  that was active before is an activation and is held to every gate.
+* **Revalidation.** An existing release (ready, retired or active) is
+  evaluated with the code a build uses: `min_counts` on the row counts
+  recorded at its build (the database is immutable), and the tile layer
+  contract, configured tiles and searches against its database, on a
+  read-only session. It requires the configured region, this build's schema
+  and style revisions, the checks the API applies before serving (release
+  id, schema major, style, toolchain: `release_incompatible`), and that the
+  release database records the region identity of the region file (id, name,
+  box, view) and this build's revisions (`release_not_revalidatable`
+  otherwise: publish the snapshot again). The policy it records is the one
+  it evaluated, read once at the start. Results are written only to the
+  registry. It never rebuilds and never activates. It runs as the operator
+  action `POST /v1/operator/releases/{id}/revalidate` (scope `publish`), and
+  on a resubmission of a built, never activated release that has not passed
+  the policy in force, before anything else.
+* **One evaluation per release.** An evaluation takes a session-level
+  advisory lock keyed by the release id on a registry session of its own,
+  without waiting, and records its outcome on that session: a second
+  evaluation of the release, in any publisher or importer process, is
+  refused at once (`409 revalidation_in_progress` with `Retry-After`; a
+  resubmission ends `interrupted` with that code, exit 7). It is never
+  queued, so a long evaluation cannot pile others up behind it. Different
+  releases may be evaluated side by side (at most one each). The lock goes
+  with its session, so a process that dies during an evaluation does not
+  leave the release locked. It does not hold up an activation: the gate
+  decides on the recorded outcome.
+* **Interrupted evaluations.** Nothing is recorded with the release unless
+  every check ran: an evaluation cut short by the request deadline, a
+  cancellation or a lost connection to the release database is an error
+  (`timeout` or `service_unavailable` for the operator action, `interrupted`
+  for a resubmission), audited as a failed `revalidate` action, and leaves
+  the release as it was. The checks are bounded by the request deadline
+  (`KARTA_OPERATOR_REQUEST_TIMEOUT`, or the publication deadline on a
+  resubmission), on the server too: pgx asks the server to cancel a
+  statement the deadline interrupts, and the revalidation session's statement
+  timeout (the time left until the deadline) stops it even if that request
+  cannot be delivered. A result is recorded only with a `release_revalidated` audit record of
+  the same request. A completed evaluation reports and records how long it
+  took (`duration_seconds`). The operator timeouts for a large region are set
+  from that measurement, not from the defaults (not shown sufficient for
+  Iran) nor from an import report's `validate` time, which was taken under
+  the build's own policy and bounds neither way an evaluation under another
+  (runbook, "Measured-timeout gate").
+* **Recording.** A pass makes the policy the release's. A failure under the
+  policy the release passed withdraws that pass (fail closed); a failure
+  under another policy keeps an earlier pass. Each evaluation is one update
+  of the release row and one audit record (`release_revalidated`, with the
+  policy, kind and failed checks) in one transaction.
+* **Concurrency.** The record takes the release row's lock, as
+  `registry.Activate` does, so an activation and a revalidation of one
+  release are serialized: an activation that arrives while an evaluation is
+  being recorded waits and decides on its outcome; a record that arrives
+  while an activation that already passed the gate commits lands after it
+  (the activation stands; the record is audited after it). An activation
+  never waits for an evaluation still running: it is refused until a pass is
+  recorded. Revalidation takes neither the build lock nor the pointer lock.
+* **Changed policy.** A release whose recorded pass is of another policy is
+  refused activation until revalidated. A policy changed during a build
+  leaves the built release `ready` (`validation_required`); restoring the
+  policy it passed makes it activatable again.
+* **Failed revalidation.** The release stays as it is, is never activated by
+  it, and cannot be activated under that policy; a resubmission ends
+  `failed` (`validation_failed`, exit 5). Nothing is rebuilt or dropped.
+* **Storage admission on reuse.** The capacity check now runs under the
+  build lock once the release id is known, and only for a new import
+  (`importer.BuildOptions.Admit`): a resubmitted built release is not refused
+  for room it does not need. The candidate created to derive the id is
+  counted once (the estimate includes it). A new build is refused as before
+  (`rejected`, `insufficient_storage`), after waiting for the build lock
+  instead of before.
+* **No activation by default.** A resubmission with `--no-activate` (or
+  with automatic activation off) revalidates and stays `ready`; a
+  revalidation never activates.
+* **Provenance.** The import report names the policy its checks evaluated;
+  the registry keeps the latest evaluation (policy, outcome, kind, time,
+  actor, source, failed checks), shown in the operator status with whether
+  each release passed the policy in force; the audit log has
+  `import_validated` (with the policy digest) and `release_revalidated`.
+
+Tests: unit (the policy digest and its identity binding, the gate and the
+status under an edit of only the name, box or view, the identity check, the
+operator timeouts and the runbook's statement of their boundary, the
+operator endpoint and its `revalidation_in_progress` answer), PostgreSQL (recording,
+the version 6 upgrade preserving every row, an activation and a revalidation
+of one release in both orders, and the per-release lock across sessions,
+including one that ends holding it), and `TestReadyReleasePolicy` against
+the stack (empty draft checks, a policy-only edit, refused activation and
+rollback, a failed revalidation, a second evaluation through the API and
+from a command-line process refused while one waits in the database, that
+one ending at the request deadline with nothing recorded and its statement
+stopped on the server, a process killed holding the lock, a resubmission
+without a rebuild under a 1 MiB storage budget, an edit of only the name, box
+or view refusing activation, a rollback refusing a release never active
+(which an activation refuses for its row counts)
+and leaving the pass not current, activation after a pass, the rollback
+exemption and the roll-forward rule (also after a rename), and a policy or a
+region name changed during an automatic publication's build).
+
 ### A rollback pauses the watcher, not deliberate deliveries
 
 A rollback now pauses, in its own transaction, automatic activation of online
@@ -511,7 +657,29 @@ outcome; a Stage 4 API reads it as before.
   it), and records one `intake_name_deduplicate` audit entry per name.
 
 A publisher of the version 4 code refuses a version 5 registry (newer than it
-supports). Restore checks compare against schema version 5.
+supports).
+
+## Registry schema version 6 (stored-data migration)
+
+* `releases.validation_policy_sha256` (the content policy the release last
+  passed) and `releases.validation` (its latest evaluation, passed or not).
+  See "The content policy is bound to a release".
+* No backfill: which checks a release built before version 6 passed is not
+  known, so it has none recorded and must be revalidated before a forward
+  activation (an existing ready release, or a retired one an operator
+  activates again). The active release keeps serving, and a rollback to a
+  release that was active before is unchanged.
+
+A publisher of the version 5 code refuses a version 6 registry (newer than it
+supports). Restore checks compare against schema version 6.
+
+The upgrade is one-way and the only rollback is a restore of a backup
+verified to be pre-version 6 (`registry.before.json` and
+`registry.after.json` at schema version 5, `MANIFEST` naming the deployed
+commit), taken with the deployed build: every command of the version 6
+build, `karta registry-summary` in `make backup` included, migrates the
+registry when it opens it. No down-migration is provided or supported
+(operations, "Images and upgrades").
 
 ## Operator API changes (additive)
 
@@ -523,7 +691,11 @@ and `/resume` (`publish`); error codes `intake_disabled`,
 `region_mismatch`, `too_large`, `validity_beyond_cap`) and
 `credentials_unavailable`; reason codes
 `authorization_revoked`, `authorization_expired`, `intake_activation_paused`;
-status gains `intake`. The public API is unchanged.
+status gains `intake`. Later: `POST /v1/operator/releases/{id}/revalidate`
+(`publish`), the error code `release_not_revalidatable`, the reason code
+`validation_required`, and release fields `validation_policy_sha256`,
+`validation` and `validation_policy_current` (status `region` gains
+`validation_policy_sha256`). The public API is unchanged.
 
 ## Failure modes
 

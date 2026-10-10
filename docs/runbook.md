@@ -127,11 +127,11 @@ them when their outcome is recorded.
 | Submission state | Meaning |
 | --- | --- |
 | `published` | built, validated and activated |
-| `ready` | built and validated, not activated: `manual_activation`, `active_changed` (an operator switched releases during the build), or `excessive_data_loss` (a resubmitted ready release would lose too much data relative to the release active now) |
+| `ready` | built and validated, not activated: `manual_activation`, `active_changed` (an operator switched releases during the build), `excessive_data_loss` (a resubmitted ready release would lose too much data relative to the release active now), or `validation_required` (the region file's checks changed during the build: the release passed the checks it was built under, not the ones in force at the switch; revalidate it, see "Validation policy") |
 | `duplicate` | `duplicate_active` (already active: nothing to do) or `duplicate_retained` (exists as a retained release: roll back or activate it instead) |
 | `rejected` | the input failed a check; nothing was built |
-| `failed` | the build or validation failed (the candidate was dropped), or the active release's row counts could not be read (`counts_unavailable`: nothing was built) |
-| `interrupted` | the process or database stopped during it; retried automatically up to `KARTA_PUBLISH_MAX_ATTEMPTS` (3) times |
+| `failed` | the build or validation failed (the candidate was dropped), the active release's row counts could not be read (`counts_unavailable`: nothing was built), or a resubmitted, already built release failed the region file's checks in force (`validation_failed`; it was evaluated again without a rebuild and is left as it is, not activated) |
+| `interrupted` | the process or database stopped during it, or (`revalidation_in_progress`) its built release was being revalidated by another process; retried automatically up to `KARTA_PUBLISH_MAX_ATTEMPTS` (3) times |
 
 A `failed` submission with `publication_timeout` ran longer than
 `KARTA_PUBLISH_TIMEOUT` and was stopped. It is final, not `interrupted`: it is
@@ -174,8 +174,10 @@ not retried automatically and does not use up attempts.
   release with more data is refused (`excessive_data_loss`). If the active
   release's counts cannot be read, the publication or activation is refused
   (`counts_unavailable`), never let through. Rollback has its own policy and
-  no count gate. If a large drop is intended, raise `max_drop_fraction` in
-  the region file through a reviewed change.
+  no count gate, so it only returns to a release that was active before
+  (`retired`): a `ready` release is never made active by a rollback
+  (`409 release_not_eligible`; activate it). If a large drop is intended,
+  raise `max_drop_fraction` in the region file through a reviewed change.
 * **One at a time, in name order.** Builds are serialized; with several
   ready submissions the newest valid one ends up active regardless of order.
 * **Region changes are explicit**: `make import-tehran IMPORT_FLAGS=--allow-region-change`,
@@ -721,8 +723,9 @@ with the credential name.
 make op-status                                           # status (monitor or operator token)
 make op CMD='audit --limit 50'                           # newest audit records
 make op CMD='rollback --reason "B has broken labels"'    # to the most recently replaced release
-make op CMD='rollback --release rXXXX --reason "..."'    # to a specific retained release
-make op CMD='activate --release rXXXX --reason "..."'    # a ready release (forward only, row counts re-checked)
+make op CMD='rollback --release rXXXX --reason "..."'    # to a specific retired release (one that was active before)
+make op CMD='revalidate --release rXXXX --reason "..."'  # evaluate a release against the region file's checks in force (no rebuild, never activates)
+make op CMD='activate --release rXXXX --reason "..."'    # a ready release (forward only, must have passed the checks in force, row counts re-checked)
 make op CMD='cleanup --dry-run --reason "check"'         # what cleanup would remove
 make op CMD='cleanup --reason "free space"'
 make op CMD=metrics                                      # Prometheus text: freshness, online source, submissions
@@ -774,10 +777,14 @@ authentication is logged and audited (at most 30 audit rows per minute).
 ## Rollback and pinned clients
 
 * **Rollback** changes only the active pointer, in one audited transaction,
-  to a retained (`ready` or `retired`), validated release that passes the
+  to a retained release that was active before (`retired`) and passes the
   same compatibility checks as serving (schema major, style, serving
-  database toolchain). Removed, failed or incompatible releases are refused
-  (`409`). Rollback is immediate; the API follows within 5 s.
+  database toolchain). It is the way back, so the forward rule, the
+  row-count gate and the validation policy do not hold it up. A release
+  that was never active (`ready`) is refused (`409 release_not_eligible`):
+  activate it instead, with every forward gate. Removed, failed or
+  incompatible releases are refused too (`409`). Rollback is immediate; the
+  API follows within 5 s.
 * **Pinned clients.** When a release is replaced (publication or rollback),
   clients that pinned its `release_id` keep getting it for
   `KARTA_RELEASE_PIN_GRACE` (24 h); requests already running always finish on
@@ -897,10 +904,10 @@ inbox submission and is audited as actor `cli`. Flags: `--no-activate`
 | 0 | published and activated; this exact release is already active; or built and ready (`--no-activate`) | new / unchanged |
 | 2 | usage or configuration error | unchanged |
 | 3 | input verification failed: digest not pinned or authorized, provenance, box, size, symlink, timestamp, malformed PBF | unchanged |
-| 4 | refused by policy: older than the active release, not newer, another region, a retained duplicate, or the active release changed during the build (the release is left `ready`) | unchanged |
-| 5 | release validation failed (counts, relative drop, tile contract, style, search or tile checks) | unchanged |
+| 4 | refused by policy: older than the active release, not newer, another region, a retained duplicate, the active release changed during the build, or the region file's checks changed during the build (`validation_required`; the release is left `ready`) | unchanged |
+| 5 | release validation failed (counts, relative drop, tile contract, style, search or tile checks), including an already built release that fails the checks in force when submitted again (evaluated without a rebuild) | unchanged |
 | 6 | insufficient storage (budget, staging, database volume, or the disk filled) | unchanged |
-| 7 | another build holds the lock (`KARTA_IMPORT_LOCK_TIMEOUT`) | unchanged |
+| 7 | another build holds the lock (`KARTA_IMPORT_LOCK_TIMEOUT`), or the built release is being revalidated by another process (`revalidation_in_progress`) | unchanged |
 | 8 | the import exceeded `KARTA_PUBLISH_TIMEOUT` and was stopped (`publication_timeout`) | unchanged |
 | 1 | other failure (database, osm2pgsql) | unchanged |
 | 130 | interrupted | unchanged |
@@ -912,7 +919,117 @@ the candidate is dropped (`--keep-failed` keeps it for inspection until the
 next build, which removes leftover candidates) and the registry records the
 release as `failed` with the reason. Changing a region's name, box or default
 view (by any amount), the provenance sidecar or the toolchain gives a new
-release id; changing only its acceptance thresholds does not.
+release id; changing only its acceptance thresholds does not. Such a release
+must then pass the thresholds in force before it is activated (see
+"Validation policy").
+
+### Validation policy
+
+A release records the content policy it passed: the region file's
+`validation.min_counts`, `search` and `tiles` (with a validation revision),
+bound to the region identity they were evaluated for (`id`, `name`, `bbox`,
+`view`), as a SHA-256 shown in `make op-status` (`region.validation_policy_sha256`,
+and per release `validation_policy_sha256`, `validation_policy_current` and
+the latest evaluation in `validation`). Every forward activation (an
+automatic publication and `activate`; a rollback cannot target a release
+that was never active) requires the target to have passed the policy in
+force, inside the pointer transaction; otherwise it is refused with
+`validation_required`. Editing only the region's name, box or view (the
+checks unchanged) also changes the policy: a release built for the old
+identity is then not current, cannot be activated and cannot be
+revalidated against the edited file
+(`release_not_revalidatable`); it needs a new build, and restoring the
+identity makes its pass current again. `max_drop_fraction` is not part of
+the policy: the row-count gate is checked again at every forward switch
+anyway.
+
+```bash
+make op CMD='revalidate --release rXXXX --reason "checks set from the measured import"'
+make op CMD='activate --release rXXXX --reason "..."'
+```
+
+`revalidate` runs the checks in force against the existing release
+database, on a read-only session: `min_counts` on the row counts recorded
+when the release was built, the tile layer contract, the configured tiles
+and the searches. Nothing is rebuilt and nothing is activated; the outcome
+is written only to the registry, with the release and audited
+(`release_revalidated`). The command exits 5 if the release failed, and the
+release then cannot be activated under this policy (it keeps any earlier
+pass of another policy). It needs a compatible release of the configured
+region whose database records the region file's identity (id, name, box,
+view) and this version's schema and style (`release_not_revalidatable` or
+`release_incompatible` otherwise: publish the snapshot again).
+
+One evaluation of a release runs at a time, across the publisher and every
+importer process using the registry. Another one is refused at once, never
+queued: `409 revalidation_in_progress` (with `Retry-After`) from the
+operator API, and a resubmission ends `interrupted` with that reason code
+(exit 7; an inbox submission is retried like any interrupted one).
+Evaluations of different releases may run side by side, at most one per
+release. The lock lives on a registry session of the evaluation: a process
+that dies during an evaluation does not leave the release locked.
+
+An evaluation must finish within `KARTA_OPERATOR_REQUEST_TIMEOUT` (60 s by
+default, at most 10 m); the client waits `KARTA_OPERATOR_CLIENT_TIMEOUT` (2 m
+by default, at most 10 m), which must be longer. The checks are bounded by
+that deadline on the server too: a statement it interrupts is cancelled,
+and the session's statement timeout (the time left) stops it even if the
+cancellation cannot be delivered. An evaluation cut short (`timeout`, a cancelled request, a lost
+database connection) records nothing with the release, is audited as a
+failed `revalidate` action, and leaves the release as it was. A completed
+evaluation reports how long it took (`duration_seconds`, also recorded in
+the release's `validation` and logged).
+
+#### Measured-timeout gate (large regions; required before revalidating Iran)
+
+The default timeouts (60 s server, 2 m client) are the operator API's
+general defaults. They have **not** been shown sufficient for Iran, and
+nothing measured so far bounds an Iran revalidation. The `validate` time in an
+import report (`timings_seconds.validate`, also the `duration_seconds` of
+an `import` evaluation) is historical evidence of that build's checks:
+under the policy of that build (the Iran draft had no searches or tiles),
+on a database just written. It is neither a lower nor an upper bound for a
+revalidation under another policy, on a read-only session, with a cold
+cache. Before relying on `revalidate` for such a region:
+
+1. **Measure.** Revalidate the release once with the server deadline near
+   its maximum and the client 30 s longer
+   (`KARTA_OPERATOR_REQUEST_TIMEOUT=9m30s` on the restarted publisher,
+   `KARTA_OPERATOR_CLIENT_TIMEOUT=10m` for the command): on a restore of the
+   target's backup on equivalent hardware, or on the target itself. On a
+   restored copy only that copy's registry records the outcome; on the
+   target the outcome is recorded like any revalidation (it is the real
+   evaluation, not a dry run, and never activates).
+2. **Record** `duration_seconds` from the result (or the release's
+   `validation`, or the `release revalidated` log line) with the policy
+   digest, the host and the database image.
+3. **Set the timeouts, or use the resubmission path.** The request deadline
+   must be at least twice the measurement (rounded up to a whole second),
+   and the client must wait at least 30 s longer than the request deadline;
+   neither may exceed the 10 min maximum. `karta operator revalidate` prints
+   both values after each evaluation. They fit only for a measurement of
+   at most 285 s (4 min 45 s), which gives 570 s and 600 s. For a longer
+   measurement, or if the measurement itself timed out (`timeout`: nothing
+   recorded), do not use the operator endpoint for that release and policy:
+   resubmit the snapshot with `karta import --no-activate`, which
+   revalidates the built release without a rebuild under
+   `KARTA_PUBLISH_TIMEOUT` and never activates it.
+4. **Measure again** after a change of the checks (searches and tiles cost
+   the most), of the host or of the database image.
+
+Submitting an already built, never activated release again (`karta import`,
+the inbox, a fresh authorization) evaluates it against the policy in force
+the same way when it has not passed it yet, before anything else: it is not
+rebuilt, it is not refused for storage it does not need (only a new import
+is held to the storage budget), `--no-activate` leaves it `ready`, and a
+release that fails is never activated (`validation_failed`).
+
+A rollback to a release that was active before is not held up by a policy
+changed since: it is the way back. Going forward to it again is an
+activation and needs a pass of the policy in force. A rollback never makes
+a release that was never active (`ready`) active. The region file is read
+for each switch under the pointer lock: one that cannot be read or parsed
+refuses the switch (`region_config`).
 
 ## Upgrading the database image
 

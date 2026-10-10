@@ -242,6 +242,9 @@ type Outcome struct {
 	ReleaseID    string           `json:"release_id,omitempty"`
 	Previous     string           `json:"previous_release_id,omitempty"`
 	Report       *importer.Report `json:"report,omitempty"`
+	// Validation is the revalidation of an existing release against the
+	// content policy in force, when this publication ran one.
+	Validation *Revalidation `json:"validation,omitempty"`
 	// Err classifies failures for exit codes (nil on success).
 	Err error `json:"-"`
 }
@@ -372,11 +375,6 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 	if err := Forward(active, cand, req.allowRegionChange); err != nil {
 		return fail(registry.SubRejected, PolicyCode(err), err)
 	}
-	s.phase("capacity", "")
-	if err := s.checkCapacity(ctx, v.Info.Size, cfg.ID); err != nil {
-		state, code := capacityFailure(err)
-		return fail(state, code, err)
-	}
 
 	s.phase("waiting_for_build_lock", "")
 	conn, err := s.cfg.Build.DB.Connect(ctx, s.cfg.RegistryDB)
@@ -406,6 +404,16 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		id := req.subID
 		opts.SubmissionID = &id
 	}
+	// Storage admission runs under the build lock once the release id is
+	// known, and only for a new import: a snapshot whose release is already
+	// built needs no room for a candidate and is not refused for it.
+	var admitErr error
+	opts.Admit = func(ctx context.Context, candidate string) error {
+		s.phase("capacity", "")
+		defer s.phase("building", "")
+		admitErr = s.checkCapacity(ctx, v.Info.Size, cfg.ID, candidate)
+		return admitErr
+	}
 	if active != nil {
 		expected = active.ID
 		// The relative row-count gate needs the active release's counts;
@@ -428,6 +436,10 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		out.ReleaseID, out.Report = built.ReleaseID, built.Report
 	}
 	if err != nil {
+		if admitErr != nil {
+			state, code := capacityFailure(admitErr)
+			return fail(state, code, admitErr)
+		}
 		switch {
 		case importer.InputCode(err) != "":
 			return fail(registry.SubRejected, importer.InputCode(err), err)
@@ -455,7 +467,30 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 		}
 		// A validated release that was never activated (an interrupted
 		// publication, or a manual-activation build) is activated now if
-		// this publication asks for it.
+		// this publication asks for it. Its content policy may have changed
+		// since its build (a policy-only edit of the region file keeps the
+		// release id): it is evaluated against the policy in force first,
+		// without a rebuild, and is never activated if it fails.
+		if !policyCurrent(*e, importer.PolicyOf(cfg).SHA256) {
+			s.phase("revalidating", e.ID)
+			res, err := s.revalidate(ctx, req.principal, e, cfg, req.reason)
+			if err != nil {
+				if errors.Is(err, registry.ErrRevalidating) && ctx.Err() == nil {
+					return fail(registry.SubInterrupted, CodeRevalidationInProgress, err)
+				}
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) || transient(err) {
+					return fail(registry.SubInterrupted, CodeInterrupted, err)
+				}
+				if code := PolicyCode(err); code != "" {
+					return fail(registry.SubRejected, code, err)
+				}
+				return fail(registry.SubFailed, CodeBuildFailed, err)
+			}
+			out.Validation = &res
+			if !res.Passed {
+				return fail(registry.SubFailed, CodeValidationFailed, revalidationFailure(e.ID, res))
+			}
+		}
 	}
 	if !req.activate {
 		out.State, out.Code, out.Reason = registry.SubReady, CodeManualActivation, "validated and ready; an operator activates it"
@@ -484,9 +519,18 @@ func (s *Service) publish(ctx context.Context, req request) Outcome {
 			if err := Forward(a, Candidate{RegionID: t.RegionID, SHA256: t.SourceSHA256, DataTimestamp: ts}, req.allowRegionChange); err != nil {
 				return err
 			}
+			// The switch applies the region file as it is now (read under
+			// the pointer lock, with the target row locked), like an
+			// operator activation: a content policy changed during the
+			// build must have been passed too, and the row-count gate uses
+			// the threshold in force.
+			swCfg, swErr := region.Load(s.cfg.RegionPath)
+			if err := policyGate(swCfg, swErr, t); err != nil {
+				return err
+			}
 			// A resumed ready release was validated against the release
 			// active at its build, which may not be this one.
-			return s.countGate(ctx, cfg, nil, a, t)
+			return s.countGate(ctx, swCfg, swErr, a, t)
 		},
 		BeforeCommit: func() { failpoint.Hit("activate.before_commit") },
 	}, s.cfg.PointerLockTimeout)
@@ -565,10 +609,10 @@ type Capacity struct {
 	MinFreeBytes      int64  `json:"min_free_bytes"`
 }
 
-func (s *Service) capacity(ctx context.Context, snapshotBytes int64, regionID string) (Capacity, error) {
+func (s *Service) capacity(ctx context.Context, snapshotBytes int64, regionID, exclude string) (Capacity, error) {
 	c := Capacity{BudgetBytes: s.cfg.StorageBudgetBytes, MinFreeBytes: s.cfg.MinFreeBytes}
 	var err error
-	if c.ReleaseBytes, err = s.releaseBytes(ctx); err != nil {
+	if c.ReleaseBytes, err = s.releaseBytes(ctx, exclude); err != nil {
 		return c, err
 	}
 	var prev int64
@@ -594,14 +638,15 @@ WHERE region_id = $1 AND state IN ('ready', 'active', 'retired')`, regionID).Sca
 	return c, nil
 }
 
-// releaseBytes sums the sizes of the release and candidate databases. Each
+// releaseBytes sums the sizes of the release and candidate databases except
+// exclude (the candidate an admission is for: its estimate counts it). Each
 // is sized separately: a candidate can be dropped concurrently (a duplicate
 // submission drops its candidate at once). A database that disappears
 // between the listing and its sizing yields NULL (dropped before the name
 // lookup) or an undefined-database error (dropped between the lookup and the
 // privilege check); either way it is skipped instead of failing the sum, as
 // one aggregate query over pg_database would.
-func (s *Service) releaseBytes(ctx context.Context) (int64, error) {
+func (s *Service) releaseBytes(ctx context.Context, exclude string) (int64, error) {
 	rows, err := s.reg.Query(ctx, `SELECT datname FROM pg_database WHERE datname ~ '^karta_(r|c)[0-9a-f]{24}$'`)
 	if err != nil {
 		return 0, err
@@ -612,6 +657,9 @@ func (s *Service) releaseBytes(ctx context.Context) (int64, error) {
 	}
 	var total int64
 	for _, name := range names {
+		if name == exclude {
+			continue
+		}
 		var n *int64
 		err := s.reg.QueryRow(ctx, `SELECT pg_database_size($1::name)`, name).Scan(&n)
 		var pgErr *pgconn.PgError
@@ -631,9 +679,11 @@ func (s *Service) releaseBytes(ctx context.Context) (int64, error) {
 
 // checkCapacity refuses a build that would exceed the storage budget for
 // release databases (active, retained, the candidate estimate), or leave
-// less than the reserve free on the database volume.
-func (s *Service) checkCapacity(ctx context.Context, snapshotBytes int64, regionID string) error {
-	c, err := s.capacity(ctx, snapshotBytes, regionID)
+// less than the reserve free on the database volume. candidate is the
+// database the build already created (from the template; counted by the
+// estimate, not again as a release database).
+func (s *Service) checkCapacity(ctx context.Context, snapshotBytes int64, regionID, candidate string) error {
+	c, err := s.capacity(ctx, snapshotBytes, regionID, candidate)
 	if err != nil {
 		return err
 	}
@@ -1035,10 +1085,11 @@ func (s *Service) checkCompatible(ctx context.Context, r *registry.Release) erro
 }
 
 // Activate makes a ready or retired release active on an operator's
-// request, subject to the forward rule (use Rollback to go back) and to the
-// relative row-count gate against the release active at the switch.
+// request, subject to the forward rule (use Rollback to go back), to the
+// content policy in force (the release must have passed it: see
+// Revalidate) and to the relative row-count gate against the release active
+// at the switch.
 func (s *Service) Activate(ctx context.Context, p Principal, a ActionRequest) (registry.ActivateResult, error) {
-	cfg, cfgErr := region.Load(s.cfg.RegionPath)
 	return s.switchTo(ctx, p, "activate", a, func(active, target *registry.Release) error {
 		ts := time.Time{}
 		if target.DataTimestamp != nil {
@@ -1047,11 +1098,21 @@ func (s *Service) Activate(ctx context.Context, p Principal, a ActionRequest) (r
 		if err := Forward(active, Candidate{RegionID: target.RegionID, SHA256: target.SourceSHA256, DataTimestamp: ts}, a.AllowRegionChange); err != nil {
 			return err
 		}
+		// The region file is read here, under the pointer lock and with the
+		// target row locked: a revalidation cannot record a result for the
+		// target in between, and an edit of the file made before this read
+		// applies to this switch.
+		cfg, cfgErr := region.Load(s.cfg.RegionPath)
+		if err := policyGate(cfg, cfgErr, target); err != nil {
+			return err
+		}
 		return s.countGate(ctx, cfg, cfgErr, active, target)
 	}, nil)
 }
 
-// Rollback makes a retained, validated, compatible release active again.
+// Rollback makes a retained, compatible release that was active before
+// (retired) active again. A ready release is refused: it is activated
+// (Activate), with every forward gate.
 func (s *Service) Rollback(ctx context.Context, p Principal, a ActionRequest) (registry.ActivateResult, error) {
 	if a.ReleaseID == "" {
 		var id string
@@ -1095,6 +1156,16 @@ ORDER BY deactivated_at DESC NULLS LAST, release_id LIMIT 1`).Scan(&id)
 		}
 	}
 	return s.switchTo(ctx, p, "rollback", a, func(active, target *registry.Release) error {
+		// A rollback is the way back to a release that was served before:
+		// only a replaced active release is retired. It is not held up by the
+		// forward rule, the row-count gate or a policy changed since. A ready
+		// release was never active: going to it is not going back, and only
+		// an operator activate, with every forward gate, may make it active.
+		if target.State != registry.StateRetired {
+			return fmt.Errorf("%w: release %s is %s and was never active; a rollback only returns to a release that was active before "+
+				"(retired): activate it instead (operator activate, with the forward rule, the validation policy and the row-count gate)",
+				registry.ErrNotEligible, target.ID, target.State)
+		}
 		if active != nil && active.RegionID != target.RegionID && !a.AllowRegionChange {
 			return policyErr(CodeRegionChanged, "release %s serves region %q, the active release %q; a region change must be explicit",
 				target.ID, target.RegionID, active.RegionID)
@@ -1450,11 +1521,15 @@ func (s *Service) Revoke(ctx context.Context, p Principal, digest, reason string
 // ReleaseStatus is a release as reported to operators.
 type ReleaseStatus struct {
 	registry.Release
-	// RollbackEligible: retained, validated and not active (compatibility
-	// is checked when a rollback is requested).
+	// RollbackEligible: retired (active before, so a rollback may return to
+	// it) and not active; compatibility is checked when a rollback is
+	// requested. A ready release is activated, not rolled back to.
 	RollbackEligible bool `json:"rollback_eligible"`
 	// PinnedServed: a retired release clients may still use.
 	PinnedServed bool `json:"pinned_served"`
+	// PolicyCurrent: the release has passed the content policy in force,
+	// which a forward activation requires (see Revalidate).
+	PolicyCurrent bool `json:"validation_policy_current"`
 }
 
 // Status is the operator view of publication.
@@ -1480,7 +1555,10 @@ type RegionStatus struct {
 	Name              string   `json:"name"`
 	PinnedDigests     []string `json:"pinned_digests"`
 	RequireProvenance bool     `json:"require_provenance"`
-	Error             string   `json:"error,omitempty"`
+	// ValidationPolicySHA256 is the content policy in force (the region
+	// file's min_counts, searches and tiles).
+	ValidationPolicySHA256 string `json:"validation_policy_sha256,omitempty"`
+	Error                  string `json:"error,omitempty"`
 }
 
 // PolicyStatus reports the publication policy in force.
@@ -1507,7 +1585,8 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	if err != nil {
 		st.Region.Error = err.Error()
 	} else {
-		st.Region = RegionStatus{ID: cfg.ID, Name: cfg.Name, PinnedDigests: cfg.Source.PinnedDigests(), RequireProvenance: cfg.Source.RequireProvenance}
+		st.Region = RegionStatus{ID: cfg.ID, Name: cfg.Name, PinnedDigests: cfg.Source.PinnedDigests(), RequireProvenance: cfg.Source.RequireProvenance,
+			ValidationPolicySHA256: importer.PolicyOf(cfg).SHA256}
 		if st.Region.PinnedDigests == nil {
 			st.Region.PinnedDigests = []string{}
 		}
@@ -1529,8 +1608,9 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	for _, r := range rels {
 		rs := ReleaseStatus{Release: r}
 		isActive := st.Active != nil && st.Active.ID == r.ID
-		rs.RollbackEligible = !isActive && (r.State == registry.StateReady || r.State == registry.StateRetired)
+		rs.RollbackEligible = !isActive && r.State == registry.StateRetired
 		rs.PinnedServed = r.State == registry.StateRetired && r.PinnedUntil != nil && now.Before(*r.PinnedUntil)
+		rs.PolicyCurrent = policyCurrent(r, st.Region.ValidationPolicySHA256)
 		st.Releases = append(st.Releases, rs)
 	}
 	sort.SliceStable(st.Releases, func(i, j int) bool { return st.Releases[i].CreatedAt.After(st.Releases[j].CreatedAt) })
@@ -1539,7 +1619,7 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	} else if subs != nil {
 		st.Submissions = subs
 	}
-	if st.Storage, err = s.capacity(ctx, 0, st.Region.ID); err != nil {
+	if st.Storage, err = s.capacity(ctx, 0, st.Region.ID, ""); err != nil {
 		return st, err
 	}
 	if st.Online, err = s.onlineStatus(ctx, st.Region.ID); err != nil {
