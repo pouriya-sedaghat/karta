@@ -28,6 +28,12 @@ PROMETHEUS_IMAGE := prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf0036
 
 # Tool versions for static and security checks (run with `go run`, no global installs).
 STATICCHECK := honnef.co/go/tools/cmd/staticcheck@v0.8.1
+# staticcheck v0.8.1, the latest release, reads compiler export data up to
+# version 4; Go 1.27.2 writes version 5 ("export data version 5 is greater
+# than maximum supported version 4"). Until a release reads it, staticcheck
+# analyses with the toolchain go.mod declares; everything else uses the
+# installed Go.
+STATICCHECK_GOTOOLCHAIN := go1.27.1
 GOVULNCHECK := golang.org/x/vuln/cmd/govulncheck@v1.8.0
 GOSEC       := github.com/securego/gosec/v2/cmd/gosec@v2.29.0
 
@@ -283,8 +289,8 @@ lint: ## gofmt, go vet, staticcheck, govulncheck, gosec, committed fixture check
 	go vet ./...
 	go vet -tags integration ./tests/integration/
 	go vet -tags browser ./tests/browser/
-	go run $(STATICCHECK) ./...
-	go run $(STATICCHECK) -tags integration,browser ./tests/...
+	GOTOOLCHAIN=$(STATICCHECK_GOTOOLCHAIN) go run $(STATICCHECK) ./...
+	GOTOOLCHAIN=$(STATICCHECK_GOTOOLCHAIN) go run $(STATICCHECK) -tags integration,browser ./tests/...
 	go run $(GOVULNCHECK) ./...
 	go run $(GOSEC) -quiet -exclude-generated ./...
 
