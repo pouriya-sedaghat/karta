@@ -211,6 +211,29 @@ publisher and undone by restoring. Upgrading the PostgreSQL/PostGIS image
 changes the serving toolchain: see the runbook, "Upgrading the database
 image".
 
+**Registry schema upgrades are one-way; the rollback is a restore.** A build
+migrates the registry the first time any of its commands opens it: the
+publisher at start, and also one-off commands such as `karta
+registry-summary` (which `make backup` runs) and `restore-check`. An older
+build then refuses the registry (newer than it supports). There is no
+down-migration; do not edit `registry.schema_migrations` or drop columns by
+hand. For an upgrade that changes the schema version (for example 5 to 6):
+
+1. Take the backup with the **deployed** revision's checkout and images,
+   before checking out or building the new one (a backup taken with new
+   images would migrate the registry first).
+2. Verify it before going on: `make backup` finished without error,
+   `MANIFEST` names the deployed `karta_commit` and image ids, and
+   `registry.before.json` and `registry.after.json` both show the old
+   `schema_version` with the expected releases, states and active release.
+   Keep it, encrypted and off the host (see "Protection").
+3. Upgrade. After `make up`, `karta registry-summary` must show the new
+   `schema_version` with the same releases, states and active release.
+4. To go back, restore that verified backup as above, with the backup's
+   `karta_commit` checked out and built first. Registry changes made after
+   the backup are lost; run no command of the newer build against the
+   restored registry.
+
 ## Bounded publication
 
 Every publication (inbox, online delivery and `karta import`) runs under one
@@ -1014,7 +1037,19 @@ mismatch). It pins the SHA-256, centres the default view, and leaves
    record the import report: counts, timings, peak RSS, database size;
 2. set `min_counts` and `max_drop_fraction` from the measured counts, and
    searches and tiles from places verified in the built release;
-3. review the file, set `KARTA_PUBLISH_REGION=iran`, and activate.
+3. review the file and set `KARTA_PUBLISH_REGION=iran`;
+4. revalidate the ready release against the checks just set
+   (`make op CMD='revalidate --release ID --reason ...'`), only after the
+   measured-timeout gate (runbook, "Validation policy"): the default
+   operator timeouts have not been shown sufficient for Iran, and the
+   import report's `validate` time (taken under the empty draft checks) does
+   not bound this evaluation. The checks are not part of the release id, so
+   this evaluates the same release without a rebuild. The release was
+   validated only against the empty draft checks (or, if built before
+   registry schema 6, against no recorded policy), and an activation before
+   it passes the checks in force is refused (`validation_required`);
+5. activate it once it passed (runbook, "Validation policy"). If it fails,
+   correct the checks or the data; never activate around them.
 
 With Geofabrik as the distributor, record the fixed file's exact bytes
 (download URL, observation time, `Last-Modified`, the `.md5` as distributor

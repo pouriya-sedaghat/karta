@@ -319,7 +319,7 @@ func LoadPublisher(getenv func(string) string) (Publisher, error) {
 		AutoActivate:           r.boolean("KARTA_PUBLISH_AUTO_ACTIVATE", true),
 		OperatorListenAddr:     r.str("KARTA_OPERATOR_LISTEN_ADDR", ":8081"),
 		OperatorTokensFile:     r.str("KARTA_OPERATOR_TOKENS_FILE", "/run/secrets/operator_tokens"),
-		OperatorRequestTimeout: r.dur("KARTA_OPERATOR_REQUEST_TIMEOUT", time.Minute, time.Second, 10*time.Minute),
+		OperatorRequestTimeout: r.dur("KARTA_OPERATOR_REQUEST_TIMEOUT", time.Minute, time.Second, MaxOperatorTimeout),
 	}
 	if c.RegionFile == "" {
 		r.errs = append(r.errs, errors.New("KARTA_REGION_FILE is required (the region configuration this deployment publishes)"))
@@ -384,13 +384,35 @@ func (r *reader) regular(key, path string) {
 	}
 }
 
+// MaxOperatorTimeout bounds KARTA_OPERATOR_REQUEST_TIMEOUT and
+// KARTA_OPERATOR_CLIENT_TIMEOUT.
+const MaxOperatorTimeout = 10 * time.Minute
+
+// OperatorClientMargin is how much longer than the server's request deadline
+// the operator client waits for an evaluation, to receive the server's
+// answer (a result, or its timeout) rather than give up first.
+const OperatorClientMargin = 30 * time.Second
+
+// RevalidationTimeouts returns the operator timeouts for revalidating a
+// release whose evaluation was measured to take d (runbook, "Measured-timeout
+// gate"): a request deadline of twice d, rounded up to a whole second, and a
+// client timeout OperatorClientMargin longer. ok is false when the client
+// timeout would exceed MaxOperatorTimeout, that is for d above 285 s: the
+// operator endpoint is then not used for that release and policy, and the
+// snapshot is resubmitted with `karta import --no-activate` instead.
+func RevalidationTimeouts(d time.Duration) (request, client time.Duration, ok bool) {
+	request = max((2*d + time.Second - 1).Truncate(time.Second), time.Second)
+	client = request + OperatorClientMargin
+	return request, client, client <= MaxOperatorTimeout
+}
+
 // LoadOperatorClient reads the operator client configuration.
 func LoadOperatorClient(getenv func(string) string) (OperatorClient, error) {
 	r := &reader{getenv: getenv}
 	c := OperatorClient{
 		URL:       r.str("KARTA_OPERATOR_URL", "http://127.0.0.1:8081"),
 		TokenFile: r.str("KARTA_OPERATOR_TOKEN_FILE", ""),
-		Timeout:   r.dur("KARTA_OPERATOR_CLIENT_TIMEOUT", 2*time.Minute, time.Second, 10*time.Minute),
+		Timeout:   r.dur("KARTA_OPERATOR_CLIENT_TIMEOUT", 2*time.Minute, time.Second, MaxOperatorTimeout),
 	}
 	return c, errors.Join(r.errs...)
 }
@@ -457,7 +479,7 @@ func LoadIntake(getenv func(string) string, watch bool) (Intake, error) {
 		RegionFile:    r.str("KARTA_REGION_FILE", ""),
 		OperatorURL:   r.str("KARTA_OPERATOR_URL", "http://127.0.0.1:8081"),
 		TokenFile:     r.str("KARTA_OPERATOR_TOKEN_FILE", ""),
-		Timeout:       r.dur("KARTA_OPERATOR_CLIENT_TIMEOUT", time.Minute, time.Second, 10*time.Minute),
+		Timeout:       r.dur("KARTA_OPERATOR_CLIENT_TIMEOUT", time.Minute, time.Second, MaxOperatorTimeout),
 		TTL:           r.dur("KARTA_INTAKE_AUTHORIZATION_TTL", 0, 0, 366*24*time.Hour),
 		MaxInputBytes: int64(r.int("KARTA_MAX_INPUT_MB", 4096, 1, 1<<22)) << 20,
 		ReserveBytes:  int64(r.int("KARTA_INTAKE_RESERVE_MB", 64, 0, 1<<22)) << 20,

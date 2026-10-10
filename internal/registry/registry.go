@@ -308,10 +308,22 @@ SELECT 'registry migration 5', 'system', 'intake_name_deduplicate', intake_name,
 FROM closed GROUP BY intake_name;
 CREATE UNIQUE INDEX authorizations_intake_name_unique ON registry.authorizations (intake_name) WHERE intake_name IS NOT NULL;
 `,
+	6: `
+-- A release records the content policy (the region file's min_counts,
+-- searches and tiles) it was validated against. Thresholds are not part of a
+-- release id, so a policy-only edit of the region file keeps the release;
+-- a forward activation then requires the release to have passed the policy
+-- in force. validation_policy_sha256 is the policy it last passed (NULL: none
+-- recorded, as for every release built before this version); validation is
+-- the latest evaluation, passed or not.
+ALTER TABLE registry.releases
+    ADD COLUMN IF NOT EXISTS validation_policy_sha256 text,
+    ADD COLUMN IF NOT EXISTS validation jsonb;
+`,
 }
 
 // SchemaVersion is the registry schema this build writes.
-const SchemaVersion = 5
+const SchemaVersion = 6
 
 // Migrate brings the registry schema to SchemaVersion (idempotent; safe to
 // run concurrently from several processes).
@@ -402,6 +414,38 @@ func UnlockImports(ctx context.Context, conn *pgx.Conn) error {
 	return err
 }
 
+// revalidationLockKey, with a hash of a release id, admits one evaluation
+// of a release at a time (session scope).
+const revalidationLockKey int32 = 0x6b617276 // "karv"
+
+// ErrRevalidating means an evaluation of the release is already running, in
+// this or another process. It is a busy error: try again once it finished.
+var ErrRevalidating = fmt.Errorf("%w: a revalidation of this release is already running", ErrBusy)
+
+// LockRevalidation takes, on conn and without waiting, the session-level
+// lock that admits one evaluation of release id at a time across every
+// publisher and importer process using this registry: ErrRevalidating if
+// another session holds it. It is released by UnlockRevalidation, or when
+// conn closes. Release ids are hashed into the key: two releases whose
+// hashes collide also exclude each other (a spurious ErrRevalidating, never
+// a second evaluation of one release).
+func LockRevalidation(ctx context.Context, conn *pgx.Conn, id string) error {
+	var ok bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, hashtext($2))`, revalidationLockKey, id).Scan(&ok); err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w (release %s)", ErrRevalidating, id)
+	}
+	return nil
+}
+
+// UnlockRevalidation releases the lock LockRevalidation took on conn.
+func UnlockRevalidation(ctx context.Context, conn *pgx.Conn, id string) error {
+	_, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1, hashtext($2))`, revalidationLockKey, id)
+	return err
+}
+
 // Errors of pointer changes.
 var (
 	ErrBusy          = errors.New("another publication operation holds the lock")
@@ -432,23 +476,60 @@ type Release struct {
 	RemovedAt      *time.Time       `json:"removed_at"`
 	CreatedAt      time.Time        `json:"created_at"`
 	UpdatedAt      time.Time        `json:"updated_at"`
+	// ValidationPolicySHA256 is the content policy the release last passed
+	// (nil: none recorded).
+	ValidationPolicySHA256 *string `json:"validation_policy_sha256"`
+	// Validation is the latest evaluation against a content policy.
+	Validation *Validation `json:"validation"`
+}
+
+// Kinds of validation records.
+const (
+	ValidationImport       = "import"
+	ValidationRevalidation = "revalidation"
+)
+
+// Validation records one evaluation of a release against a content policy.
+type Validation struct {
+	PolicySHA256 string `json:"policy_sha256"`
+	// Policy is the canonical policy evaluated (importer.PolicyOf).
+	Policy json.RawMessage `json:"policy"`
+	Passed bool            `json:"passed"`
+	// Kind is import (validated by its build) or revalidation (an existing
+	// release evaluated again, without a rebuild).
+	Kind   string    `json:"kind"`
+	At     time.Time `json:"at"`
+	Actor  string    `json:"actor"`
+	Source string    `json:"source"`
+	// Checks counts the checks evaluated; Failed lists those that failed.
+	Checks int      `json:"checks"`
+	Failed []string `json:"failed,omitempty"`
+	// DurationSeconds is how long the evaluation took: a measurement to set
+	// the operator timeouts from, valid for this policy on this host.
+	DurationSeconds float64 `json:"duration_seconds,omitempty"`
 }
 
 const releaseColumns = `release_id, database_name, state, region_id, source_sha256, source_size, schema_revision,
     style_revision, schema_major, data_timestamp, failure_reason, database_bytes, counts, submission_id,
-    activated_at, deactivated_at, pinned_until, removed_at, created_at, updated_at`
+    activated_at, deactivated_at, pinned_until, removed_at, created_at, updated_at, validation_policy_sha256, validation`
 
 func scanRelease(row pgx.Row) (*Release, error) {
 	var r Release
-	var counts []byte
+	var counts, validation []byte
 	err := row.Scan(&r.ID, &r.Database, &r.State, &r.RegionID, &r.SourceSHA256, &r.SourceSize, &r.SchemaRevision,
 		&r.StyleRevision, &r.SchemaMajor, &r.DataTimestamp, &r.FailureReason, &r.DatabaseBytes, &counts, &r.SubmissionID,
-		&r.ActivatedAt, &r.DeactivatedAt, &r.PinnedUntil, &r.RemovedAt, &r.CreatedAt, &r.UpdatedAt)
+		&r.ActivatedAt, &r.DeactivatedAt, &r.PinnedUntil, &r.RemovedAt, &r.CreatedAt, &r.UpdatedAt, &r.ValidationPolicySHA256, &validation)
 	if err != nil {
 		return nil, err
 	}
 	if len(counts) > 0 {
 		if err := json.Unmarshal(counts, &r.Counts); err != nil {
+			return nil, err
+		}
+	}
+	if len(validation) > 0 {
+		r.Validation = &Validation{}
+		if err := json.Unmarshal(validation, r.Validation); err != nil {
 			return nil, err
 		}
 	}
@@ -556,7 +637,7 @@ INSERT INTO registry.releases (release_id, database_name, state, region_id, sour
 VALUES ($1, $2, 'importing', $3, $4, $5, $6, $7, $8)
 ON CONFLICT (release_id) DO UPDATE SET state = 'importing', failure_reason = NULL, source_size = EXCLUDED.source_size,
     submission_id = EXCLUDED.submission_id, activated_at = NULL, deactivated_at = NULL, pinned_until = NULL,
-    removed_at = NULL, database_bytes = NULL, counts = NULL, updated_at = now()
+    removed_at = NULL, database_bytes = NULL, counts = NULL, validation_policy_sha256 = NULL, validation = NULL, updated_at = now()
 WHERE registry.releases.state IN ('failed', 'removed', 'importing', 'validating')`,
 		r.ID, r.Database, r.RegionID, r.SourceSHA256, r.SourceSize, r.SchemaRevision, r.StyleRevision, r.SubmissionID)
 	if err != nil {
@@ -575,16 +656,76 @@ UPDATE registry.releases SET state = 'validating', data_timestamp = $2, updated_
 WHERE release_id = $1 AND state = 'importing'`, id, dataTimestamp))
 }
 
-// MarkReady records a validated, frozen release database.
-func MarkReady(ctx context.Context, q Querier, id string, schemaMajor int, dbBytes int64, counts map[string]int64) error {
+// MarkReady records a validated, frozen release database and the content
+// policy its build validated (v, which passed).
+func MarkReady(ctx context.Context, q Querier, id string, schemaMajor int, dbBytes int64, counts map[string]int64, v Validation) error {
 	c, err := json.Marshal(counts)
 	if err != nil {
 		return err
 	}
+	if !v.Passed || v.PolicySHA256 == "" {
+		return fmt.Errorf("release %s: a ready release needs a passed validation", id)
+	}
+	vb, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
 	return oneRow(q.Exec(ctx, `
-UPDATE registry.releases SET state = 'ready', schema_major = $2, database_bytes = $3, counts = $4, updated_at = now()
-WHERE release_id = $1 AND state = 'validating'`, id, schemaMajor, dbBytes, c))
+UPDATE registry.releases SET state = 'ready', schema_major = $2, database_bytes = $3, counts = $4,
+    validation_policy_sha256 = $5, validation = $6, updated_at = now()
+WHERE release_id = $1 AND state = 'validating'`, id, schemaMajor, dbBytes, c, v.PolicySHA256, vb))
 }
+
+// RecordValidation records an evaluation of an existing release (ready,
+// retired or active) against a content policy, with its audit record, in one
+// transaction. A pass makes v's policy the one the release last passed; a
+// failure under the policy it last passed clears it (the release then has no
+// passed policy), and a failure under another policy leaves it. The update
+// takes the release row's lock, so it is serialized with an activation of the
+// release (registry.Activate locks the row): an activation sees the record
+// before or after it, never a part of it.
+func RecordValidation(ctx context.Context, db TxBeginner, id string, v Validation, reason, requestID string) error {
+	if v.PolicySHA256 == "" {
+		return fmt.Errorf("release %s: a validation record needs a policy", id)
+	}
+	vb, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := oneRow(tx.Exec(ctx, `
+UPDATE registry.releases SET validation = $2,
+    validation_policy_sha256 = CASE WHEN $3 THEN $4
+        WHEN validation_policy_sha256 = $4 THEN NULL ELSE validation_policy_sha256 END,
+    updated_at = now()
+WHERE release_id = $1 AND state IN ('ready', 'retired', 'active')`, id, vb, v.Passed, v.PolicySHA256)); err != nil {
+		return err
+	}
+	outcome := OutcomeSucceeded
+	if !v.Passed {
+		outcome = OutcomeFailed
+	}
+	detail := map[string]any{"policy_sha256": v.PolicySHA256, "kind": v.Kind, "checks": v.Checks}
+	if len(v.Failed) > 0 {
+		detail["failed"] = v.Failed
+	}
+	if err := Audit(ctx, tx, AuditEntry{Actor: v.Actor, Source: v.Source, Action: "release_revalidated", Target: id, Outcome: outcome,
+		Reason: reason, RequestID: requestID, Detail: detail}); err != nil {
+		return err
+	}
+	if beforeValidationCommit != nil {
+		beforeValidationCommit()
+	}
+	return tx.Commit(ctx)
+}
+
+// beforeValidationCommit, when set (tests only), runs inside
+// RecordValidation just before its commit, with the release row locked.
+var beforeValidationCommit func()
 
 func oneRow(tag pgconn.CommandTag, err error) error {
 	if err == nil && tag.RowsAffected() != 1 {

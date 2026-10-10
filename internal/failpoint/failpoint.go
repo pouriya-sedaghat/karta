@@ -29,6 +29,8 @@ var Known = []string{
 	"activate.after_commit",
 	"cleanup.after_mark",
 	"cleanup.after_drop",
+	// The revalidation of an existing release, holding its lock.
+	"revalidate.after_lock",
 	// Stage 3: the publisher, after an online delivery's signed manifest
 	// was verified and its serial recorded.
 	"online.after_verify",
